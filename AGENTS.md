@@ -84,4 +84,4 @@ When introducing a new pattern, class, Python construct, or dependency, explain 
 - which component calls it,
 - its important failure cases.
 
-Do not perform a large rewrite that would be difficult to follow.
+Do not perform a large rewrite that would be difficult to follow.g
