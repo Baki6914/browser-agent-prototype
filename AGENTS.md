@@ -55,12 +55,12 @@ The following are currently out of scope:
 - Do not change files until explicitly asked to implement.
 - Do not add or remove dependencies without approval.
 - Do not make architectural decisions silently.
-- Stop and ask before changing more than three files.
 - Stop and ask before changing a public function or data contract.
 - Never delete tests to make a change pass.
 - Never commit or push changes.
 - Never add API keys, passwords, internal URLs, confidential documents, or institution-specific data.
-- Keep changes small and reviewable.
+- Keep each task coherent and reviewable. Do not split a logically complete
+change solely to reduce the number of changed files.
 - Preserve existing behavior unless the task explicitly changes it.
 - Prefer clear, typed Python over clever abstractions.
 - Use Python 3.11+.
@@ -84,4 +84,4 @@ When introducing a new pattern, class, Python construct, or dependency, explain 
 - which component calls it,
 - its important failure cases.
 
-Do not perform a large rewrite that would be difficult to follow.g
+Do not perform a large rewrite that would be difficult to follow
