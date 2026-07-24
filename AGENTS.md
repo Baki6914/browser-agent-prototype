@@ -85,3 +85,11 @@ When introducing a new pattern, class, Python construct, or dependency, explain 
 - its important failure cases.
 
 Do not perform a large rewrite that would be difficult to follow
+
+## Scope Control — Latest Rule
+This section supersedes any earlier fixed file-count limit in this document.
+
+Change only files explicitly listed in the approved implementation plan.
+If another file becomes necessary during implementation, stop and explain why before editing it.
+Stop for approval before dependency changes, public API changes, database schema changes, or security-sensitive changes.
+Do not commit or push.
