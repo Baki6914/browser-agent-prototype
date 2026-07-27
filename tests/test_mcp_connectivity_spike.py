@@ -116,5 +116,106 @@ class ResultTextTests(unittest.TestCase):
             spike.ensure_usable_result("browser_snapshot", {"content": []})
 
 
+class FailurePreservationTests(unittest.TestCase):
+    def test_primary_operation_error_remains_reported_when_shutdown_succeeds(
+        self,
+    ) -> None:
+        primary_error = spike.SpikeError("snapshot failed")
+
+        with self.assertRaises(spike.SpikeError) as raised:
+            spike.raise_preserving_failures(primary_error, None)
+
+        self.assertIs(raised.exception, primary_error)
+
+    def test_shutdown_error_is_reported_when_primary_operation_succeeds(self) -> None:
+        shutdown_error = spike.SpikeError("browser_close failed")
+
+        with self.assertRaises(spike.SpikeError) as raised:
+            spike.raise_preserving_failures(None, shutdown_error)
+
+        self.assertIs(raised.exception, shutdown_error)
+
+    def test_both_errors_are_identified_and_reported(self) -> None:
+        primary_error = spike.SpikeError("snapshot failed")
+        shutdown_error = spike.SpikeError("browser_close failed")
+
+        with self.assertRaises(spike.SpikeError) as raised:
+            spike.raise_preserving_failures(primary_error, shutdown_error)
+
+        message = str(raised.exception)
+        self.assertIn("primary operation failure: snapshot failed", message)
+        self.assertIn(
+            "additional shutdown failure: browser_close failed",
+            message,
+        )
+
+    def test_direct_spike_error_remains_unchanged(self) -> None:
+        direct_error = spike.SpikeError("invocation error: snapshot failed")
+
+        with self.assertRaises(spike.SpikeError) as raised:
+            spike.raise_preserving_failures(direct_error, None)
+
+        self.assertIs(raised.exception, direct_error)
+
+
+class ExceptionGroupVisibilityTests(unittest.TestCase):
+    def test_nested_single_leaf_exposes_spike_error_message(self) -> None:
+        nested = ExceptionGroup(
+            "outer task group",
+            [
+                ExceptionGroup(
+                    "inner task group",
+                    [spike.SpikeError("invocation error: browser_navigate failed")],
+                )
+            ],
+        )
+
+        self.assertEqual(
+            spike.extract_exception_messages(nested),
+            ["invocation error: browser_navigate failed"],
+        )
+
+    def test_multiple_nested_leaf_errors_are_included_in_order(self) -> None:
+        nested = ExceptionGroup(
+            "outer task group",
+            [
+                spike.SpikeError("primary operation failure: navigate failed"),
+                ExceptionGroup(
+                    "shutdown task group",
+                    [
+                        spike.SpikeError(
+                            "additional shutdown failure: browser_close failed"
+                        )
+                    ],
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            spike.extract_exception_messages(nested),
+            [
+                "primary operation failure: navigate failed",
+                "additional shutdown failure: browser_close failed",
+            ],
+        )
+
+    def test_duplicate_leaf_messages_are_not_repeated(self) -> None:
+        nested = ExceptionGroup(
+            "outer task group",
+            [
+                spike.SpikeError("browser unavailable"),
+                ExceptionGroup(
+                    "inner task group",
+                    [spike.SpikeError("browser unavailable")],
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            spike.extract_exception_messages(nested),
+            ["browser unavailable"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

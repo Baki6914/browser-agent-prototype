@@ -166,6 +166,42 @@ def ensure_usable_result(operation: str, result: object) -> str:
     return text
 
 
+def raise_preserving_failures(
+    primary_error: Exception | None,
+    shutdown_error: Exception | None,
+) -> None:
+    """Raise a sole failure unchanged, or report primary and shutdown failures."""
+    if primary_error is not None and shutdown_error is not None:
+        raise SpikeError(
+            f"primary operation failure: {primary_error}; "
+            f"additional shutdown failure: {shutdown_error}"
+        ) from primary_error
+    if primary_error is not None:
+        raise primary_error
+    if shutdown_error is not None:
+        raise shutdown_error
+
+
+def extract_exception_messages(exc: Exception) -> list[str]:
+    """Return distinct leaf messages from nested exception groups."""
+    messages: list[str] = []
+    seen: set[str] = set()
+
+    def visit(current: Exception) -> None:
+        if isinstance(current, ExceptionGroup):
+            for nested in current.exceptions:
+                visit(nested)
+            return
+
+        message = str(current).strip()
+        if message and message not in seen:
+            seen.add(message)
+            messages.append(message)
+
+    visit(exc)
+    return messages
+
+
 async def _with_timeout(awaitable: Any, label: str, seconds: float) -> Any:
     try:
         async with asyncio.timeout(seconds):
@@ -228,42 +264,56 @@ async def run_connectivity_spike() -> None:
                 )
 
                 names = {tool.name for tool in tools}
+                primary_error: Exception | None = None
+                shutdown_error: Exception | None = None
                 try:
-                    navigate = await _with_timeout(
-                        session.call_tool(
-                            "browser_navigate", arguments={"url": TARGET_URL}
-                        ),
-                        "browser_navigate",
-                        OPERATION_TIMEOUT_SECONDS,
-                    )
-                    ensure_usable_result("browser_navigate", navigate)
+                    try:
+                        navigate = await _with_timeout(
+                            session.call_tool(
+                                "browser_navigate", arguments={"url": TARGET_URL}
+                            ),
+                            "browser_navigate",
+                            OPERATION_TIMEOUT_SECONDS,
+                        )
+                        ensure_usable_result("browser_navigate", navigate)
 
-                    snapshot = await _with_timeout(
-                        session.call_tool("browser_snapshot", arguments={}),
-                        "browser_snapshot",
-                        OPERATION_TIMEOUT_SECONDS,
-                    )
-                    ensure_usable_result("browser_snapshot", snapshot)
+                        snapshot = await _with_timeout(
+                            session.call_tool("browser_snapshot", arguments={}),
+                            "browser_snapshot",
+                            OPERATION_TIMEOUT_SECONDS,
+                        )
+                        ensure_usable_result("browser_snapshot", snapshot)
+                    except Exception as exc:
+                        primary_error = exc
                 finally:
                     if "browser_close" in names:
-                        close_result = await _with_timeout(
-                            session.call_tool("browser_close", arguments={}),
-                            "browser_close",
-                            SHUTDOWN_TIMEOUT_SECONDS,
-                        )
-                        if _tool_value(
-                            close_result,
-                            "isError",
-                            _tool_value(close_result, "is_error", False),
-                        ):
-                            raise SpikeError(
-                                "shutdown error: browser_close returned an MCP error: "
-                                + extract_result_text(close_result)
+                        try:
+                            close_result = await _with_timeout(
+                                session.call_tool("browser_close", arguments={}),
+                                "browser_close",
+                                SHUTDOWN_TIMEOUT_SECONDS,
                             )
+                            if _tool_value(
+                                close_result,
+                                "isError",
+                                _tool_value(close_result, "is_error", False),
+                            ):
+                                raise SpikeError(
+                                    "shutdown error: browser_close returned an MCP "
+                                    "error: "
+                                    + extract_result_text(close_result)
+                                )
+                        except Exception as exc:
+                            shutdown_error = exc
+                raise_preserving_failures(primary_error, shutdown_error)
     except SpikeError:
         raise
     except Exception as exc:
-        raise SpikeError(f"startup, invocation, or shutdown error: {exc}") from exc
+        messages = extract_exception_messages(exc)
+        details = "; ".join(messages) if messages else str(exc)
+        raise SpikeError(
+            f"startup, invocation, or shutdown error: {details}"
+        ) from exc
 
 
 def main() -> int:
