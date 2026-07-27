@@ -1,0 +1,10 @@
+{
+  "name": "browser-agent-prototype-mvp",
+  "private": true,
+  "scripts": {
+    "playwright-mcp": "node ./node_modules/@playwright/mcp/cli.js"
+  },
+  "dependencies": {
+    "@playwright/mcp": "0.0.78"
+  }
+}

@@ -218,3 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 artifacts/
+node_modules/
+
+.playwright-mcp/

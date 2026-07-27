@@ -1,0 +1,22 @@
+{
+  "browser": {
+    "browserName": "chromium",
+    "isolated": true,
+    "launchOptions": {
+      "headless": true
+    }
+  },
+  "capabilities": [
+    "core"
+  ],
+  "network": {
+    "allowedOrigins": [
+      "https://example.com"
+    ]
+  },
+  "imageResponses": "omit",
+  "codegen": "none",
+  "allowUnrestrictedFileAccess": false,
+  "saveSession": false,
+  "sharedBrowserContext": false
+}
