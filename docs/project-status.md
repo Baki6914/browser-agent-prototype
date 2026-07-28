@@ -4,13 +4,14 @@
 
 - **Active branch:** `mvp/playwright-mcp-agent`
 - **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current completed milestone:** Milestone 4, Agent Control Tools
+- **Current completed milestone:** Milestone 5, Deterministic MCP-backed Mock
+  Agent Loop
 - **Current implementation:** synchronous learning prototype, verified local
-  Playwright MCP connectivity spike, dynamic MCP tool gateway, typed tool
-  classification and policy layer, and typed application-owned `finish` and
-  `ask_user` controls
-- **Current phase:** Preparing and reviewing the Milestone 5, Deterministic
-  MCP-backed Mock Agent Loop, Implementation Brief
+  Playwright MCP connectivity, dynamic MCP tool gateway, typed classification
+  and policy enforcement, typed `finish` and `ask_user` controls,
+  `AgentToolRouter`, and a deterministic observation-driven agent loop
+- **Current phase:** Preparing and reviewing the Milestone 6,
+  OpenAI-Compatible LLM Provider, Implementation Brief
 
 ## Completed
 
@@ -128,34 +129,79 @@
   the local and remote branch hashes were verified equal, and the working tree
   was clean after the push.
 - Milestone 4, Agent Control Tools, is completed.
+- Milestone 5 introduced typed `AgentToolSource`, `AgentStepStatus`, and
+  `AgentRunStatus`; immutable `AgentToolDefinition`, `AgentStepObservation`,
+  `AgentStepRecord`, `AgentLoopContext`, and `AgentRunResult`; defensively
+  copied `AgentToolCall`; `AgentDecisionSourceProtocol`; temporary
+  `ScriptedDecisionSource`; `McpToolExecutorProtocol`; `AgentToolCatalogError`;
+  `AgentToolRouter`; and `DeterministicAgentLoop`.
+- `AgentToolCall` accepts only a mapping, deep-copies nested arguments during
+  construction, retains no caller-owned mutable dictionary, and returns a
+  fresh nested copy through public argument access.
+- `AgentToolRouter` combines policy-visible MCP definitions with `finish` and
+  `ask_user`, sorts the catalog alphabetically, and returns fresh nested schema
+  copies. Duplicate MCP names and MCP/control name collisions are rejected.
+- `finish` and `ask_user` remain local and never reach MCP. Browser tools use
+  only the supplied policy-enforced executor; the router never calls
+  `McpToolGateway` directly. Unknown tools call neither executor.
+- The router always passes `confirmation_granted=False`; tool arguments,
+  including similarly named arguments, cannot grant trusted approval.
+- `DeterministicAgentLoop` validates its task and positive exact-integer
+  `max_steps`, rejecting booleans; builds a fresh context for each decision;
+  records decisions and observations; and feeds observations into the next
+  context.
+- `finish` terminates with `FINISHED`; `ask_user` pauses with
+  `AWAITING_USER`; source exhaustion and the step limit are typed termination
+  states. All run state and step records remain in memory.
+- Expected repository-owned control, policy, and gateway errors become
+  `REJECTED` observations containing their exception type and message.
+  Unexpected programming errors propagate with their original traceback.
+- A rejected confirmation-required action is not retried or executed after a
+  later `ask_user` decision.
+- The live smoke's false-positive protection requires successful browser
+  steps and rejects `MCP_ERROR` or `TRANSPORT_ERROR` in either browser step.
+- The verified Milestone 5 feature checkpoint is
+  `09af169f5370f8b5cfa8087e500555afd02c22fe`, with commit subject
+  `feat: add deterministic MCP agent loop`.
+- The full unit-test suite ran 126 tests and all passed with final result
+  `OK`; `py_compile` and `git diff --check` passed.
+- The real MCP smoke passed. Stdout was exactly
+  `MCP agent loop smoke succeeded: navigate, snapshot, finish, and close`;
+  stderr was empty and the exit code was 0.
+- The Milestone 5 feature checkpoint was committed and pushed by the human,
+  the local and remote branch hashes were verified equal, and the working tree
+  was clean after the push.
+- Milestone 5, Deterministic MCP-backed Mock Agent Loop, is completed.
 
 The gateway remains the browser-capability boundary and normalization layer.
 Dynamic discovery is capability information, not authorization. The policy
 layer enforces authorization decisions. The agent-control layer remains local
-to the orchestrator. Neither layer is an agent loop.
+to the orchestrator, and the router joins that local path with the
+policy-enforced MCP path without collapsing their boundaries.
 
 ## In progress
 
-- Preparation and review of the Milestone 5, Deterministic MCP-backed Mock
-  Agent Loop, Implementation Brief.
+- Preparation and review of the Milestone 6, OpenAI-Compatible LLM Provider,
+  Implementation Brief.
 
 ## Not started
 
-- A tool router.
-- A deterministic MCP-backed mock agent loop.
+- A real OpenAI-compatible LLM provider.
+- Provider request construction.
+- Provider response and tool-call parsing.
+- Provider error and timeout behavior.
 - A real confirmation UI or question presentation.
 - User-response waiting and resume.
-- Trusted approval-state management or persistence.
+- Trusted approval-state management.
 - Session and step persistence.
-- Step and timeout limits.
-- An OpenAI-compatible LLM provider.
-- General browser-agent MVP evaluation.
+- A timeout system.
+- General browser-agent MVP evaluation using a real model.
 - Local vLLM integration.
 - HTTP API work.
 - Database work.
 - Offline packaging and optional Docker.
 
-Milestone 5, Deterministic MCP-backed Mock Agent Loop, is the next engineering
+Milestone 6, OpenAI-Compatible LLM Provider, is the next engineering
 milestone. Its implementation has not started.
 
 ## Known constraints
@@ -193,12 +239,23 @@ milestone. Its implementation has not started.
 - `finish` does not verify factual task completion.
 - `ask_user` produces `AWAITING_USER` only; it does not display a UI, wait for
   an answer, persist it, or resume execution automatically.
-- No tool router or deterministic loop exists yet, and no real LLM provider
-  exists.
-- The policy layer and agent-control layer are implemented but are not yet
-  joined by a loop. The intended future route sends agent controls to
-  `AgentControlExecutor` and browser tools to
-  `PolicyEnforcedToolExecutor`.
+- `ScriptedDecisionSource` is finite, deterministic, and memory-only. It tests
+  only the loop execution contract; it is not a real LLM, a provider
+  simulation, or a model of provider request and response internals.
+- No real model currently chooses tools. `DeterministicAgentLoop` executes
+  supplied decisions but does not generate them.
+- `AgentToolRouter` joins the local control path and the policy-enforced MCP
+  path. Agent controls never reach MCP, and browser tools never bypass policy
+  enforcement.
+- `confirmation_granted` remains false in the loop. No trusted confirmation
+  workflow exists, and rejected actions are not automatically retried.
+- `ask_user` does not display a UI, wait for an answer, persist state, or
+  resume execution.
+- Run state and step history are memory-only. No timeout system exists.
+- Unexpected programming errors propagate rather than becoming generic run
+  results.
+- Mock infrastructure will not be expanded further. The next milestone must
+  connect a real OpenAI-compatible provider to the existing loop.
 - Allowed origins are a defensive configuration, not a complete security
   boundary. Local MCP transport does not make target web content trusted.
 - File upload and download lifecycle management and credential handling remain
@@ -212,8 +269,9 @@ milestone. Its implementation has not started.
 
 ## Immediate next step
 
-Prepare and review the Milestone 5, Deterministic MCP-backed Mock Agent Loop,
-Implementation Brief. Milestone 5 implementation has not started.
+Prepare and review the Milestone 6, OpenAI-Compatible LLM Provider,
+Implementation Brief. Milestone 6 implementation has not started. Further
+mock-loop expansion is out of scope.
 
 ## Last verified checkpoint
 
@@ -325,3 +383,33 @@ Also verified on `2026-07-28`:
   push.
 
 Milestone 4, Agent Control Tools, is completed.
+
+Also verified on `2026-07-28`:
+
+- The verified Milestone 5 feature checkpoint is
+  `09af169f5370f8b5cfa8087e500555afd02c22fe`, with commit subject
+  `feat: add deterministic MCP agent loop`.
+- The checkpoint changed exactly five files: `browser_agent/__init__.py`,
+  `browser_agent/agent_loop.py`, `docs/agent-loop.md`,
+  `scripts/mcp_agent_loop_smoke.py`, and `tests/test_agent_loop.py`.
+- The full unit-test suite ran 126 tests and all passed with final result
+  `OK`.
+- `py_compile` passed.
+- `git diff --check` passed.
+- The real MCP-backed live smoke passed. Stdout was exactly
+  `MCP agent loop smoke succeeded: navigate, snapshot, finish, and close`;
+  stderr was empty and the exit code was 0.
+- `browser_navigate` and `browser_snapshot` both returned source `MCP` and
+  status `SUCCESS`; `finish` remained local with source `AGENT_CONTROL` and
+  status `FINISHED`.
+- The loop recorded exactly three steps. `finish` did not reach MCP, and
+  `browser_close` succeeded only through
+  `PolicyEnforcedToolExecutor.invoke_internal()`.
+- False-positive protection rejects `MCP_ERROR` and `TRANSPORT_ERROR` in
+  either browser step rather than allowing a later `finish` to hide the
+  failure.
+- The feature checkpoint was committed and pushed by the human, the local and
+  remote branch hashes were verified equal, and the working tree was clean
+  after the push.
+
+Milestone 5, Deterministic MCP-backed Mock Agent Loop, is completed.

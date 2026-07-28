@@ -49,16 +49,20 @@ process on the same computer:
 
 Milestone 1 is completed. Milestone 2, Dynamic MCP Tool Gateway, is completed.
 Milestone 3, Tool Classification and Policy Layer, is completed. Milestone 4,
-Agent Control Tools, is completed. Typed application-owned `finish` and
-`ask_user` controls now exist. These controls remain separate from MCP browser
-tools and never reach MCP. The current work is preparation and review of
-Milestone 5, Deterministic MCP-backed Mock Agent Loop. Milestone 5 will connect
-agent-control routing with policy-enforced MCP tool execution in a
-deterministic mock loop. A real LLM provider, confirmation or question UI,
-user-response waiting and resume, and persistence remain later work. Dynamic
-discovery remains distinct from authorization. Do not recreate the lost
-asynchronous `BrowserService` draft unless a separately approved plan
-explicitly requires it.
+Agent Control Tools, is completed. Milestone 5, Deterministic MCP-backed Mock
+Agent Loop, is completed. `AgentToolRouter` now keeps agent controls separate
+from policy-enforced MCP browser execution. `DeterministicAgentLoop` now
+supports observation feedback, `finish`, `ask_user`, source exhaustion, and
+`max_steps`. The real navigate -> snapshot -> local finish -> internal close
+smoke passed. `ScriptedDecisionSource` is only a temporary deterministic
+execution-contract source, not a real provider, and mock infrastructure must
+not be expanded further. The current work is preparation and review of
+Milestone 6, OpenAI-Compatible LLM Provider. The next implementation must
+connect a real OpenAI-compatible provider to the existing loop. Confirmation
+UI, trusted approval, user-response waiting and resume, and persistence remain
+later work. Dynamic discovery remains distinct from authorization. Do not
+recreate the lost asynchronous `BrowserService` draft unless a separately
+approved plan explicitly requires it.
 
 The following are currently out of scope:
 
