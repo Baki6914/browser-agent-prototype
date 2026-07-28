@@ -48,10 +48,14 @@ process on the same computer:
   included in the initial MVP allowlist.
 
 Milestone 1 is completed. Milestone 2, Dynamic MCP Tool Gateway, is completed.
-Milestone 3, Tool Classification and Policy Layer, is completed. The current
-work is preparation and review of Milestone 4, Agent Control Tools. Milestone 4
-will concern application-owned controls such as `finish` and `ask_user`. A real
-confirmation UI and the complete agent loop remain later work. Dynamic
+Milestone 3, Tool Classification and Policy Layer, is completed. Milestone 4,
+Agent Control Tools, is completed. Typed application-owned `finish` and
+`ask_user` controls now exist. These controls remain separate from MCP browser
+tools and never reach MCP. The current work is preparation and review of
+Milestone 5, Deterministic MCP-backed Mock Agent Loop. Milestone 5 will connect
+agent-control routing with policy-enforced MCP tool execution in a
+deterministic mock loop. A real LLM provider, confirmation or question UI,
+user-response waiting and resume, and persistence remain later work. Dynamic
 discovery remains distinct from authorization. Do not recreate the lost
 asynchronous `BrowserService` draft unless a separately approved plan
 explicitly requires it.

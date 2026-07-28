@@ -4,13 +4,13 @@
 
 - **Active branch:** `mvp/playwright-mcp-agent`
 - **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current completed milestone:** Milestone 3, Tool Classification and Policy
-  Layer
+- **Current completed milestone:** Milestone 4, Agent Control Tools
 - **Current implementation:** synchronous learning prototype, verified local
-  Playwright MCP connectivity spike, dynamic MCP tool gateway, and typed
-  classification and policy layer
-- **Current phase:** Preparing and reviewing the Milestone 4, Agent Control
-  Tools, Implementation Brief
+  Playwright MCP connectivity spike, dynamic MCP tool gateway, typed tool
+  classification and policy layer, and typed application-owned `finish` and
+  `ask_user` controls
+- **Current phase:** Preparing and reviewing the Milestone 5, Deterministic
+  MCP-backed Mock Agent Loop, Implementation Brief
 
 ## Completed
 
@@ -95,30 +95,67 @@
   local and remote branch hashes were verified equal, and the working tree was
   clean after the push.
 - Milestone 3, Tool Classification and Policy Layer, is completed.
+- Milestone 4 introduced `AgentControlStatus` with `FINISHED` and
+  `AWAITING_USER`, immutable `AgentControlDefinition` and
+  `AgentControlResult`, a control-owned error hierarchy, private immutable
+  control specifications, and `AgentControlExecutor`.
+- Exactly two application-owned controls are defined: `finish` and `ask_user`.
+  Their definitions use deterministic alphabetical ordering and fresh
+  defensive copies of nested schemas.
+- Strict dependency-free validation fails closed for unknown or empty control
+  names, browser or MCP names, non-mapping arguments, missing or unexpected
+  fields, non-string values including booleans, and empty or whitespace-only
+  strings.
+- Accepted text is preserved exactly. `finish` returns `FINISHED`, with the
+  supplied result in both `text` and `final_result` and `question=None`.
+  `ask_user` returns `AWAITING_USER`, with the supplied question in both
+  `text` and `question` and `final_result=None`.
+- Explicit execution branches route `finish` and `ask_user`; a future control
+  registered without an execution branch fails closed with
+  `AgentControlError`.
+- Unexpected argument fields use deterministic `repr`-sorted rendering.
+- Agent controls remain separate from MCP and browser tools: they are not
+  discovered through MCP, added to MCP policy, or sent to the policy executor,
+  gateway, MCP session, Playwright, subprocesses, or network services.
+- The verified Milestone 4 feature checkpoint is
+  `1146ad838d44edb65091fb964ff605db1e502556` (`feat: add agent control
+  tools`).
+- The full unit-test suite ran 103 tests and all passed with final result
+  `OK`; `py_compile` and `git diff --check` passed.
+- No live MCP or browser smoke was needed for the dependency-free local
+  controls.
+- The Milestone 4 feature checkpoint was committed and pushed by the human,
+  the local and remote branch hashes were verified equal, and the working tree
+  was clean after the push.
+- Milestone 4, Agent Control Tools, is completed.
 
 The gateway remains the browser-capability boundary and normalization layer.
 Dynamic discovery is capability information, not authorization. The policy
-layer enforces authorization decisions, but it is not an agent loop.
+layer enforces authorization decisions. The agent-control layer remains local
+to the orchestrator. Neither layer is an agent loop.
 
 ## In progress
 
-- Preparation and review of the Milestone 4, Agent Control Tools,
-  Implementation Brief.
+- Preparation and review of the Milestone 5, Deterministic MCP-backed Mock
+  Agent Loop, Implementation Brief.
 
 ## Not started
 
-- Application-owned `finish` and `ask_user` tools.
-- A real confirmation UI or confirmation presentation.
-- Trusted approval-state management or persistence.
+- A tool router.
 - A deterministic MCP-backed mock agent loop.
+- A real confirmation UI or question presentation.
+- User-response waiting and resume.
+- Trusted approval-state management or persistence.
+- Session and step persistence.
+- Step and timeout limits.
 - An OpenAI-compatible LLM provider.
 - General browser-agent MVP evaluation.
 - Local vLLM integration.
-- Session and persistence work.
 - HTTP API work.
+- Database work.
 - Offline packaging and optional Docker.
 
-Milestone 4, Agent Control Tools, is the next engineering
+Milestone 5, Deterministic MCP-backed Mock Agent Loop, is the next engineering
 milestone. Its implementation has not started.
 
 ## Known constraints
@@ -151,8 +188,17 @@ milestone. Its implementation has not started.
   review.
 - `confirmation_granted` is only an enforcement input. No confirmation UI,
   trusted approval source, identity, or persisted approval exists.
-- The policy layer is not an agent loop and does not provide `finish`,
-  `ask_user`, or an LLM provider.
+- `AgentControlExecutor` performs only local Python validation and result
+  construction. `finish` and `ask_user` never invoke MCP or browser tools.
+- `finish` does not verify factual task completion.
+- `ask_user` produces `AWAITING_USER` only; it does not display a UI, wait for
+  an answer, persist it, or resume execution automatically.
+- No tool router or deterministic loop exists yet, and no real LLM provider
+  exists.
+- The policy layer and agent-control layer are implemented but are not yet
+  joined by a loop. The intended future route sends agent controls to
+  `AgentControlExecutor` and browser tools to
+  `PolicyEnforcedToolExecutor`.
 - Allowed origins are a defensive configuration, not a complete security
   boundary. Local MCP transport does not make target web content trusted.
 - File upload and download lifecycle management and credential handling remain
@@ -166,8 +212,8 @@ milestone. Its implementation has not started.
 
 ## Immediate next step
 
-Prepare and review the Milestone 4, Agent Control Tools, Implementation Brief.
-Milestone 4 implementation has not started.
+Prepare and review the Milestone 5, Deterministic MCP-backed Mock Agent Loop,
+Implementation Brief. Milestone 5 implementation has not started.
 
 ## Last verified checkpoint
 
@@ -255,3 +301,27 @@ Also verified on `2026-07-28`:
   clean after the push.
 
 Milestone 3, Tool Classification and Policy Layer, is completed.
+
+Also verified on `2026-07-28`:
+
+- The verified Milestone 4 feature checkpoint is
+  `1146ad838d44edb65091fb964ff605db1e502556`, with commit subject
+  `feat: add agent control tools`.
+- The full unit-test suite ran 103 tests and all passed with final result
+  `OK`.
+- `py_compile` passed.
+- `git diff --check` passed.
+- Agent controls were tested without Node, MCP, Chromium, Playwright, network,
+  or external services. No live MCP or browser smoke was required because
+  their execution is local and dependency-free.
+- `finish` preserves its exact non-empty supplied result in `text` and
+  `final_result`, returns `FINISHED`, and sets `question=None`.
+- `ask_user` preserves its exact non-empty supplied question in `text` and
+  `question`, returns `AWAITING_USER`, and sets `final_result=None`.
+- Fail-closed validation rejects invalid names and arguments, and explicit
+  routing rejects registered but unimplemented future controls.
+- The checkpoint was committed and pushed by the human, the local and remote
+  branch hashes were verified equal, and the working tree was clean after the
+  push.
+
+Milestone 4, Agent Control Tools, is completed.
