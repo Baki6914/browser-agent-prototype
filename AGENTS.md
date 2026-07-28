@@ -50,19 +50,27 @@ process on the same computer:
 Milestone 1 is completed. Milestone 2, Dynamic MCP Tool Gateway, is completed.
 Milestone 3, Tool Classification and Policy Layer, is completed. Milestone 4,
 Agent Control Tools, is completed. Milestone 5, Deterministic MCP-backed Mock
-Agent Loop, is completed. `AgentToolRouter` now keeps agent controls separate
-from policy-enforced MCP browser execution. `DeterministicAgentLoop` now
-supports observation feedback, `finish`, `ask_user`, source exhaustion, and
-`max_steps`. The real navigate -> snapshot -> local finish -> internal close
-smoke passed. `ScriptedDecisionSource` is only a temporary deterministic
-execution-contract source, not a real provider, and mock infrastructure must
-not be expanded further. The current work is preparation and review of
-Milestone 6, OpenAI-Compatible LLM Provider. The next implementation must
-connect a real OpenAI-compatible provider to the existing loop. Confirmation
-UI, trusted approval, user-response waiting and resume, and persistence remain
-later work. Dynamic discovery remains distinct from authorization. Do not
-recreate the lost asynchronous `BrowserService` draft unless a separately
-approved plan explicitly requires it.
+Agent Loop, is completed. Milestone 6, OpenAI-Compatible LLM Provider, has
+completed implementation, review, unit tests, Learning Handoff, human feature
+commit and push, remote feature-checkpoint verification, and a live external-
+provider smoke. `OpenAICompatibleDecisionSource` implements the existing
+`AgentDecisionSourceProtocol` boundary and supplies proposed decisions to the
+observation-driven loop. Its endpoint, model, API key, and timeout are
+configuration values, so the provider boundary remains provider-neutral.
+
+Provider visibility is not execution authority. `AgentToolRouter`,
+`McpToolPolicy`, `PolicyEnforcedToolExecutor`, `McpToolGateway`, and the local
+agent controls remain the enforcement and execution boundaries. The successful
+external smoke temporarily used NVIDIA API with `z-ai/glm-5.2` and only public
+`https://example.com` data. This is external integration proof only; it does
+not satisfy offline, on-prem, institution-internal, local-vLLM,
+confidential-data, or production-readiness goals. The next work is planning
+Milestone 7, MVP Evaluation.
+
+Confirmation UI, trusted approval, user-response waiting and resume, and
+persistence remain later work. Dynamic discovery remains distinct from
+authorization. Do not recreate the lost asynchronous `BrowserService` draft
+unless a separately approved plan explicitly requires it.
 
 The following are currently out of scope:
 

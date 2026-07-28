@@ -4,14 +4,13 @@
 
 - **Active branch:** `mvp/playwright-mcp-agent`
 - **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current completed milestone:** Milestone 5, Deterministic MCP-backed Mock
-  Agent Loop
+- **Current completed milestone:** Milestone 6, OpenAI-Compatible LLM Provider
 - **Current implementation:** synchronous learning prototype, verified local
   Playwright MCP connectivity, dynamic MCP tool gateway, typed classification
   and policy enforcement, typed `finish` and `ask_user` controls,
-  `AgentToolRouter`, and a deterministic observation-driven agent loop
-- **Current phase:** Preparing and reviewing the Milestone 6,
-  OpenAI-Compatible LLM Provider, Implementation Brief
+  `AgentToolRouter`, a deterministic observation-driven agent loop, and a
+  provider-neutral real decision source connected to that existing loop
+- **Current phase:** planning Milestone 7, MVP Evaluation
 
 ## Completed
 
@@ -172,6 +171,75 @@
   the local and remote branch hashes were verified equal, and the working tree
   was clean after the push.
 - Milestone 5, Deterministic MCP-backed Mock Agent Loop, is completed.
+- Milestone 6 introduced the public `OpenAICompatibleProviderConfig`,
+  `OpenAICompatibleDecisionSource`, `OpenAIProviderError`,
+  `OpenAIProviderConfigurationError`, `OpenAIProviderTimeoutError`,
+  `OpenAIProviderTransportError`, `OpenAIProviderHTTPError`, and
+  `OpenAIProviderResponseError` types.
+- `OpenAICompatibleDecisionSource` implements the existing
+  `AgentDecisionSourceProtocol` as a provider-neutral OpenAI-compatible Chat
+  Completions boundary. Endpoint, model, API key, and timeout are supplied
+  through configuration; no provider-specific NVIDIA runtime class or
+  hard-coded runtime endpoint or model was added.
+- The provider consumes `AgentLoopContext`. It deterministically serializes the
+  task and previous step observations, converts only the context tool
+  definitions into OpenAI-compatible function tools, and defensively copies
+  nested schemas. Requests use `tool_choice="auto"` and
+  `parallel_tool_calls=false`.
+- Response parsing accepts exactly one function tool call. Missing, malformed,
+  text-only, multiple, or non-object tool-call responses fail closed with
+  typed response errors. Syntactically valid unknown tool names remain the
+  router's responsibility.
+- The provider proposes decisions only. It does not execute tools, call MCP,
+  apply policy, or grant confirmation. `AgentToolRouter`, `McpToolPolicy`,
+  `PolicyEnforcedToolExecutor`, `McpToolGateway`, and local agent controls
+  remain the enforcement and execution boundaries.
+- Configuration, timeout, transport, HTTP-status, and response failures use
+  typed provider errors. The API key is excluded from configuration `repr`,
+  and an echoed API key is redacted before HTTP error-body truncation.
+  Base URLs containing literal whitespace are rejected, and invalid response
+  UTF-8 is normalized to `OpenAIProviderResponseError`.
+- No retries, streaming, persistence, confirmation UI, waiting/resume, or
+  local vLLM integration was added.
+- The full unit-test suite ran 153 tests with 153 passing and 0 failures.
+  `py_compile` and `git diff --check` passed.
+- The verified Milestone 6 feature checkpoint is
+  `3e195e0fa46d1224a78b3208e20c39e5f0aae489`, with commit subject
+  `feat: add OpenAI-compatible decision provider`.
+- That checkpoint changed exactly six files: `browser_agent/__init__.py`,
+  `browser_agent/openai_provider.py`, `docs/openai-provider.md`,
+  `requirements.txt`, `scripts/openai_agent_smoke.py`, and
+  `tests/test_openai_provider.py`.
+- The feature checkpoint was committed and pushed by the human, the local and
+  remote branch hashes were verified equal, and the working tree was clean
+  after the feature push.
+- A minimal external probe temporarily used NVIDIA API with model
+  `z-ai/glm-5.2`, supplied its API root through the generic environment
+  contract, returned HTTP 200 in 8.87 seconds, and produced model response
+  `OK`.
+- The real external-provider plus local-MCP smoke ran
+  `python scripts/openai_agent_smoke.py` against only public
+  `https://example.com` data. Its decision flow was
+  `browser_navigate` -> `browser_snapshot` -> `finish`, followed by internal
+  close. Both browser actions succeeded through MCP; `finish` remained a local
+  application-owned control and did not reach MCP; `browser_close` ran only
+  through `PolicyEnforcedToolExecutor.invoke_internal()`.
+- Smoke stdout was exactly
+  `OpenAI-compatible agent smoke succeeded: model navigate, snapshot, finish, and close`;
+  stderr was empty and the exit code was 0.
+- The external checks used only public or synthetic data and committed no API
+  key. They prove that a real external OpenAI-compatible model can drive the
+  existing loop, router, policy, gateway, MCP, Playwright, and local controls,
+  and that provider replacement works through configuration without changing
+  the loop.
+- NVIDIA API was only the temporary external verification provider. These
+  checks do not prove offline operation, on-prem or institution-internal
+  deployment, local-vLLM compatibility, approval to use confidential or
+  institution data with external models, or production readiness.
+- Milestone 6 implementation, review, unit tests, Learning Handoff, human
+  feature commit and push, remote feature-checkpoint verification, and live
+  external-provider smoke are complete.
+- Milestone 6, OpenAI-Compatible LLM Provider, is completed.
 
 The gateway remains the browser-capability boundary and normalization layer.
 Dynamic discovery is capability information, not authorization. The policy
@@ -181,15 +249,11 @@ policy-enforced MCP path without collapsing their boundaries.
 
 ## In progress
 
-- Preparation and review of the Milestone 6, OpenAI-Compatible LLM Provider,
-  Implementation Brief.
+- Preparation and review of the Milestone 7, MVP Evaluation, Implementation
+  Brief.
 
 ## Not started
 
-- A real OpenAI-compatible LLM provider.
-- Provider request construction.
-- Provider response and tool-call parsing.
-- Provider error and timeout behavior.
 - A real confirmation UI or question presentation.
 - User-response waiting and resume.
 - Trusted approval-state management.
@@ -200,9 +264,6 @@ policy-enforced MCP path without collapsing their boundaries.
 - HTTP API work.
 - Database work.
 - Offline packaging and optional Docker.
-
-Milestone 6, OpenAI-Compatible LLM Provider, is the next engineering
-milestone. Its implementation has not started.
 
 ## Known constraints
 
@@ -242,20 +303,29 @@ milestone. Its implementation has not started.
 - `ScriptedDecisionSource` is finite, deterministic, and memory-only. It tests
   only the loop execution contract; it is not a real LLM, a provider
   simulation, or a model of provider request and response internals.
-- No real model currently chooses tools. `DeterministicAgentLoop` executes
-  supplied decisions but does not generate them.
+- A real model now chooses tools through the provider boundary, but external
+  model output remains untrusted proposed decisions. The router, policy,
+  gateway, policy-enforced executor, and local controls remain the enforcement
+  and execution boundaries.
 - `AgentToolRouter` joins the local control path and the policy-enforced MCP
   path. Agent controls never reach MCP, and browser tools never bypass policy
   enforcement.
 - `confirmation_granted` remains false in the loop. No trusted confirmation
-  workflow exists, and rejected actions are not automatically retried.
+  workflow exists, so model-selected confirmation-required tools are rejected
+  and are not automatically retried.
 - `ask_user` does not display a UI, wait for an answer, persist state, or
   resume execution.
-- Run state and step history are memory-only. No timeout system exists.
+- Provider configuration includes an HTTP timeout, and provider failures
+  propagate as typed provider exceptions from the decision source. No retries
+  or streaming are implemented.
+- Run state and step history are memory-only. No general run timeout system
+  exists.
 - Unexpected programming errors propagate rather than becoming generic run
   results.
-- Mock infrastructure will not be expanded further. The next milestone must
-  connect a real OpenAI-compatible provider to the existing loop.
+- Mock infrastructure will not be expanded further.
+- The external NVIDIA verification does not establish offline operation,
+  institution-internal or on-prem deployment, local-vLLM compatibility,
+  confidential-data suitability, or production readiness.
 - Allowed origins are a defensive configuration, not a complete security
   boundary. Local MCP transport does not make target web content trusted.
 - File upload and download lifecycle management and credential handling remain
@@ -263,15 +333,14 @@ milestone. Its implementation has not started.
 - Docker is not required for the first browser-agent MVP.
 - FastAPI, sessions, persistence, offline packaging, and production deployment
   remain out of scope.
-- Until local vLLM integration, only synthetic or public test data may be used.
+- Until local vLLM integration, only synthetic or public data may be sent to
+  external providers.
 - Secrets, internal URLs, institution data, and confidential browser contents
-  must not be sent to external services.
+  remain prohibited from external services.
 
 ## Immediate next step
 
-Prepare and review the Milestone 6, OpenAI-Compatible LLM Provider,
-Implementation Brief. Milestone 6 implementation has not started. Further
-mock-loop expansion is out of scope.
+Prepare and review the Milestone 7, MVP Evaluation, Implementation Brief.
 
 ## Last verified checkpoint
 
@@ -413,3 +482,40 @@ Also verified on `2026-07-28`:
   after the push.
 
 Milestone 5, Deterministic MCP-backed Mock Agent Loop, is completed.
+
+Also verified on `2026-07-28`:
+
+- The verified Milestone 6 feature checkpoint is
+  `3e195e0fa46d1224a78b3208e20c39e5f0aae489`, with commit subject
+  `feat: add OpenAI-compatible decision provider`.
+- The checkpoint changed exactly six files: `browser_agent/__init__.py`,
+  `browser_agent/openai_provider.py`, `docs/openai-provider.md`,
+  `requirements.txt`, `scripts/openai_agent_smoke.py`, and
+  `tests/test_openai_provider.py`.
+- The full unit-test suite ran 153 tests with 153 passing and 0 failures.
+- `py_compile` passed.
+- `git diff --check` passed.
+- The minimal external-provider probe temporarily used NVIDIA API with model
+  `z-ai/glm-5.2`. Its generic API root was supplied through the environment;
+  it returned HTTP 200 in 8.87 seconds with model response `OK`.
+- The real command `python scripts/openai_agent_smoke.py` used NVIDIA API
+  temporarily with `z-ai/glm-5.2` and only public `https://example.com` data.
+  Its decision flow was `browser_navigate` -> `browser_snapshot` -> `finish`,
+  followed by internal `browser_close`.
+- `browser_navigate` and `browser_snapshot` used the MCP path and succeeded.
+  `finish` remained an application-owned local control and did not reach MCP.
+  `browser_close` ran only through
+  `PolicyEnforcedToolExecutor.invoke_internal()`.
+- Stdout was exactly
+  `OpenAI-compatible agent smoke succeeded: model navigate, snapshot, finish, and close`;
+  stderr was empty and the exit code was 0.
+- Only synthetic or public data was used externally, and no API key was
+  committed.
+- The human committed and pushed the feature checkpoint, the local and remote
+  branch hashes were verified equal, and the working tree was clean at the
+  feature checkpoint.
+- This proves external integration and configuration-based provider
+  replacement through the existing loop. It does not prove offline operation,
+  on-prem or institution-internal deployment, local-vLLM compatibility,
+  approval for confidential or institution data, or production readiness.
+Milestone 6, OpenAI-Compatible LLM Provider, is completed.
