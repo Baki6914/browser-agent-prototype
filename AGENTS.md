@@ -48,10 +48,13 @@ process on the same computer:
   included in the initial MVP allowlist.
 
 Milestone 1 is completed. Milestone 2, Dynamic MCP Tool Gateway, is completed.
-The current work is preparation and review of Milestone 3, Tool Classification
-and Policy Layer. Dynamic discovery remains distinct from authorization. Do
-not recreate the lost asynchronous `BrowserService` draft unless a separately
-approved plan explicitly requires it.
+Milestone 3, Tool Classification and Policy Layer, is completed. The current
+work is preparation and review of Milestone 4, Agent Control Tools. Milestone 4
+will concern application-owned controls such as `finish` and `ask_user`. A real
+confirmation UI and the complete agent loop remain later work. Dynamic
+discovery remains distinct from authorization. Do not recreate the lost
+asynchronous `BrowserService` draft unless a separately approved plan
+explicitly requires it.
 
 The following are currently out of scope:
 

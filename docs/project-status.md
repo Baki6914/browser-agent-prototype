@@ -4,11 +4,13 @@
 
 - **Active branch:** `mvp/playwright-mcp-agent`
 - **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current completed milestone:** Milestone 2, Dynamic MCP Tool Gateway
-- **Current implementation:** synchronous Playwright learning prototype and a
-  verified local Playwright MCP connectivity spike and dynamic MCP tool gateway
-- **Current phase:** Preparing and reviewing the Milestone 3, Tool
-  Classification and Policy Layer, Implementation Brief
+- **Current completed milestone:** Milestone 3, Tool Classification and Policy
+  Layer
+- **Current implementation:** synchronous learning prototype, verified local
+  Playwright MCP connectivity spike, dynamic MCP tool gateway, and typed
+  classification and policy layer
+- **Current phase:** Preparing and reviewing the Milestone 4, Agent Control
+  Tools, Implementation Brief
 
 ## Completed
 
@@ -55,21 +57,59 @@
 - The Milestone 2 code checkpoint was committed and pushed by the human and
   remotely verified.
 - Milestone 2, Dynamic MCP Tool Gateway, is completed.
+- Milestone 3 introduced `ToolCategory`, `PolicyAction`, immutable
+  `ToolPolicyDecision`, a policy-owned error hierarchy, `McpToolPolicy`, and
+  `PolicyEnforcedToolExecutor`.
+- The explicit typed policy registry covers all 24 tools in the committed
+  inventory and is exposed as an immutable `MappingProxyType`.
+- The verified base policy distribution is:
+  - `ALLOW` (11): `browser_console_messages`, `browser_find`,
+    `browser_hover`, `browser_navigate`, `browser_navigate_back`,
+    `browser_network_request`, `browser_network_requests`, `browser_resize`,
+    `browser_snapshot`, `browser_take_screenshot`, and `browser_wait_for`.
+  - `REQUIRE_CONFIRMATION` (8): `browser_click`, `browser_drag`,
+    `browser_fill_form`, `browser_handle_dialog`, `browser_press_key`,
+    `browser_select_option`, `browser_tabs`, and `browser_type`.
+  - `INTERNAL_ONLY` (1): `browser_close`.
+  - `DENY` (4): `browser_drop`, `browser_evaluate`,
+    `browser_file_upload`, and `browser_run_code_unsafe`.
+- Unknown or unclassified tools fail closed as `DENY`.
+- Denied and internal-only tools are excluded from the LLM-visible catalog.
+- Normal invocation and internal-only invocation are separate;
+  `browser_close` is available only through the internal cleanup path, and
+  that path cannot bypass `DENY`.
+- A non-empty filename escalates an otherwise `ALLOW` observation tool to
+  `REQUIRE_CONFIRMATION`.
+- `confirmation_granted` is separate trusted orchestrator state. Strict
+  runtime validation accepts only an actual `bool`; truthy non-booleans such
+  as strings, integers, lists, or dictionaries are rejected before gateway
+  invocation.
+- The real discovery-only policy smoke started MCP, initialized the session,
+  discovered and classified 24 tools, and shut down successfully. It reported
+  `allow=11`, `deny=4`, `internal_only=1`, and
+  `require_confirmation=8`; it invoked no browser tool.
+- The verified Milestone 3 code checkpoint is
+  `8b14ef7a3b65ad9d56a70e8ef3f9fee6d5fafb31` (`feat: add MCP tool policy
+  layer`).
+- The Milestone 3 code checkpoint was committed and pushed by the human, the
+  local and remote branch hashes were verified equal, and the working tree was
+  clean after the push.
+- Milestone 3, Tool Classification and Policy Layer, is completed.
 
-The gateway is a browser-capability boundary and normalization layer. Dynamic
-discovery is not authorization, and the gateway is not an agent loop.
+The gateway remains the browser-capability boundary and normalization layer.
+Dynamic discovery is capability information, not authorization. The policy
+layer enforces authorization decisions, but it is not an agent loop.
 
 ## In progress
 
-- Preparation and review of the Milestone 3, Tool Classification and Policy
-  Layer, Implementation Brief.
+- Preparation and review of the Milestone 4, Agent Control Tools,
+  Implementation Brief.
 
 ## Not started
 
-- Tool classification and policy enforcement.
-- LLM-visible tool allowlisting and filtering.
-- Confirmation rules.
-- Agent-control tools such as `finish` and `ask_user`.
+- Application-owned `finish` and `ask_user` tools.
+- A real confirmation UI or confirmation presentation.
+- Trusted approval-state management or persistence.
 - A deterministic MCP-backed mock agent loop.
 - An OpenAI-compatible LLM provider.
 - General browser-agent MVP evaluation.
@@ -78,7 +118,7 @@ discovery is not authorization, and the gateway is not an agent loop.
 - HTTP API work.
 - Offline packaging and optional Docker.
 
-Milestone 3, Tool Classification and Policy Layer, is the next engineering
+Milestone 4, Agent Control Tools, is the next engineering
 milestone. Its implementation has not started.
 
 ## Known constraints
@@ -95,14 +135,24 @@ milestone. Its implementation has not started.
   `browser_evaluate`, `browser_file_upload`, and
   `browser_run_code_unsafe`. Discovery records advertised capability; it does
   not authorize execution.
-- Only `browser_navigate`, `browser_snapshot`, and `browser_close` were invoked.
-  No `browser_evaluate`, `browser_run_code_unsafe`, file upload, file download,
-  or any other discovered tool was invoked.
-- Discovery records advertised capability; it does not authorize execution.
-  Tool classification, authorization, LLM-visible filtering, policy
-  enforcement, and confirmation rules remain unimplemented.
-- The gateway is not a deterministic agent loop and does not provide
-  `finish`, `ask_user`, or an LLM provider.
+- The Milestone 2 gateway smoke invoked only `browser_navigate`,
+  `browser_snapshot`, and `browser_close`. It did not invoke
+  `browser_evaluate`, `browser_run_code_unsafe`, file upload, file download, or
+  any other discovered tool.
+- The distinct Milestone 3 policy smoke performed MCP startup, session
+  initialization, `list_tools` discovery, local classification, and shutdown
+  only. It did not call `McpToolGateway.invoke()`,
+  `PolicyEnforcedToolExecutor.invoke()`,
+  `PolicyEnforcedToolExecutor.invoke_internal()`, `session.call_tool()`,
+  `browser_navigate`, `browser_close`, or any other browser tool.
+- Dynamic discovery is capability information, not authorization. The policy
+  registry is tied to the current committed 24-tool inventory. Any newly
+  discovered unregistered tool fails closed as `DENY` and requires human
+  review.
+- `confirmation_granted` is only an enforcement input. No confirmation UI,
+  trusted approval source, identity, or persisted approval exists.
+- The policy layer is not an agent loop and does not provide `finish`,
+  `ask_user`, or an LLM provider.
 - Allowed origins are a defensive configuration, not a complete security
   boundary. Local MCP transport does not make target web content trusted.
 - File upload and download lifecycle management and credential handling remain
@@ -116,8 +166,8 @@ milestone. Its implementation has not started.
 
 ## Immediate next step
 
-Prepare and review the Milestone 3, Tool Classification and Policy Layer,
-Implementation Brief. Milestone 3 implementation has not started.
+Prepare and review the Milestone 4, Agent Control Tools, Implementation Brief.
+Milestone 4 implementation has not started.
 
 ## Last verified checkpoint
 
@@ -177,3 +227,31 @@ Verified on `2026-07-28`:
 - The working tree was clean after the push.
 
 Milestone 2, Dynamic MCP Tool Gateway, is completed.
+
+Also verified on `2026-07-28`:
+
+- The verified Milestone 3 code checkpoint is
+  `8b14ef7a3b65ad9d56a70e8ef3f9fee6d5fafb31`, with commit subject
+  `feat: add MCP tool policy layer`.
+- The unit-test suite ran 78 tests and all passed with final result `OK`.
+- `py_compile` passed.
+- `git diff --check` passed.
+- The real command `python scripts/mcp_policy_smoke.py` discovered and
+  classified 24 tools with action counts `allow=11`, `deny=4`,
+  `internal_only=1`, and `require_confirmation=8`.
+- Its stdout ended with
+  `MCP policy smoke succeeded: discovery and classification only`, stderr was
+  empty, and the exit code was 0.
+- The smoke performed MCP startup, session initialization, `list_tools`
+  discovery, local classification, and shutdown only. It did not invoke the
+  gateway or either policy-executor path, call `session.call_tool()`, or invoke
+  `browser_navigate`, `browser_close`, or any other browser tool.
+- Explicit coverage of all 24 committed inventory tools, unknown-tool
+  fail-closed denial, LLM-visible filtering, separate normal and internal-only
+  invocation paths, filename escalation, strict boolean confirmation
+  validation, and immutable registry behavior were verified.
+- The Milestone 3 code checkpoint was committed and pushed by the human, the
+  local and remote branch hashes were verified equal, and the working tree was
+  clean after the push.
+
+Milestone 3, Tool Classification and Policy Layer, is completed.
