@@ -47,9 +47,9 @@ process on the same computer:
 - Upstream file upload or download tools may be discovered, but they are not
   included in the initial MVP allowlist.
 
-The current work is Milestone 0: repository recovery and project memory. The
-next technical milestone is a narrow local Playwright MCP connectivity spike.
-Do not recreate the lost asynchronous `BrowserService` draft unless a later
+Milestone 1 is completed. The current work is Milestone 2: Dynamic MCP Tool
+Gateway. Policy and tool classification remain a later milestone. Do not
+recreate the lost asynchronous `BrowserService` draft unless a separately
 approved plan explicitly requires it.
 
 The following are currently out of scope:
