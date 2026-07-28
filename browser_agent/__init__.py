@@ -1,5 +1,14 @@
 """Public package interface for the browser-agent prototype."""
 
+from .agent_controls import (
+    AgentControlDefinition,
+    AgentControlError,
+    AgentControlExecutor,
+    AgentControlResult,
+    AgentControlStatus,
+    InvalidAgentControlArgumentsError,
+    UnknownAgentControlError,
+)
 from .mcp_gateway import (
     InvalidToolArgumentsError,
     McpGatewayError,
@@ -25,7 +34,13 @@ from .tool_policy import (
 )
 
 __all__ = [
+    "AgentControlDefinition",
+    "AgentControlError",
+    "AgentControlExecutor",
+    "AgentControlResult",
+    "AgentControlStatus",
     "InvalidToolArgumentsError",
+    "InvalidAgentControlArgumentsError",
     "InternalOnlyToolError",
     "McpGatewayError",
     "McpSessionProtocol",
@@ -43,5 +58,6 @@ __all__ = [
     "ToolPolicyDecision",
     "ToolPolicyError",
     "UnknownMcpToolError",
+    "UnknownAgentControlError",
     "UnsupportedToolSchemaError",
 ]
