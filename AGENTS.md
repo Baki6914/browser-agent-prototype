@@ -47,9 +47,10 @@ process on the same computer:
 - Upstream file upload or download tools may be discovered, but they are not
   included in the initial MVP allowlist.
 
-Milestone 1 is completed. The current work is Milestone 2: Dynamic MCP Tool
-Gateway. Policy and tool classification remain a later milestone. Do not
-recreate the lost asynchronous `BrowserService` draft unless a separately
+Milestone 1 is completed. Milestone 2, Dynamic MCP Tool Gateway, is completed.
+The current work is preparation and review of Milestone 3, Tool Classification
+and Policy Layer. Dynamic discovery remains distinct from authorization. Do
+not recreate the lost asynchronous `BrowserService` draft unless a separately
 approved plan explicitly requires it.
 
 The following are currently out of scope:
