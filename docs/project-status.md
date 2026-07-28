@@ -4,10 +4,12 @@
 
 - **Active branch:** `mvp/playwright-mcp-agent`
 - **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current milestone:** Milestone 1, local Playwright MCP connectivity spike
+- **Current milestone:** Milestone 1, Local Playwright MCP Connectivity Spike,
+  completed
 - **Current implementation:** synchronous Playwright learning prototype and a
   verified local Playwright MCP connectivity spike
-- **Current phase:** Results documentation and milestone workflow completion
+- **Current phase:** Preparing and reviewing the Milestone 2 Implementation
+  Brief
 
 ## Completed
 
@@ -22,16 +24,22 @@
   `7abe516fc114c5c46e57661eb93b7fe510fc0018`.
 - Milestone 1 technical connectivity acceptance criteria were demonstrated on
   `2026-07-27`.
+- The verified Milestone 1 feature checkpoint is
+  `9e063e8c004083d05a5a8111fdb58b197570f296`.
+- The verified Milestone 1 error-visibility fix checkpoint is
+  `d4a49c72256c8a706b4c51ecd2b2453eecc0f23c`.
+- Both Milestone 1 code checkpoints were committed and pushed by the human and
+  remotely verified.
+- The normal successful CLI path and a controlled blocked-origin failure path
+  were verified after the error-visibility fixes.
+- Milestone 1, Local Playwright MCP Connectivity Spike, is completed.
 
 The demonstrated integration is limited to the connectivity spike. It does not
 constitute a general MCP gateway, policy layer, or agent loop.
 
 ## In progress
 
-- Milestone 1: a narrow local Playwright MCP connectivity spike.
-- The implementation and generated artifacts still require complete diff
-  review, applicable checks, Learning Handoff, human commit, human push, and
-  remote verification before Milestone 1 is complete.
+- Preparation and review of the Milestone 2 Implementation Brief.
 
 ## Not started
 
@@ -43,6 +51,7 @@ constitute a general MCP gateway, policy layer, or agent loop.
 - General browser-agent MVP evaluation.
 - Local vLLM integration.
 - Session and persistence work.
+- HTTP API work.
 - Offline packaging and optional Docker.
 
 Milestone 2, Dynamic MCP Tool Gateway, is the next engineering milestone. It
@@ -79,10 +88,8 @@ has not started.
 
 ## Immediate next step
 
-Complete the Milestone 1 diff review, applicable checks, and Learning Handoff,
-then hand control to the human for commit and push. After the human push,
-verify the intended commit and files on the remote branch. The next engineering
-milestone after that checkpoint is Milestone 2, Dynamic MCP Tool Gateway.
+Prepare and review the Milestone 2, Dynamic MCP Tool Gateway, Implementation
+Brief. Milestone 2 has not started.
 
 ## Last verified checkpoint
 
@@ -91,16 +98,30 @@ Verified on `2026-07-27`:
 - Node.js `v20.19.0`, npm `10.8.2`, Python `3.12.13`, Python MCP SDK
   `1.28.1`, Playwright MCP `0.0.78`, and its Playwright dependency
   `1.62.0-alpha-1783623505000` were used.
-- The dependency-free unit-test command ran 6 tests and all passed.
+- The dependency-free unit-test command ran 13 tests and all passed with final
+  result `OK` in approximately 0.002 seconds. The tests did not start Node,
+  MCP, Chromium, subprocesses, or network access.
 - The live connectivity command printed
   `Playwright MCP connectivity spike succeeded`, wrote nothing to stderr, and
   exited with code 0.
+- A controlled temporary-script probe of
+  `https://not-allowed.invalid` was blocked by the configured allowed-origin
+  restriction, exposed the nested `net::ERR_BLOCKED_BY_CLIENT` detail in
+  stderr, and exited with code 1. It did not modify the committed script or
+  real MCP configuration, and the temporary copy was deleted without being
+  committed.
+- Error handling always attempts advertised `browser_close`, preserves primary
+  and shutdown failures separately or together as applicable, and recursively
+  exposes distinct nested `ExceptionGroup` leaf messages in deterministic
+  first-seen order.
 - The real `list_tools` response contained 24 tools and generated
   `docs/mcp-tool-inventory.json`.
 - Real npm resolution generated `package-lock.json`.
 - Temporary `.playwright-mcp/` runtime output was removed and is ignored;
   installed `node_modules/` content remains ignored.
+- Milestone 1 code checkpoints
+  `9e063e8c004083d05a5a8111fdb58b197570f296` and
+  `d4a49c72256c8a706b4c51ecd2b2453eecc0f23c` were committed, pushed, and
+  remotely verified.
 
-Technical connectivity acceptance criteria are demonstrated, but Milestone 1
-is not complete until complete diff review, applicable checks, Learning
-Handoff, human commit, human push, and remote verification are complete.
+Milestone 1, Local Playwright MCP Connectivity Spike, is completed.

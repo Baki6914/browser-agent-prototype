@@ -84,11 +84,17 @@ python -m unittest discover -s tests -p "test_*.py" -v
 
 Result:
 
-- 6 tests ran.
-- All 6 passed.
+- 13 tests ran.
+- All 13 passed.
 - Final result: `OK`.
+- Runtime was approximately 0.002 seconds.
 
-These dependency-free helper tests validated deterministic logic; they did not
+These dependency-free helper tests do not start Node, MCP, Chromium,
+subprocesses, or network access. They cover stable schema summaries,
+deterministic JSON-compatible tool inventory, required-tool validation, MCP
+result text extraction, empty-result rejection, primary and shutdown error
+preservation, direct `SpikeError` preservation, and deterministic extraction
+and deduplication of nested `ExceptionGroup` leaf messages. They do not
 themselves prove live MCP connectivity.
 
 ## Verified live connectivity result
@@ -117,6 +123,29 @@ Exit code 0 proves that this specific configured local stdio flow completed its
 implemented checks successfully in the verified environment. It does not prove
 that arbitrary sites or tools are safe, that every advertised tool works, or
 that authorization and policy enforcement exist.
+
+## Verified controlled blocked-origin failure
+
+For this controlled probe, a temporary copy of the script changed the target
+URL from `https://example.com` to `https://not-allowed.invalid`. The committed
+script and real MCP configuration were not modified. The temporary copy was
+deleted after the probe and was never committed.
+
+Result:
+
+- stdout: empty
+- stderr included:
+  - `Playwright MCP connectivity spike failed`
+  - `startup, invocation, or shutdown error`
+  - `invocation error: browser_navigate returned an MCP error`
+  - `net::ERR_BLOCKED_BY_CLIENT`
+- process exit code: `1`
+
+This verified that the configured allowed-origin restriction blocked this
+navigation, useful nested error details were visible in normal CLI output, and
+the failure returned a non-zero exit code. It demonstrates one configured
+guardrail on this controlled path; it does not establish the origin allowlist
+as a complete security boundary.
 
 ## Discovered capability versus permission
 
@@ -154,8 +183,19 @@ The verified run demonstrated all technical connectivity criteria:
 The script distinguishes repository/configuration startup problems, missing
 Node or Python dependencies, a missing local CLI, MCP initialization failures,
 missing required tools, invocation failures, timeouts, and shutdown failures.
-The SDK context managers own session and child-process cleanup, including when
-an operation fails. The isolated browser profile is not persisted.
+When `browser_close` is advertised, the script always attempts it, including
+after a navigate or snapshot failure. A primary operation failure is preserved;
+a shutdown failure is reported when it is the only failure; and both the
+primary failure and additional shutdown failure are reported when both occur.
+The handling does not broadly catch `KeyboardInterrupt`, `SystemExit`,
+cancellation, or other conditions derived only from `BaseException`.
+
+For nested `ExceptionGroup` instances, the script recursively extracts
+distinct, non-empty leaf exception messages in deterministic first-seen order.
+This prevents a generic TaskGroup summary from hiding useful nested details and
+removes duplicate leaf messages. The SDK context managers own session and
+child-process cleanup, including when an operation fails. The isolated browser
+profile is not persisted.
 
 ## Security boundaries and exclusions
 
