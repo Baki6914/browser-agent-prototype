@@ -38,6 +38,16 @@ from .mcp_gateway import (
     UnknownMcpToolError,
     UnsupportedToolSchemaError,
 )
+from .openai_provider import (
+    OpenAICompatibleDecisionSource,
+    OpenAICompatibleProviderConfig,
+    OpenAIProviderConfigurationError,
+    OpenAIProviderError,
+    OpenAIProviderHTTPError,
+    OpenAIProviderResponseError,
+    OpenAIProviderTimeoutError,
+    OpenAIProviderTransportError,
+)
 from .tool_policy import (
     InternalOnlyToolError,
     McpToolPolicy,
@@ -79,6 +89,14 @@ __all__ = [
     "McpToolGatewayNotDiscoveredError",
     "McpToolExecutorProtocol",
     "McpToolPolicy",
+    "OpenAICompatibleDecisionSource",
+    "OpenAICompatibleProviderConfig",
+    "OpenAIProviderConfigurationError",
+    "OpenAIProviderError",
+    "OpenAIProviderHTTPError",
+    "OpenAIProviderResponseError",
+    "OpenAIProviderTimeoutError",
+    "OpenAIProviderTransportError",
     "PolicyAction",
     "PolicyEnforcedToolExecutor",
     "ScriptedDecisionSource",
