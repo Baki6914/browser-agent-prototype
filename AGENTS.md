@@ -50,22 +50,44 @@ process on the same computer:
 Milestone 1 is completed. Milestone 2, Dynamic MCP Tool Gateway, is completed.
 Milestone 3, Tool Classification and Policy Layer, is completed. Milestone 4,
 Agent Control Tools, is completed. Milestone 5, Deterministic MCP-backed Mock
-Agent Loop, is completed. Milestone 6, OpenAI-Compatible LLM Provider, has
-completed implementation, review, unit tests, Learning Handoff, human feature
-commit and push, remote feature-checkpoint verification, and a live external-
-provider smoke. `OpenAICompatibleDecisionSource` implements the existing
-`AgentDecisionSourceProtocol` boundary and supplies proposed decisions to the
-observation-driven loop. Its endpoint, model, API key, and timeout are
-configuration values, so the provider boundary remains provider-neutral.
+Agent Loop, is completed. Milestone 6, OpenAI-Compatible LLM Provider, is
+completed. Milestone 7 technical implementation, review, tests, Learning
+Handoff, and live verification are complete. Human commit, human push, and
+remote verification remain before Milestone 7, MVP Evaluation, may be declared
+complete. Milestone 7 adds provider-neutral evaluation types and deterministic
+`PASS`, `FAIL`, and `ERROR` scoring, with `ERROR` taking exit-code precedence
+over `FAIL`; exactly three public-data scenarios using
+`https://example.com`; sanitized JSON reports; an import-safe executable
+runner; and one fresh MCP/browser session per scenario with internal-only
+`browser_close` cleanup. The scenarios cover title extraction, read-only link
+extraction, and the policy-enforced confirmation boundary.
 
 Provider visibility is not execution authority. `AgentToolRouter`,
 `McpToolPolicy`, `PolicyEnforcedToolExecutor`, `McpToolGateway`, and the local
-agent controls remain the enforcement and execution boundaries. The successful
-external smoke temporarily used NVIDIA API with `z-ai/glm-5.2` and only public
-`https://example.com` data. This is external integration proof only; it does
-not satisfy offline, on-prem, institution-internal, local-vLLM,
-confidential-data, or production-readiness goals. The next work is planning
-Milestone 7, MVP Evaluation.
+agent controls remain the enforcement and execution boundaries. Milestone 7
+offline validation recorded 217 passing tests, passing `py_compile`, and
+passing `git diff --check`. Its first valid live baseline on `2026-07-29`,
+using temporary external model `z-ai/glm-5.2` and only public
+`https://example.com` data, remains documented as 2 PASS / 1 FAIL / 0 ERROR,
+66.67%, exit code 1. The sole failure exposed a stale oracle that expected
+`More information` instead of the fixture's visible `Learn more`; this
+historical baseline was not replaced or rewritten. After correcting the
+declared expectation and relevant task text without prompt tuning, scoring
+relaxation, or acceptance-criteria weakening, a separate live verification
+recorded 3 PASS / 0 FAIL / 0 ERROR, 100.00%, exit code 0, and empty stderr.
+The confirmation scenario observed `browser_click REJECTED` followed by
+`ask_user AWAITING_USER`: the model proposed decisions, no automatic
+confirmation was granted, and the rejected click did not execute.
+
+These live results prove only temporary external real-model integration,
+public `example.com` browser use, integration of the existing
+MCP/policy/agent-loop/evaluator boundaries, and safe confirmation-boundary
+behavior in these scenarios. They do not prove offline operation, on-premises
+deployment, confidential or institution-data safety, local vLLM integration,
+broad statistical reliability, or production readiness. Milestone 7 is
+technically complete and ready for COMMIT CHECKPOINT. The next planned work is
+Milestone 8, local vLLM planning and integration. Milestone 8 implementation
+has not started.
 
 Confirmation UI, trusted approval, user-response waiting and resume, and
 persistence remain later work. Dynamic discovery remains distinct from

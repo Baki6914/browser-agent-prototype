@@ -59,6 +59,20 @@ from .tool_policy import (
     ToolPolicyDecision,
     ToolPolicyError,
 )
+from .mvp_evaluation import (
+    MvpEvaluationExpectation,
+    MvpEvaluationOutcome,
+    MvpEvaluationScenario,
+    MvpEvaluationScenarioResult,
+    MvpEvaluationSummary,
+    MvpEvaluationToolTrace,
+    create_mvp_error_result,
+    default_mvp_evaluation_scenarios,
+    evaluate_mvp_scenario,
+    mvp_evaluation_exit_code,
+    mvp_summary_to_json,
+    summarize_mvp_results,
+)
 
 __all__ = [
     "AgentDecisionSourceProtocol",
@@ -89,6 +103,12 @@ __all__ = [
     "McpToolGatewayNotDiscoveredError",
     "McpToolExecutorProtocol",
     "McpToolPolicy",
+    "MvpEvaluationExpectation",
+    "MvpEvaluationOutcome",
+    "MvpEvaluationScenario",
+    "MvpEvaluationScenarioResult",
+    "MvpEvaluationSummary",
+    "MvpEvaluationToolTrace",
     "OpenAICompatibleDecisionSource",
     "OpenAICompatibleProviderConfig",
     "OpenAIProviderConfigurationError",
@@ -110,4 +130,10 @@ __all__ = [
     "UnknownMcpToolError",
     "UnknownAgentControlError",
     "UnsupportedToolSchemaError",
+    "create_mvp_error_result",
+    "default_mvp_evaluation_scenarios",
+    "evaluate_mvp_scenario",
+    "mvp_evaluation_exit_code",
+    "mvp_summary_to_json",
+    "summarize_mvp_results",
 ]
