@@ -4,17 +4,17 @@
 
 - **Active branch:** `mvp/playwright-mcp-agent`
 - **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current completed milestone:** Milestone 6, OpenAI-Compatible LLM Provider
-  - This is the latest milestone whose human commit, push, and remote
-    verification are complete.
-- **Current milestone:** Milestone 7, MVP Evaluation
+- **Current completed milestone:** Milestone 7, MVP Evaluation
+  - This is the latest milestone whose implementation, review, tests, Learning
+    Handoff, human commit, human push, and remote verification are complete.
+- **Current milestone:** Milestone 8, local vLLM planning and integration
 - **Current implementation:** synchronous learning prototype, verified local
   Playwright MCP connectivity, dynamic MCP tool gateway, typed classification
   and policy enforcement, typed `finish` and `ask_user` controls,
   `AgentToolRouter`, a deterministic observation-driven agent loop, and a
   provider-neutral real decision source connected to that existing loop, plus
   a provider-neutral MVP evaluation framework
-- **Current phase:** Milestone 7 COMMIT CHECKPOINT
+- **Current phase:** PLAN — Milestone 8
 
 ## Completed
 
@@ -256,8 +256,7 @@
   avoid raw browser snapshots. The executable runner is import-safe when run
   as `python scripts/openai_agent_eval.py`.
 - Offline validation completed with 217 tests passed, `py_compile` passed, and
-  `git diff --check` passed. The complete implementation scope remained
-  exactly five files.
+  `git diff --check` passed.
 - The first valid live baseline on `2026-07-29` temporarily used the external
   OpenAI-compatible model `z-ai/glm-5.2`. It recorded 2 PASS / 1 FAIL /
   0 ERROR, a 66.67% pass rate, and exit code 1:
@@ -291,10 +290,22 @@
   behavior in these scenarios. They do not prove offline operation,
   on-premises deployment, confidential or institution-data safety, local vLLM
   integration, broad statistical reliability, or production readiness.
-- Milestone 7 technical implementation, review, tests, Learning Handoff, and
-  live verification are complete. The milestone is technically complete and
-  ready for COMMIT CHECKPOINT, but its human commit, human push, and remote
-  verification remain pending before it may be declared complete.
+- Milestone 7 implementation, review, 217 passing tests, Learning Handoff,
+  human feature commit, human push, and remote feature-checkpoint verification
+  are complete.
+- The verified Milestone 7 feature checkpoint is
+  `d2e2716f646d3aaaff6eab1624a91609a3688b00`, with commit subject
+  `feat: add MVP evaluation framework`.
+- The feature checkpoint changed exactly seven files: `AGENTS.md`,
+  `browser_agent/__init__.py`, `browser_agent/mvp_evaluation.py`,
+  `docs/mvp-evaluation.md`, `docs/project-status.md`,
+  `scripts/openai_agent_eval.py`, and `tests/test_mvp_evaluation.py`.
+- Local and remote SHA both matched the verified feature checkpoint. The
+  branch was up to date with `origin/mvp/playwright-mcp-agent`, the remote
+  comparison from checkpoint
+  `9721001a8f20bbb75ee90c16a7b8a679d83246bb` was ahead by 1 commit and
+  behind by 0 commits, and the working tree was clean after the push.
+- Milestone 7, MVP Evaluation, is completed.
 
 The gateway remains the browser-capability boundary and normalization layer.
 Dynamic discovery is capability information, not authorization. The policy
@@ -304,8 +315,8 @@ policy-enforced MCP path without collapsing their boundaries.
 
 ## In progress
 
-- Milestone 7 COMMIT CHECKPOINT: human commit, human push, and remote
-  verification remain pending.
+- Milestone 8 planning.
+- Milestone 8 planning has started; Milestone 8 implementation has not started.
 
 ## Not started
 
@@ -394,9 +405,8 @@ policy-enforced MCP path without collapsing their boundaries.
 
 ## Immediate next step
 
-Complete the Milestone 7 COMMIT CHECKPOINT through human commit, human push,
-and remote verification. Milestone 8, local vLLM planning and integration, is
-the next planned work. Milestone 8 implementation has not started.
+Prepare and review the Milestone 8 Implementation Brief. Milestone 8 planning
+has started; Milestone 8 implementation has not started.
 
 ## Last verified checkpoint
 
@@ -603,10 +613,27 @@ Verified on `2026-07-29`:
   local vLLM integration, broad statistical reliability, or production
   readiness.
 
-Milestone 7 technical implementation, review, tests, Learning Handoff, and
-live verification are complete. Milestone 7 is technically complete and ready
-for COMMIT CHECKPOINT. Human commit, human push, and remote verification
-remain before the milestone may be declared complete.
+Milestone 7 implementation, review, 217 passing tests, Learning Handoff,
+human feature commit, human push, and remote feature-checkpoint verification
+are complete.
 
-Milestone 8, local vLLM planning and integration, is the next planned work.
-Milestone 8 implementation has not started.
+The verified Milestone 7 feature checkpoint is
+`d2e2716f646d3aaaff6eab1624a91609a3688b00`, with commit subject
+`feat: add MVP evaluation framework`. It changed exactly seven files:
+`AGENTS.md`, `browser_agent/__init__.py`,
+`browser_agent/mvp_evaluation.py`, `docs/mvp-evaluation.md`,
+`docs/project-status.md`, `scripts/openai_agent_eval.py`, and
+`tests/test_mvp_evaluation.py`.
+
+Local and remote SHA both matched
+`d2e2716f646d3aaaff6eab1624a91609a3688b00`. The branch was up to date with
+`origin/mvp/playwright-mcp-agent`. Compared with checkpoint
+`9721001a8f20bbb75ee90c16a7b8a679d83246bb`, the remote was ahead by 1
+commit and behind by 0 commits. The working tree was clean after the push.
+
+Milestone 7, MVP Evaluation, is completed.
+
+Milestone 8, local vLLM planning and integration, is the current milestone.
+Its current phase is PLAN — Milestone 8. Milestone 8 planning has started;
+Milestone 8 implementation has not started. The immediate next step is to
+prepare and review the Milestone 8 Implementation Brief.

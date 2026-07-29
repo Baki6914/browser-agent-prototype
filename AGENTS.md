@@ -51,12 +51,14 @@ Milestone 1 is completed. Milestone 2, Dynamic MCP Tool Gateway, is completed.
 Milestone 3, Tool Classification and Policy Layer, is completed. Milestone 4,
 Agent Control Tools, is completed. Milestone 5, Deterministic MCP-backed Mock
 Agent Loop, is completed. Milestone 6, OpenAI-Compatible LLM Provider, is
-completed. Milestone 7 technical implementation, review, tests, Learning
-Handoff, and live verification are complete. Human commit, human push, and
-remote verification remain before Milestone 7, MVP Evaluation, may be declared
-complete. Milestone 7 adds provider-neutral evaluation types and deterministic
-`PASS`, `FAIL`, and `ERROR` scoring, with `ERROR` taking exit-code precedence
-over `FAIL`; exactly three public-data scenarios using
+completed. Milestone 7 technical implementation, review, 217 passing tests,
+Learning Handoff, live verification, human feature commit, human push, and
+remote feature-checkpoint verification are complete. Milestone 7, MVP
+Evaluation, is completed. Its verified feature checkpoint is
+`d2e2716f646d3aaaff6eab1624a91609a3688b00` (`feat: add MVP evaluation
+framework`). Milestone 7 adds provider-neutral evaluation types and
+deterministic `PASS`, `FAIL`, and `ERROR` scoring, with `ERROR` taking
+exit-code precedence over `FAIL`; exactly three public-data scenarios using
 `https://example.com`; sanitized JSON reports; an import-safe executable
 runner; and one fresh MCP/browser session per scenario with internal-only
 `browser_close` cleanup. The scenarios cover title extraction, read-only link
@@ -84,10 +86,9 @@ public `example.com` browser use, integration of the existing
 MCP/policy/agent-loop/evaluator boundaries, and safe confirmation-boundary
 behavior in these scenarios. They do not prove offline operation, on-premises
 deployment, confidential or institution-data safety, local vLLM integration,
-broad statistical reliability, or production readiness. Milestone 7 is
-technically complete and ready for COMMIT CHECKPOINT. The next planned work is
-Milestone 8, local vLLM planning and integration. Milestone 8 implementation
-has not started.
+broad statistical reliability, or production readiness. Milestone 8, local
+vLLM planning and integration, is the current milestone. Milestone 8 planning
+has started, and its implementation has not started.
 
 Confirmation UI, trusted approval, user-response waiting and resume, and
 persistence remain later work. Dynamic discovery remains distinct from
