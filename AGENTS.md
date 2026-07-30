@@ -11,8 +11,9 @@ The service will eventually:
 - let an LLM choose one action at a time,
 - validate the selected action,
 - execute it through Playwright,
-- persist session, step, and file metadata,
-- pause and request user input or confirmation when necessary.
+- pause and request user input or confirmation when necessary,
+- resume the same in-memory run while the service remains running, and
+- automatically manage approved file downloads.
 
 The architecture document is a reference design, not an immutable specification.
 Do not depart from it silently. When proposing an alternative, first explain:
@@ -38,14 +39,24 @@ process on the same computer:
 - The orchestrator validates policy before executing a selected tool and feeds
   the result back to the LLM.
 - Application-owned agent-control tools include `finish` and `ask_user`.
-- The LLM provider must be replaceable so a future local vLLM provider does not
-  require redesigning the agent loop.
+- The active reference provider is NVIDIA's OpenAI-compatible API. Base URL,
+  model, API key, and timeout remain configurable so another approved
+  OpenAI-compatible endpoint can be used without redesigning the agent loop.
+- The custom agent loop remains the selected MVP orchestration approach.
+- The planned product interface is a mandatory FastAPI HTTP service backed by
+  an in-memory `RunManager`; neither is implemented yet.
+- Runs may pause across HTTP requests while the service remains running. No
+  persistent session, database-backed session, or service-restart resume is
+  planned for the MVP.
 - `browser_run_code_unsafe`, or any equivalent arbitrary host or server-side
   code execution capability, must never be exposed to the LLM.
 - `browser_evaluate` is not exposed by default. It may be enabled only for a
   narrowly justified page-context task through an explicitly approved policy.
-- Upstream file upload or download tools may be discovered, but they are not
-  included in the initial MVP allowlist.
+- Controlled automatic file download is required future MVP work. Its technical
+  mechanism is not yet proven and must begin with a Playwright MCP capability
+  spike.
+- File upload is optional future work. `browser_file_upload` remains denied by
+  default unless a separately approved milestone changes it.
 
 Milestone 1 is completed. Milestone 2, Dynamic MCP Tool Gateway, is completed.
 Milestone 3, Tool Classification and Policy Layer, is completed. Milestone 4,
@@ -81,30 +92,33 @@ The confirmation scenario observed `browser_click REJECTED` followed by
 `ask_user AWAITING_USER`: the model proposed decisions, no automatic
 confirmation was granted, and the rejected click did not execute.
 
-These live results prove only temporary external real-model integration,
+These live results prove only external real-model integration,
 public `example.com` browser use, integration of the existing
 MCP/policy/agent-loop/evaluator boundaries, and safe confirmation-boundary
 behavior in these scenarios. They do not prove offline operation, on-premises
 deployment, confidential or institution-data safety, local vLLM integration,
-broad statistical reliability, or production readiness. Milestone 8, local
-vLLM planning and integration, is the current milestone. Milestone 8 planning
-has started, and its implementation has not started.
+broad statistical reliability, or production readiness. The repository is at
+an approved documentation-only roadmap correction checkpoint before Milestone
+8 implementation. Milestone 8 implementation has not started.
 
-Confirmation UI, trusted approval, user-response waiting and resume, and
-persistence remain later work. Dynamic discovery remains distinct from
-authorization. Do not recreate the lost asynchronous `BrowserService` draft
-unless a separately approved plan explicitly requires it.
+FastAPI, trusted approval, user-response waiting and resume, secure login, and
+controlled downloads remain future work described in `ROADMAP.md`.
+Dynamic discovery remains distinct from authorization. Do not recreate the
+lost asynchronous `BrowserService` draft unless a separately approved plan
+explicitly requires it.
 
 The following are currently out of scope:
 
-- FastAPI endpoints,
 - PostgreSQL,
 - SQLAlchemy and Alembic,
 - Docker and Docker Compose for the initial MVP,
-- local vLLM integration before its roadmap milestone,
-- the complete agent loop before its roadmap milestones,
-- file upload and download lifecycle management,
-- credential handling.
+- local vLLM, GPU/VRAM planning, and offline model hosting,
+- persistent sessions and service-restart resume,
+- institution-internal LLM integration, and
+- file upload unless separately approved.
+
+The authoritative future milestone sequence is in `ROADMAP.md`. Planned
+components must not be described as implemented.
 
 ## Mandatory named stages
 
@@ -189,9 +203,12 @@ and request further approval.
 - Never delete tests to make a change pass.
 - Codex must never commit or push changes.
 - Never add API keys, passwords, internal URLs, confidential documents, or institution-specific data.
-- Until local vLLM is integrated, use only synthetic or public test data.
+- Use only synthetic or public test data with the configured external NVIDIA
+  service.
 - Never send secrets, internal URLs, institution data, or confidential browser
   contents to external services.
+- Secret values must remain outside LLM context, logs, reports, and
+  serializable run history when secret handling is implemented.
 - Keep each task coherent and reviewable. Do not split a logically complete
 change solely to reduce the number of changed files.
 - Preserve existing behavior unless the task explicitly changes it.

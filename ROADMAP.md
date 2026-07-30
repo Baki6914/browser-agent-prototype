@@ -7,14 +7,25 @@ natural-language task, lets an LLM choose validated actions one step at a time,
 executes those actions in a browser, and returns observations until the task is
 finished or user input is required.
 
-The first implementation will use Microsoft's open-source Playwright MCP as a
-local browser-capability process. Our Python application will remain responsible
-for orchestration, policy enforcement, agent control, and LLM-provider
-integration.
+The implementation uses Microsoft's open-source Playwright MCP as a local
+browser-capability process. Our Python application remains responsible for
+orchestration, policy enforcement, agent control, and LLM-provider integration.
+
+The intended product architecture is:
+
+Client or user interface → mandatory FastAPI HTTP service → in-memory
+`RunManager` → resumable custom agent loop → NVIDIA OpenAI-compatible LLM API
+→ `AgentToolRouter` and policy enforcement → Playwright MCP → browser
+
+NVIDIA's OpenAI-compatible API is the active reference provider. Base URL,
+model, API key, and timeout remain configurable so another approved
+OpenAI-compatible provider can be used without redesigning the agent loop.
+Institution-internal LLM integration is not this project's responsibility.
+The custom agent loop remains the MVP orchestration approach.
 
 ## MVP definition
 
-The browser-agent MVP is a local Python application that:
+The implemented learning prototype:
 
 - starts or connects to Playwright MCP locally through stdio;
 - discovers the available MCP tools at runtime;
@@ -23,11 +34,14 @@ The browser-agent MVP is a local Python application that:
 - supports agent-control tools such as `finish` and `ask_user`;
 - runs a deterministic tool-call and observation loop;
 - supports an OpenAI-compatible LLM provider behind a replaceable interface;
-- completes representative tasks from all three MVP task families; and
+- evaluates representative tasks from all three MVP task families; and
 - does not expose arbitrary server-side code execution to the LLM.
 
-FastAPI, durable sessions, database persistence, Docker, and offline packaging
-are not required for this MVP.
+The product MVP additionally requires the planned FastAPI HTTP service,
+in-memory run management and resume while the service remains running, secure
+login, and controlled automatic downloads. Persistent sessions, database
+persistence, service-restart resume, Docker, local vLLM, and offline hosting
+are not required and are out of scope.
 
 ## Milestones
 
@@ -157,46 +171,84 @@ families and identify reliability or safety gaps.
 - Known failures and follow-up work are documented without overstating MVP
   capability.
 
-### 8. Local vLLM integration
+### 8. FastAPI HTTP Run Service and Human-in-the-Loop Resume
 
-**Purpose:** Run the LLM provider locally while preserving the same agent-loop
-and tool-policy design.
-
-**Acceptance criteria:**
-
-- A local vLLM OpenAI-compatible endpoint can replace the external provider by
-  configuration.
-- Tool schema and tool-call translations work with the selected local model.
-- The three MVP scenarios are reevaluated for quality and compatibility.
-- Provider-specific limitations are isolated in the provider adapter.
-- Sensitive browser observations can remain local in the demonstrated flow.
-
-### 9. Session and persistence layer
-
-**Purpose:** Persist sessions, steps, tool calls, observations, user pauses, and
-file metadata so work can be inspected or resumed.
+**Purpose:** Add the mandatory product HTTP boundary and allow an in-memory run
+to pause for a user interaction and resume across HTTP requests while the
+service remains running.
 
 **Acceptance criteria:**
 
-- A separately approved data model defines stored state and retention.
-- Session lifecycle and resume behavior are explicit.
-- Sensitive observations receive appropriate access and redaction treatment.
-- Persistence failures do not silently corrupt agent state.
-- Migrations and integration tests exist before this milestone is complete.
+- A mandatory FastAPI service exposes start, inspect, respond, and cancel
+  behavior.
+- An in-memory `RunManager` owns explicit typed run states.
+- The custom agent loop resumes after user questions and trusted confirmation.
+- Per-run concurrency protection prevents conflicting execution.
+- Interaction handling is idempotent.
+- Browser and MCP resources are cleaned up on completion, cancellation, and
+  failure.
+- No persistent session, database, or service-restart resume is added.
 
-### 10. Offline packaging and optional Docker
+### 9. Secure Login and Secret Handling
 
-**Purpose:** Make the validated local system reproducible and, where useful,
-deployable without relying on an always-online development environment.
+**Purpose:** Support login without allowing credentials or one-time passwords
+to enter model-visible or serializable state.
 
 **Acceptance criteria:**
 
-- Installation, browser assets, model requirements, and startup are documented.
-- An offline or controlled-network setup path is demonstrated.
-- Docker remains optional and is added only if it improves reproducibility or
-  deployment.
-- Packaging preserves the local trust boundaries and does not expose an MCP
-  port by default.
+- Credentials and optional OTP values are supplied through HTTP interactions.
+- Temporary secrets are stored separately from run history.
+- Raw secrets are never sent to NVIDIA or included in LLM context, logs,
+  reports, or serializable run history.
+- Login forms are filled through a secure application-controlled path.
+- Only sanitized login observations are returned to the model.
+- Tests cover successful, failed, cancelled, duplicate, and invalid
+  interactions.
+
+### 10. Controlled Automatic File Download
+
+**Purpose:** Let the agent trigger and safely manage a target-site download
+without requiring the user to click the site's download button manually.
+
+**Acceptance criteria:**
+
+- Work begins with a Playwright MCP download-capability spike because the
+  mechanism is not yet implemented or proven.
+- The agent automatically activates the target site's download action.
+- The resulting download is captured or otherwise safely managed.
+- A user-selected destination is accepted only within approved filesystem
+  boundaries, with a safe default destination when none is supplied.
+- Paths, filenames, collisions, partial downloads, failures, and cleanup are
+  handled.
+- The result exposes sanitized file metadata and the final local path.
+- File upload remains out of scope for this milestone.
+
+### 11. End-to-End NVIDIA Browser-Agent MVP
+
+**Purpose:** Demonstrate the complete product flow with the reference provider.
+
+**Acceptance criteria:**
+
+- A task is submitted through HTTP and handled by a real NVIDIA model.
+- The flow covers navigation, page inspection, user interaction and resume,
+  secure login, form filling, selection, clicking, and automatic download.
+- Cancellation and browser/MCP resource cleanup are verified.
+- End-to-end evaluation uses only public or synthetic data.
+
+### 12. Installation, HTTP API, Usage, and Adaptation Documentation
+
+**Purpose:** Document how to install, configure, operate, and safely adapt the
+completed MVP.
+
+**Acceptance criteria:**
+
+- Installation and NVIDIA environment configuration are documented.
+- HTTP endpoints and examples are documented.
+- Interaction, confirmation, login, and secret-safety flows are explained.
+- Download behavior and destination rules are explained.
+- Supported, confirmation-required, denied, and optional actions are listed.
+- Troubleshooting is included.
+- Configuration of another approved OpenAI-compatible provider is explained.
 
 ## End-to-end MVP demonstration scenarios
 
@@ -218,21 +270,28 @@ Given a public or synthetic diagnostic page, inspect page structure, capture a
 screenshot, review relevant console messages and network activity, and produce
 an evidence-based explanation without executing arbitrary server-side code.
 
-## Deferred features
+## Optional future milestone — Controlled file upload
 
-The following are intentionally deferred until their milestones or a separately
-approved plan:
+File upload is optional future work. It remains disabled, and
+`browser_file_upload` remains denied, until a separately approved milestone
+changes that policy.
 
-- FastAPI and other HTTP endpoints;
-- multi-user or long-running service deployment;
-- PostgreSQL, SQLAlchemy, Alembic, and durable session persistence;
-- file upload, file download, and download lifecycle management;
-- credential handling and authenticated institution systems;
-- offline model and browser packaging;
-- Docker and Docker Compose;
-- production observability, scaling, and distributed workers;
-- a fork or vendored copy of Playwright MCP;
-- unrestricted JavaScript or arbitrary server-side code execution.
+## Explicitly out of scope
+
+- Docker and Docker Compose
+- PostgreSQL, SQLAlchemy, Alembic, and database-backed persistence
+- Persistent sessions and service-restart resume
+- Local vLLM, GPU/VRAM planning, and offline model hosting
+- Institution-internal LLM integration
+- Production scaling and distributed workers
+- Unrestricted JavaScript or arbitrary host or server-side code execution
+
+## Possible future LangGraph reconsideration
+
+LangChain and LangGraph are not part of the current MVP. LangGraph may be
+reconsidered only if persistent sessions, service-restart resume, durable
+checkpoints, checkpoint history or replay, complex branching, or many
+long-lived waiting runs become real requirements.
 
 ## Mandatory checkpoint process
 

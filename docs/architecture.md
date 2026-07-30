@@ -2,10 +2,20 @@
 
 ## Architectural direction
 
-The MVP is a local browser agent composed of separate processes on the same
-computer. Microsoft's open-source Playwright MCP supplies browser capabilities.
-Our Python application is the orchestrator and MCP client. An LLM provider
+The implemented prototype is a local browser agent composed of separate
+processes on the same computer. Microsoft's open-source Playwright MCP supplies
+browser capabilities. Our Python application is the orchestrator and MCP
+client. NVIDIA's OpenAI-compatible API is the active reference LLM provider and
 chooses among tools that the orchestrator has discovered and approved.
+
+The planned product architecture is:
+
+Client or user interface → mandatory FastAPI HTTP service → in-memory
+`RunManager` → resumable custom agent loop → NVIDIA OpenAI-compatible LLM API
+→ `AgentToolRouter` and policy enforcement → Playwright MCP → browser
+
+FastAPI, the `RunManager`, HTTP-request resume, secure login, and controlled
+automatic download are planned and are not implemented yet.
 
 This is a reference design. If implementation work proposes a different
 architecture, it must first explain the documented approach, the alternative,
@@ -18,11 +28,11 @@ deliverables.
   +---------------- local computer and local trust boundary ---------------+
   |                                                                        |
   |  +---------------------- Python application ------------------------+  |
-  |  | task + URL -> agent loop <-> replaceable LLM provider adapter    |  |
+  |  | task + URL -> custom agent loop <-> provider adapter             |  |
   |  |                    |                     |                        |  |
-  |  |                    |                     +--> future local vLLM   |  |
+  |  |                    |                     +--> NVIDIA API          |  |
   |  |                    +--> finish / ask_user                         |  |
-  |  |                    +--> gateway -> policy -> invoke               |  |
+  |  |                    +--> router -> policy -> gateway -> invoke     |  |
   |  +------------------------------------------------|-----------------+  |
   |                                                   | MCP over stdio     |
   |                                                   v                    |
@@ -45,9 +55,12 @@ No MCP network port is required. The orchestrator starts or attaches to the
 local Playwright MCP process and exchanges protocol messages through the
 process's standard input and standard output.
 
-The external OpenAI-compatible API is outside the local-computer and local-trust
-boundary. When configured, selected prompts and browser observations cross that
-boundary. The future local vLLM endpoint remains inside the local boundary.
+The external NVIDIA OpenAI-compatible API is outside the local-computer and
+local-trust boundary. Selected prompts and browser observations cross that
+boundary. The base URL, model, API key, and timeout remain configurable so
+another approved OpenAI-compatible provider can be used without redesigning
+the loop. Institution-internal LLM integration and local vLLM hosting are not
+project deliverables.
 
 ## MCP protocol versus Playwright MCP
 
@@ -83,10 +96,11 @@ network inspection, scraping, and page analysis. `browser_evaluate` may supply
 page-context JavaScript evaluation only under the explicit policy described
 below.
 
-Upstream file upload and download tools may also be discovered. Discovery does
-not grant permission: those tools are excluded from the initial MVP allowlist,
-and file upload, download lifecycle management, and credential handling remain
-deferred.
+Upstream file upload or download capabilities may also be discovered.
+Discovery does not grant permission. Controlled automatic download is required
+planned MVP work, but its mechanism is not implemented or proven and Milestone
+10 must begin with a Playwright MCP capability spike. File upload remains
+optional, disabled, and denied unless separately approved.
 
 The available upstream tool catalog can change between versions. The
 orchestrator must not assume that every desired tool exists or that every
@@ -104,7 +118,7 @@ The Python application owns the agent workflow. It:
 - adds application-owned agent-control tools;
 - returns observations and errors to the agent loop;
 - enforces step, timeout, confirmation, and termination rules; and
-- records or persists state only in later approved milestones.
+- records current run state and step history in memory.
 
 The orchestrator, rather than the LLM, is the enforcement boundary. Prompt
 instructions alone are not a security policy.
@@ -115,10 +129,10 @@ The LLM provider receives the task, relevant conversation or observation state,
 and approved tool schemas. It returns a proposed tool call or agent-control
 decision. It does not execute tools directly.
 
-A provider interface will isolate provider-specific request, response, and
-tool-call formats. The initial real integration will be OpenAI-compatible. A
-future local vLLM implementation should use the same interface so the agent
-loop does not need redesign.
+The implemented provider interface isolates provider-specific request,
+response, and tool-call formats. NVIDIA's OpenAI-compatible API is the active
+reference provider. Another approved compatible provider can use the same
+interface through configuration without redesigning the agent loop.
 
 ## Dynamic MCP tool discovery
 
@@ -187,8 +201,9 @@ These tools can access or transmit protected information or cause consequential
 actions. Examples include reading authenticated content, entering personal
 data, submitting forms, uploading files, downloading files, or interacting with
 financial or administrative controls. Sensitive actions require explicit
-policy and may require user confirmation. Credential handling is out of scope
-for the MVP.
+policy and may require user confirmation. Secure credential handling is
+planned for Milestone 9, and raw secrets must remain outside NVIDIA requests,
+LLM context, logs, reports, and serializable run history.
 
 ### Unsafe
 
@@ -212,7 +227,7 @@ but still requires narrow inputs and normal validation and policy checks.
 Playwright MCP already supplies a broad, evolving browser-tool surface and
 accessibility-oriented observations. Using it lets this project focus on the
 parts that distinguish the application: orchestration, tool policy, provider
-replacement, agent control, evaluation, and later session management.
+replacement, agent control, evaluation, and in-memory run management.
 
 Rebuilding every browser action would duplicate upstream work, increase the
 maintenance and testing burden, and delay evaluation of the agent design.
@@ -235,9 +250,10 @@ The main trust boundaries are:
 - **Browser/Playwright MCP to orchestrator:** tool results may be large,
   malformed, sensitive, or version-dependent.
 - **Orchestrator to LLM provider:** prompts and observations may leave the local
-  machine when an external provider is configured.
+  machine when the NVIDIA reference provider or another external provider is
+  configured.
 - **Orchestrator to local host:** screenshots, logs, temporary profiles, and
-  later persisted sessions may contain confidential data.
+  in-memory run state may contain confidential data.
 - **Browser to network:** navigation, forms, subresources, analytics, and
   downloads can transmit data to target sites or third parties.
 
@@ -246,32 +262,38 @@ external LLM, entering private data into a form, loading secret-bearing URLs,
 retaining browser profiles or logs, exposing console or network payloads, and
 allowing arbitrary host code execution.
 
-Until local vLLM is integrated, evaluation must use only synthetic or public
-data. Secrets, internal URLs, institution data, and confidential browser
-contents must never be sent to external services. Policy enforcement,
+Evaluation with the configured external NVIDIA service must use only synthetic
+or public data. Secrets, internal URLs, institution data, and confidential
+browser contents must never be sent to external services. Policy enforcement,
 redaction, confirmation, retention, browser isolation, and provider selection
 must be revisited before sensitive use.
 
 Local-only MCP narrows the transport exposure but does not make browser content
 safe or prevent an external LLM request from carrying observations off-device.
 
-## Future local-vLLM flow
+## Implemented, planned, and out of scope
 
-In the future local configuration, the Python orchestrator will send the same
-provider-level request to an adapter targeting a local vLLM
-OpenAI-compatible endpoint. Tool discovery, classification, validation,
-execution, and the observation loop remain unchanged.
+Implemented now:
 
-```text
-Python agent loop
-    -> provider interface
-        -> local vLLM adapter and endpoint
-    <- proposed tool call
-    -> policy and local Playwright MCP over stdio
-    <- local browser observation
-    -> next local model decision
-```
+- the synchronous custom agent loop and provider boundary;
+- `AgentToolRouter`, policy enforcement, and the MCP gateway;
+- local Playwright MCP integration over stdio; and
+- the provider-neutral evaluation framework.
 
-This preserves a replaceable provider boundary and allows browser snapshots and
-model traffic to remain on the local machine, subject to the target web pages'
-own network behavior.
+Planned:
+
+- the mandatory FastAPI HTTP service and in-memory `RunManager`;
+- resume across HTTP requests while the service remains running;
+- secure login with temporary secret storage outside run history; and
+- controlled automatic download beginning with a capability spike.
+
+Out of scope:
+
+- persistent sessions, database-backed sessions, and service-restart resume;
+- PostgreSQL, SQLAlchemy, and Alembic;
+- Docker and Docker Compose;
+- local vLLM, GPU/VRAM planning, and offline model hosting;
+- institution-internal LLM integration; and
+- file upload unless separately approved.
+
+The authoritative future milestone sequence is in [ROADMAP.md](../ROADMAP.md).

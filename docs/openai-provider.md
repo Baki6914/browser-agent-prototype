@@ -1,9 +1,12 @@
 # OpenAI-Compatible Decision Provider
 
 The Milestone 6 provider is a provider-neutral OpenAI-compatible HTTP boundary.
-NVIDIA API is the temporary real integration target, but neither its endpoint
-nor a model name is hard-coded. A future internal endpoint or local vLLM server
-uses the same implementation by changing only the endpoint, model, and API key.
+NVIDIA's OpenAI-compatible API is the active reference provider for this
+project, but neither its endpoint nor a model name is hard-coded. Another
+approved compatible endpoint can use the same boundary by changing the base
+URL, model, API key, and timeout without redesigning the agent loop.
+Institution-internal LLM integration is not a project milestone or
+responsibility.
 
 ## Boundary and request flow
 
@@ -32,9 +35,11 @@ with the configured key redacted if echoed. The API key is excluded from config
 representation and is never intentionally logged.
 
 There is no retry, streaming, conversation persistence, confirmation UI, or
-user-response resume. `ScriptedDecisionSource` is not expanded.
+user-response resume. The provider also does not manage HTTP runs, login
+secrets, browser downloads, policy, or execution. `ScriptedDecisionSource` is
+not expanded.
 
-## Temporary NVIDIA API smoke
+## NVIDIA reference-provider configuration
 
 The live script reads these provider-neutral variables:
 
@@ -43,10 +48,10 @@ The live script reads these provider-neutral variables:
 - Optional: `BROWSER_AGENT_LLM_API_KEY`
 - Optional: `BROWSER_AGENT_LLM_TIMEOUT` (default `60`)
 
-Point the generic variables temporarily at an NVIDIA API root ending in `/v1`,
-its selected model, and its key. Do not put endpoints, models, or keys in source
-control. The same variables can later point at an internal provider, for
-example an approved compatible root such as `http://localhost:8000/v1`.
+Point the generic variables at the approved NVIDIA API root ending in `/v1`,
+selected model, and key. Do not put endpoints, models, or keys in source
+control. The same variables can later point at another approved
+OpenAI-compatible provider.
 
 Run `python scripts/openai_agent_smoke.py` only when explicitly approved. It
 uses the local Node executable, local `@playwright/mcp`, the committed spike
@@ -60,6 +65,7 @@ the deterministic loop. With only public/synthetic data, the model must:
 
 Passing this smoke proves external NVIDIA integration only. It does not prove
 offline operation, an internal or on-prem deployment, local-vLLM compatibility,
-safe handling of confidential data, or production readiness. Never send
-secrets, internal URLs, institution data, or confidential page content to the
-external smoke provider.
+safe handling of confidential data, or production readiness. Only public or
+synthetic data may be used with the configured external NVIDIA service. Never
+send credentials, secrets, internal URLs, institution data, or confidential
+page content to it.

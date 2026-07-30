@@ -7,14 +7,16 @@
 - **Current completed milestone:** Milestone 7, MVP Evaluation
   - This is the latest milestone whose implementation, review, tests, Learning
     Handoff, human commit, human push, and remote verification are complete.
-- **Current milestone:** Milestone 8, local vLLM planning and integration
+- **Current checkpoint:** documentation roadmap correction awaiting human
+  commit, push, and remote verification
 - **Current implementation:** synchronous learning prototype, verified local
   Playwright MCP connectivity, dynamic MCP tool gateway, typed classification
   and policy enforcement, typed `finish` and `ask_user` controls,
   `AgentToolRouter`, a deterministic observation-driven agent loop, and a
   provider-neutral real decision source connected to that existing loop, plus
   a provider-neutral MVP evaluation framework
-- **Current phase:** PLAN — Milestone 8
+- **Current phase:** COMMIT CHECKPOINT — awaiting human commit, push, and
+  remote verification
 
 ## Completed
 
@@ -236,10 +238,11 @@
   existing loop, router, policy, gateway, MCP, Playwright, and local controls,
   and that provider replacement works through configuration without changing
   the loop.
-- NVIDIA API was only the temporary external verification provider. These
-  checks do not prove offline operation, on-prem or institution-internal
-  deployment, local-vLLM compatibility, approval to use confidential or
-  institution data with external models, or production readiness.
+- NVIDIA API was the external verification provider and is now the project's
+  active reference provider. These checks do not prove offline operation,
+  on-prem or institution-internal deployment, local-vLLM compatibility,
+  approval to use confidential or institution data with external models, or
+  production readiness.
 - Milestone 6 implementation, review, unit tests, Learning Handoff, human
   feature commit and push, remote feature-checkpoint verification, and live
   external-provider smoke are complete.
@@ -315,20 +318,23 @@ policy-enforced MCP path without collapsing their boundaries.
 
 ## In progress
 
-- Milestone 8 planning.
-- Milestone 8 planning has started; Milestone 8 implementation has not started.
+- The documentation roadmap correction implementation, static review, and
+  Learning Handoff are complete.
+- Human commit, push, and remote verification of this documentation checkpoint
+  remain outstanding.
+- Milestone 8 implementation has not started.
 
 ## Not started
 
-- A real confirmation UI or question presentation.
-- User-response waiting and resume.
-- Trusted approval-state management.
-- Session and step persistence.
+- The mandatory FastAPI HTTP service and in-memory `RunManager`.
+- HTTP question presentation, user-response waiting and resume, and trusted
+  approval-state management.
+- Secure login and temporary secret handling.
+- Controlled automatic file download; its Playwright MCP mechanism has not
+  yet been proven.
 - A timeout system.
-- Local vLLM integration.
-- HTTP API work.
-- Database work.
-- Offline packaging and optional Docker.
+- The Milestone 11 end-to-end NVIDIA browser-agent MVP.
+- Milestone 12 installation, HTTP API, usage, and adaptation documentation.
 
 ## Known constraints
 
@@ -393,20 +399,31 @@ policy-enforced MCP path without collapsing their boundaries.
   confidential-data suitability, or production readiness.
 - Allowed origins are a defensive configuration, not a complete security
   boundary. Local MCP transport does not make target web content trusted.
-- File upload and download lifecycle management and credential handling remain
-  deferred.
-- Docker is not required for the first browser-agent MVP.
-- FastAPI, sessions, persistence, offline packaging, and production deployment
-  remain out of scope.
-- Until local vLLM integration, only synthetic or public data may be sent to
-  external providers.
+- Automatic download is required future MVP work, but safe capture, destination
+  handling, and cleanup have not yet been proven. Milestone 10 begins with a
+  Playwright MCP download-capability spike.
+- File upload remains optional future work, disabled and denied by default.
+- FastAPI is the mandatory planned product interface, but it has not been
+  added yet.
+- Planned run state is in memory only. Persistent sessions, database-backed
+  sessions, and service-restart resume are out of scope for the MVP.
+- Docker, Docker Compose, PostgreSQL, SQLAlchemy, Alembic, local vLLM,
+  GPU/VRAM planning, and offline model hosting are out of scope.
+- NVIDIA's OpenAI-compatible API is the active reference provider. Another
+  approved compatible endpoint can be configured without redesigning the
+  agent loop, but institution-internal LLM integration is not this project's
+  responsibility.
+- Only synthetic or public data may be sent to the configured external NVIDIA
+  service.
 - Secrets, internal URLs, institution data, and confidential browser contents
   remain prohibited from external services.
 
 ## Immediate next step
 
-Prepare and review the Milestone 8 Implementation Brief. Milestone 8 planning
-has started; Milestone 8 implementation has not started.
+The human documentation checkpoint is next: commit, push, and remotely verify
+the reviewed documentation changes. After that verification, prepare and
+review the Milestone 8 Implementation Brief. Milestone 8 implementation has
+not started.
 
 ## Last verified checkpoint
 
@@ -633,7 +650,21 @@ commit and behind by 0 commits. The working tree was clean after the push.
 
 Milestone 7, MVP Evaluation, is completed.
 
-Milestone 8, local vLLM planning and integration, is the current milestone.
-Its current phase is PLAN — Milestone 8. Milestone 8 planning has started;
-Milestone 8 implementation has not started. The immediate next step is to
-prepare and review the Milestone 8 Implementation Brief.
+The repository is at an approved documentation-only roadmap correction
+checkpoint before Milestone 8 implementation. Milestone 8 is the FastAPI HTTP
+Run Service and Human-in-the-Loop Resume milestone; its implementation has not
+started. The authoritative Milestones 8–12 sequence is in
+[`ROADMAP.md`](../ROADMAP.md):
+
+- Milestone 8: mandatory FastAPI HTTP service, in-memory `RunManager`, and
+  resumable human interaction without persistent sessions or a database.
+- Milestone 9: secure login and secret handling without exposing raw secrets
+  to NVIDIA or serializable run history.
+- Milestone 10: controlled automatic file download, beginning with a
+  Playwright MCP capability spike; download behavior is not yet proven.
+- Milestone 11: end-to-end NVIDIA browser-agent MVP.
+- Milestone 12: installation, HTTP API, usage, and provider-adaptation
+  documentation.
+
+Controlled file upload is an optional future milestone. It remains disabled
+and `browser_file_upload` remains denied unless separately approved.
