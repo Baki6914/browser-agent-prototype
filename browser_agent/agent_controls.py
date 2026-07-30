@@ -34,6 +34,7 @@ class AgentControlResult:
     text: str
     final_result: str | None
     question: str | None
+    confirmation_for_step: int | None = None
 
 
 class AgentControlError(Exception):
@@ -85,24 +86,36 @@ class AgentControlExecutor:
     def definitions(self) -> tuple[AgentControlDefinition, ...]:
         """Return fresh control definitions in deterministic alphabetical order."""
 
-        return tuple(
-            AgentControlDefinition(
-                name=name,
-                description=spec.description,
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        spec.field_name: {
-                            "type": "string",
-                            "description": spec.field_description,
-                        }
+        definitions = []
+        for name, spec in sorted(_CONTROL_SPECS.items()):
+            properties: dict[str, Any] = {
+                spec.field_name: {
+                    "type": "string",
+                    "description": spec.field_description,
+                }
+            }
+            if name == "ask_user":
+                properties["confirmation_for_step"] = {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "Claim that this question asks approval for the "
+                        "immediately preceding rejected step."
+                    ),
+                }
+            definitions.append(
+                AgentControlDefinition(
+                    name=name,
+                    description=spec.description,
+                    input_schema={
+                        "type": "object",
+                        "properties": properties,
+                        "required": [spec.field_name],
+                        "additionalProperties": False,
                     },
-                    "required": [spec.field_name],
-                    "additionalProperties": False,
-                },
+                )
             )
-            for name, spec in sorted(_CONTROL_SPECS.items())
-        )
+        return tuple(definitions)
 
     def execute(
         self,
@@ -123,8 +136,10 @@ class AgentControlExecutor:
             )
 
         expected_fields = {spec.field_name}
+        if tool_name == "ask_user":
+            expected_fields.add("confirmation_for_step")
         actual_fields = set(arguments)
-        missing_fields = expected_fields - actual_fields
+        missing_fields = {spec.field_name} - actual_fields
         if missing_fields:
             raise InvalidAgentControlArgumentsError(
                 f"Agent control {tool_name!r} is missing required field "
@@ -163,12 +178,22 @@ class AgentControlExecutor:
             )
 
         if tool_name == "ask_user":
+            confirmation_for_step = arguments.get("confirmation_for_step")
+            if "confirmation_for_step" in arguments and (
+                type(confirmation_for_step) is not int
+                or confirmation_for_step <= 0
+            ):
+                raise InvalidAgentControlArgumentsError(
+                    "Agent control 'ask_user' field "
+                    "'confirmation_for_step' must be a positive integer."
+                )
             return AgentControlResult(
                 tool_name=tool_name,
                 status=spec.status,
                 text=value,
                 final_result=None,
                 question=value,
+                confirmation_for_step=confirmation_for_step,
             )
 
         raise AgentControlError(

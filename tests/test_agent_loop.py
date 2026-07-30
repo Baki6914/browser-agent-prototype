@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import unittest
 from collections.abc import Mapping
 from typing import Any
@@ -9,17 +10,30 @@ from typing import Any
 from browser_agent.agent_controls import AgentControlExecutor
 from browser_agent.agent_loop import (
     AgentLoopContext,
+    AgentPauseKind,
     AgentRunStatus,
+    AgentSessionConstructionError,
+    AgentSessionStateError,
     AgentStepStatus,
     AgentToolCall,
     AgentToolCatalogError,
     AgentToolRouter,
     AgentToolSource,
+    AgentUserResponseError,
     DeterministicAgentLoop,
+    PendingConfirmation,
+    ResumableAgentSession,
     ScriptedDecisionSource,
 )
-from browser_agent.mcp_gateway import ToolDefinition, ToolObservation
-from browser_agent.tool_policy import ToolConfirmationRequiredError
+from browser_agent.mcp_gateway import (
+    InvalidToolArgumentsError,
+    ToolDefinition,
+    ToolObservation,
+)
+from browser_agent.tool_policy import (
+    ToolConfirmationRequiredError,
+    ToolDeniedError,
+)
 from scripts.mcp_agent_loop_smoke import AgentLoopSmokeError, _run_loop
 
 
@@ -103,6 +117,32 @@ class RecordingDecisionSource:
         decision = self.decisions[self.index]
         self.index += 1
         return decision
+
+
+class ConfirmationExecutor:
+    def __init__(self, *, replay_error: BaseException | None = None) -> None:
+        self.calls: list[tuple[str, dict[str, Any], bool]] = []
+        self.replay_error = replay_error
+        self.replay_started = asyncio.Event()
+        self.release_replay = asyncio.Event()
+        self.block_replay = False
+
+    async def invoke(
+        self,
+        tool_name: str,
+        arguments: Mapping[str, Any],
+        *,
+        confirmation_granted: bool = False,
+    ) -> ToolObservation:
+        self.calls.append((tool_name, dict(arguments), confirmation_granted))
+        if not confirmation_granted:
+            raise ToolConfirmationRequiredError("approval required")
+        self.replay_started.set()
+        if self.block_replay:
+            await self.release_replay.wait()
+        if self.replay_error is not None:
+            raise self.replay_error
+        return ToolObservation(tool_name, "success", "replayed", None, None)
 
 
 class AgentToolCallTests(unittest.TestCase):
@@ -234,6 +274,7 @@ class AgentToolRouterTests(unittest.IsolatedAsyncioTestCase):
             AgentToolCall("browser_snapshot", {})
         )
         self.assertEqual(observation.status, AgentStepStatus.REJECTED)
+        self.assertIs(observation.confirmation_required, True)
         self.assertIn("ToolConfirmationRequiredError", observation.error or "")
         self.assertIn("trusted approval required", observation.error or "")
 
@@ -371,6 +412,395 @@ class DeterministicAgentLoopTests(unittest.IsolatedAsyncioTestCase):
                         router,
                         limit,  # type: ignore[arg-type]
                     )
+
+
+class ResumableAgentSessionTests(unittest.IsolatedAsyncioTestCase):
+    def make_session(
+        self,
+        decisions: list[AgentToolCall],
+        *,
+        executor: Any | None = None,
+        max_steps: int = 8,
+    ) -> tuple[ResumableAgentSession, RecordingDecisionSource, Any]:
+        actual_executor = executor or FakePolicyExecutor()
+        source = RecordingDecisionSource(decisions)
+        router = AgentToolRouter(
+            actual_executor,
+            [tool_definition()],
+            RecordingControls(),
+        )
+        return (
+            ResumableAgentSession(source, router, max_steps),
+            source,
+            actual_executor,
+        )
+
+    def confirmation_session(
+        self,
+        *,
+        executor: ConfirmationExecutor | None = None,
+        max_steps: int = 8,
+        arguments: dict[str, Any] | None = None,
+        reference: Any = 1,
+        later: list[AgentToolCall] | None = None,
+    ) -> tuple[
+        ResumableAgentSession, RecordingDecisionSource, ConfirmationExecutor
+    ]:
+        actual_executor = executor or ConfirmationExecutor()
+        session, source, _ = self.make_session(
+            [
+                AgentToolCall(
+                    "browser_snapshot",
+                    (
+                        arguments
+                        if arguments is not None
+                        else {"nested": {"values": [1]}, "café": True}
+                    ),
+                ),
+                AgentToolCall(
+                    "ask_user",
+                    {
+                        "question": "Approve this exact action?",
+                        "confirmation_for_step": reference,
+                    },
+                ),
+                *(later or []),
+            ],
+            executor=actual_executor,
+            max_steps=max_steps,
+        )
+        return session, source, actual_executor
+
+    async def test_start_finish_and_terminal_transitions(self) -> None:
+        session, _, _ = self.make_session(
+            [AgentToolCall("finish", {"result": "done"})]
+        )
+        result = await session.start("Inspect")
+        self.assertEqual(result.status, AgentRunStatus.FINISHED)
+        with self.assertRaises(AgentSessionStateError):
+            await session.start("again")
+        with self.assertRaises(AgentSessionStateError):
+            await session.respond("again")
+
+    async def test_normal_response_resumes_history_and_context(self) -> None:
+        session, source, _ = self.make_session(
+            [
+                AgentToolCall("ask_user", {"question": "Which period?"}),
+                AgentToolCall("finish", {"result": "done"}),
+            ]
+        )
+        paused = await session.start("Inspect")
+        self.assertEqual(paused.pause_kind, AgentPauseKind.USER_INPUT)
+        self.assertIsNone(paused.pending_confirmation)
+        result = await session.respond("2026")
+        self.assertEqual(result.status, AgentRunStatus.FINISHED)
+        self.assertEqual([step.step_number for step in result.steps], [1, 2])
+        interaction = source.contexts[1].user_interactions[0]
+        self.assertEqual(interaction.after_step_number, 1)
+        self.assertEqual(interaction.response, "2026")
+        with self.assertRaises(AgentSessionStateError):
+            await session.confirm(True)
+
+    async def test_invalid_normal_response_is_rejected(self) -> None:
+        session, _, _ = self.make_session(
+            [AgentToolCall("ask_user", {"question": "Which?"})]
+        )
+        await session.start("Inspect")
+        for response in ("", " ", True, 1):
+            with self.subTest(response=response):
+                with self.assertRaises(AgentUserResponseError):
+                    await session.respond(response)  # type: ignore[arg-type]
+
+    async def test_step_limit_is_shared_across_response(self) -> None:
+        session, source, _ = self.make_session(
+            [
+                AgentToolCall("ask_user", {"question": "Which?"}),
+                AgentToolCall("browser_snapshot", {}),
+                AgentToolCall("finish", {"result": "unused"}),
+            ],
+            max_steps=2,
+        )
+        await session.start("Inspect")
+        result = await session.respond("one")
+        self.assertEqual(result.status, AgentRunStatus.STEP_LIMIT_REACHED)
+        self.assertEqual(len(result.steps), 2)
+        self.assertEqual(source.index, 2)
+
+    async def test_matching_confirmation_binds_and_replays_exact_call(self) -> None:
+        original = {"nested": {"values": [1]}, "café": True}
+        session, source, executor = self.confirmation_session(
+            arguments=original,
+            later=[AgentToolCall("finish", {"result": "done"})],
+        )
+        paused = await session.start("Inspect")
+        self.assertEqual(paused.pause_kind, AgentPauseKind.CONFIRMATION)
+        self.assertEqual(len(executor.calls), 1)
+        pending = paused.pending_confirmation
+        self.assertIsNotNone(pending)
+        original["nested"]["values"].append(2)
+        returned = pending.arguments  # type: ignore[union-attr]
+        returned["nested"]["values"].append(3)
+        result = await session.confirm(True)
+        self.assertEqual(result.status, AgentRunStatus.FINISHED)
+        self.assertEqual(
+            executor.calls,
+            [
+                (
+                    "browser_snapshot",
+                    {"nested": {"values": [1]}, "café": True},
+                    False,
+                ),
+                (
+                    "browser_snapshot",
+                    {"café": True, "nested": {"values": [1]}},
+                    True,
+                ),
+            ],
+        )
+        self.assertEqual(result.steps[2].replay_of_step_number, 1)
+        self.assertEqual(result.steps[2].step_number, 3)
+        self.assertIs(
+            source.contexts[-1].user_interactions[0].response, True
+        )
+
+    async def test_confirmation_rejection_does_not_replay(self) -> None:
+        session, source, executor = self.confirmation_session(
+            later=[AgentToolCall("finish", {"result": "safe"})]
+        )
+        await session.start("Inspect")
+        result = await session.confirm(False)
+        self.assertEqual(result.status, AgentRunStatus.FINISHED)
+        self.assertEqual(len(executor.calls), 1)
+        self.assertIs(
+            source.contexts[-1].user_interactions[0].response, False
+        )
+
+    async def test_wrong_or_unsafe_associations_fall_back_to_user_input(self) -> None:
+        for arguments, reference in (
+            ({}, 2),
+            ({"value": float("nan")}, 1),
+            ({1: "not a string key"}, 1),
+            ({"nested": ("not", "a", "list")}, 1),
+        ):
+            with self.subTest(arguments=arguments, reference=reference):
+                session, _, _ = self.confirmation_session(
+                    arguments=arguments, reference=reference
+                )
+                result = await session.start("Inspect")
+                self.assertEqual(result.pause_kind, AgentPauseKind.USER_INPUT)
+                self.assertIsNone(result.pending_confirmation)
+
+    def test_direct_pending_confirmation_rejects_unsafe_or_noncanonical_json(
+        self,
+    ) -> None:
+        for canonical in (
+            '{"value":NaN}',
+            '{"value":Infinity}',
+            '{"value":-Infinity}',
+            '{"value": 1}',
+            '{"z":1,"a":2}',
+            '{"value":1,"value":2}',
+            '[]',
+        ):
+            with self.subTest(canonical=canonical):
+                with self.assertRaises(AgentSessionConstructionError):
+                    PendingConfirmation(1, "browser_snapshot", canonical)
+
+    def test_valid_pending_arguments_are_fresh_independent_mappings(self) -> None:
+        pending = PendingConfirmation(
+            1,
+            "browser_snapshot",
+            '{"nested":{"items":[{"value":1}]},"text":"café"}',
+        )
+        first = pending.arguments
+        second = pending.arguments
+        self.assertIsNot(first, second)
+        self.assertIsNot(first["nested"], second["nested"])
+        first["nested"]["items"][0]["value"] = 2
+        self.assertEqual(second["nested"]["items"][0]["value"], 1)
+        self.assertEqual(pending.arguments["nested"]["items"][0]["value"], 1)
+
+    async def test_generic_deny_does_not_create_confirmation(self) -> None:
+        session, _, _ = self.make_session(
+            [
+                AgentToolCall("browser_snapshot", {}),
+                AgentToolCall(
+                    "ask_user",
+                    {"question": "Approve?", "confirmation_for_step": 1},
+                ),
+            ],
+            executor=FakePolicyExecutor(error=ToolDeniedError("denied")),
+        )
+        result = await session.start("Inspect")
+        self.assertEqual(result.pause_kind, AgentPauseKind.USER_INPUT)
+
+    async def test_invalid_tool_arguments_do_not_create_confirmation(self) -> None:
+        session, _, _ = self.make_session(
+            [
+                AgentToolCall("browser_snapshot", {}),
+                AgentToolCall(
+                    "ask_user",
+                    {"question": "Approve?", "confirmation_for_step": 1},
+                ),
+            ],
+            executor=FakePolicyExecutor(
+                error=InvalidToolArgumentsError("invalid")
+            ),
+        )
+        result = await session.start("Inspect")
+        self.assertEqual(result.pause_kind, AgentPauseKind.USER_INPUT)
+
+    async def test_intervening_call_invalidates_older_candidate(self) -> None:
+        executor = ConfirmationExecutor()
+        session, _, _ = self.make_session(
+            [
+                AgentToolCall("browser_snapshot", {"attempt": 1}),
+                AgentToolCall("browser_snapshot", {"attempt": 2}),
+                AgentToolCall(
+                    "ask_user",
+                    {"question": "Approve first?", "confirmation_for_step": 1},
+                ),
+            ],
+            executor=executor,
+        )
+        result = await session.start("Inspect")
+        self.assertEqual(result.pause_kind, AgentPauseKind.USER_INPUT)
+
+    async def test_rejected_control_call_invalidates_candidate(self) -> None:
+        session, _, _ = self.make_session(
+            [
+                AgentToolCall("browser_snapshot", {"attempt": 1}),
+                AgentToolCall(
+                    "ask_user",
+                    {"question": "Invalid", "confirmation_for_step": True},
+                ),
+                AgentToolCall(
+                    "ask_user",
+                    {"question": "Approve?", "confirmation_for_step": 1},
+                ),
+            ],
+            executor=ConfirmationExecutor(),
+        )
+        result = await session.start("Inspect")
+        self.assertEqual(result.pause_kind, AgentPauseKind.USER_INPUT)
+        self.assertIsNone(result.pending_confirmation)
+
+    async def test_confirmation_and_response_state_are_distinct(self) -> None:
+        session, _, _ = self.confirmation_session()
+        await session.start("Inspect")
+        with self.assertRaises(AgentSessionStateError):
+            await session.respond("yes")
+        with self.assertRaises(AgentUserResponseError):
+            await session.confirm(1)  # type: ignore[arg-type]
+
+    async def test_concurrent_and_sequential_confirm_are_single_use(self) -> None:
+        executor = ConfirmationExecutor()
+        executor.block_replay = True
+        session, _, _ = self.confirmation_session(executor=executor)
+        await session.start("Inspect")
+        first = asyncio.create_task(session.confirm(True))
+        await executor.replay_started.wait()
+        self.assertIsNone(session.pending_confirmation)
+        second = asyncio.create_task(session.confirm(True))
+        executor.release_replay.set()
+        await first
+        with self.assertRaises(AgentSessionStateError):
+            await second
+        with self.assertRaises(AgentSessionStateError):
+            await session.confirm(True)
+        self.assertEqual(sum(call[2] for call in executor.calls), 1)
+
+    async def test_replay_failure_and_exception_cannot_retry(self) -> None:
+        for error in (
+            ToolDeniedError("denied"),
+            RuntimeError("bug"),
+            TimeoutError("timed out"),
+        ):
+            with self.subTest(error=error):
+                executor = ConfirmationExecutor(replay_error=error)
+                session, _, _ = self.confirmation_session(executor=executor)
+                await session.start("Inspect")
+                if isinstance(error, (RuntimeError, TimeoutError)):
+                    with self.assertRaises(type(error)):
+                        await session.confirm(True)
+                else:
+                    await session.confirm(True)
+                with self.assertRaises(AgentSessionStateError):
+                    await session.confirm(True)
+                self.assertEqual(sum(call[2] for call in executor.calls), 1)
+
+    async def test_normalized_replay_errors_cannot_be_confirmed_again(
+        self,
+    ) -> None:
+        for status in ("mcp_error", "transport_error"):
+            with self.subTest(status=status):
+                executor = ConfirmationExecutor()
+                session, _, _ = self.confirmation_session(executor=executor)
+                await session.start("Inspect")
+                executor.replay_error = None
+
+                async def replay_error(
+                    tool_name: str,
+                    arguments: Mapping[str, Any],
+                    *,
+                    confirmation_granted: bool = False,
+                ) -> ToolObservation:
+                    executor.calls.append(
+                        (tool_name, dict(arguments), confirmation_granted)
+                    )
+                    return ToolObservation(
+                        tool_name, status, "", None, f"{status} detail"
+                    )
+
+                executor.invoke = replay_error  # type: ignore[method-assign]
+                await session.confirm(True)
+                with self.assertRaises(AgentSessionStateError):
+                    await session.confirm(True)
+                self.assertEqual(sum(call[2] for call in executor.calls), 1)
+
+    async def test_rejection_consumes_confirmation_permanently(self) -> None:
+        session, _, executor = self.confirmation_session(
+            later=[AgentToolCall("ask_user", {"question": "Continue?"})]
+        )
+        await session.start("Inspect")
+        result = await session.confirm(False)
+        self.assertEqual(result.pause_kind, AgentPauseKind.USER_INPUT)
+        with self.assertRaises(AgentSessionStateError):
+            await session.confirm(True)
+        self.assertEqual(sum(call[2] for call in executor.calls), 0)
+
+    async def test_cancellation_during_replay_cannot_retry(self) -> None:
+        executor = ConfirmationExecutor()
+        executor.block_replay = True
+        session, _, _ = self.confirmation_session(executor=executor)
+        await session.start("Inspect")
+        replay = asyncio.create_task(session.confirm(True))
+        await executor.replay_started.wait()
+        replay.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await replay
+        with self.assertRaises(AgentSessionStateError):
+            await session.confirm(True)
+        self.assertEqual(sum(call[2] for call in executor.calls), 1)
+
+    async def test_replay_respects_full_and_final_step_limits(self) -> None:
+        full, _, full_executor = self.confirmation_session(max_steps=2)
+        await full.start("Inspect")
+        full_result = await full.confirm(True)
+        self.assertEqual(
+            full_result.status, AgentRunStatus.STEP_LIMIT_REACHED
+        )
+        self.assertEqual(sum(call[2] for call in full_executor.calls), 0)
+
+        final, source, final_executor = self.confirmation_session(max_steps=3)
+        await final.start("Inspect")
+        final_result = await final.confirm(True)
+        self.assertEqual(
+            final_result.status, AgentRunStatus.STEP_LIMIT_REACHED
+        )
+        self.assertEqual(sum(call[2] for call in final_executor.calls), 1)
+        self.assertEqual(source.index, 2)
+        self.assertEqual(len(final_result.steps), 3)
 
 
 class AgentLoopSmokeTests(unittest.IsolatedAsyncioTestCase):

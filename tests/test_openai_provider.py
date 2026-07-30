@@ -11,12 +11,14 @@ import httpx
 
 from browser_agent.agent_loop import (
     AgentLoopContext,
+    AgentPauseKind,
     AgentStepObservation,
     AgentStepRecord,
     AgentStepStatus,
     AgentToolCall,
     AgentToolDefinition,
     AgentToolSource,
+    AgentUserInput,
 )
 from browser_agent.openai_provider import (
     OpenAICompatibleDecisionSource,
@@ -229,6 +231,71 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
                 "step_number": 1,
                 "tool_name": "browser_navigate",
             },
+        )
+        self.assertNotIn("user_interactions", user)
+
+    async def test_user_interactions_serialize_deterministically(self) -> None:
+        context = _context()
+        context = AgentLoopContext(
+            context.task,
+            context.tools,
+            context.steps,
+            (
+                AgentUserInput(
+                    1,
+                    AgentPauseKind.USER_INPUT,
+                    "Which period?",
+                    "2026",
+                ),
+                AgentUserInput(
+                    3,
+                    AgentPauseKind.CONFIRMATION,
+                    "Approve exact action?",
+                    True,
+                ),
+            ),
+        )
+        _, request = await self._request(
+            httpx.Response(200, json=_payload()), context=context
+        )
+        content = json.loads(request.content)["messages"][1]["content"]
+        self.assertEqual(
+            content,
+            json.dumps(
+                {
+                    "task": context.task,
+                    "previous_steps": [
+                        {
+                            "arguments": {"url": "https://example.com"},
+                            "observation": {
+                                "error": None,
+                                "source": "mcp",
+                                "status": "success",
+                                "text": "Exact observation café",
+                            },
+                            "step_number": 1,
+                            "tool_name": "browser_navigate",
+                        }
+                    ],
+                    "user_interactions": [
+                        {
+                            "after_step_number": 1,
+                            "kind": "user_input",
+                            "question": "Which period?",
+                            "response": "2026",
+                        },
+                        {
+                            "after_step_number": 3,
+                            "kind": "confirmation",
+                            "question": "Approve exact action?",
+                            "response": True,
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
         )
 
     async def test_valid_tool_call_returns_agent_tool_call(self) -> None:

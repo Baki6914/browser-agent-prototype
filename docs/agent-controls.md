@@ -1,52 +1,19 @@
-# Agent Control Tools
+# Agent control tools
 
 ## Boundary and ownership
 
-Agent controls are application-owned orchestration tools. They are separate
-from the browser tools discovered from the local Playwright MCP process:
+`finish` and `ask_user` are application-owned orchestration controls.
+`AgentControlExecutor` defines, validates, and executes them locally. They are
+separate from browser tools and never reach the MCP gateway, policy executor,
+Playwright, a subprocess, or a network service. Browser decisions continue
+through the policy-enforced executor.
 
-- `finish` ends the current agent task and supplies its final result.
-- `ask_user` pauses progress because information or clarification is missing.
+## Schemas
 
-The Python orchestrator owns their definitions, validation, and execution.
-They are not discovered through MCP, registered in the MCP tool policy,
-classified as browser tools, or passed to an MCP gateway, policy-enforced MCP
-executor, MCP session, Playwright, subprocess, or network service.
+`finish` is unchanged: it requires exactly one non-empty string field,
+`result`, and rejects additional properties.
 
-The future routing model is:
-
-```text
-tool decision
-    -> if agent-control name:
-           AgentControlExecutor.execute()
-       else:
-           PolicyEnforcedToolExecutor.invoke()
-```
-
-This milestone defines neither that router nor the surrounding agent loop.
-
-## Definitions
-
-`AgentControlExecutor.definitions()` returns an alphabetically ordered tuple:
-`ask_user`, then `finish`.
-
-The `finish` input schema is:
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "result": {
-      "type": "string",
-      "description": "Final result to return to the user."
-    }
-  },
-  "required": ["result"],
-  "additionalProperties": false
-}
-```
-
-The `ask_user` input schema is:
+`ask_user` remains backward compatible:
 
 ```json
 {
@@ -55,6 +22,11 @@ The `ask_user` input schema is:
     "question": {
       "type": "string",
       "description": "Question that must be answered before continuing."
+    },
+    "confirmation_for_step": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Claim that this question asks approval for the immediately preceding rejected step."
     }
   },
   "required": ["question"],
@@ -62,58 +34,50 @@ The `ask_user` input schema is:
 }
 ```
 
-Definitions are immutable dataclass values, but their JSON-compatible schemas
-contain mutable dictionaries and lists. Each public call therefore constructs
-fresh nested schema data. Mutating a returned schema cannot affect the private
-control specifications or a later call.
+`question` must be a non-empty, non-whitespace string.
+`confirmation_for_step` is optional; when present it must be an exact positive
+integer, and a boolean is rejected. Unexpected fields remain invalid.
+Definitions contain mutable JSON-compatible dictionaries, so every call
+returns fresh nested schema data.
 
-## Status and result model
+`AgentControlResult` carries the validated optional reference. This is only a
+model-supplied claimed association. The control executor does not grant
+confirmation and cannot authorize a browser call.
 
-`AgentControlStatus` has two string values:
+## Association and fallback
 
-- `FINISHED` (`"finished"`) means `finish` ended the task.
-- `AWAITING_USER` (`"awaiting_user"`) means `ask_user` paused progress for an
-  answer.
+A confirmation pause exists only when all of these facts agree:
 
-Every execution returns an immutable `AgentControlResult` with:
+1. The immediately preceding decision was an MCP/browser tool call.
+2. It was rejected through the typed `ToolConfirmationRequiredError` path.
+3. No tool or control occurred between that rejection and `ask_user`.
+4. `confirmation_for_step` exactly names that immediately preceding step.
+5. The rejected call's arguments can be safely canonicalized.
 
-- `tool_name`: the executed control name;
-- `status`: its `AgentControlStatus`;
-- `text`: the exact supplied result or question;
-- `final_result`: the exact finish result, otherwise `None`; and
-- `question`: the exact ask-user question, otherwise `None`.
+The pending record takes its tool name and arguments only from the rejected
+browser call, never from `ask_user`. A syntactically valid positive integer
+reference that is wrong, stale, unbound, or ambiguous produces an ordinary
+`USER_INPUT` pause with no pending confirmation. A later `ask_user` cannot
+reuse a candidate invalidated by an intervening rejected control call.
 
-For `finish({"result": value})`, execution returns `FINISHED`, copies `value`
-unchanged into `text` and `final_result`, and sets `question` to `None`.
-`finish` does not verify that the task was completed correctly.
+Invalid schema values for `confirmation_for_step`—including null, booleans,
+zero, negative integers, floats, and strings—are rejected by
+`AgentControlExecutor` validation. They are not converted into `USER_INPUT`
+pauses. A denial, invalid tool arguments, intervening decision, missing
+reference, or unsafe arguments also cannot establish a confirmation.
+Ambiguity therefore fails closed.
 
-For `ask_user({"question": value})`, execution returns `AWAITING_USER`, copies
-`value` unchanged into `text` and `question`, and sets `final_result` to
-`None`. This result represents an orchestration pause only; no real user
-interface is displayed.
+`ask_user({"question": "Which reporting period should I use?"})` retains its
+original normal-input behavior. `finish` retains its schema, result, and
+terminal behavior unchanged.
 
-## Validation and failure behavior
+## Validation and limits
 
-Execution first requires an explicitly registered control name. Unknown,
-empty, browser, MCP, and future unregistered names raise
-`UnknownAgentControlError`.
+Unknown control names raise `UnknownAgentControlError`. Invalid mappings,
+missing fields, wrong types, empty text, invalid confirmation references, and
+additional fields raise `InvalidAgentControlArgumentsError`. Accepted text is
+preserved rather than trimmed.
 
-Arguments must be a mapping containing exactly the required field. Missing
-fields, additional fields, non-string values (including booleans), empty
-strings, and whitespace-only strings raise
-`InvalidAgentControlArgumentsError`. Validation uses only the Python standard
-library. Accepted text is checked with whitespace awareness but is never
-trimmed or rewritten. These rules fail closed and errors identify the control
-and relevant field.
-
-After validation, execution creates the typed result directly in the
-orchestrator process. No browser capability is needed, which is why these
-controls must never reach MCP.
-
-## Current limitations and deferred work
-
-This milestone does not implement an agent loop, tool router, confirmation UI,
-display of questions, waiting for or persisting user answers, automatic resume,
-session or approval persistence, step or timeout limits, an LLM provider,
-OpenAI-compatible provider adapter, local vLLM, an HTTP API, database support,
-Docker, offline packaging, file lifecycle management, or credential handling.
+The resumable loop is process-memory only. These controls do not implement
+FastAPI, an HTTP RunManager, persistence, login, downloads, or secret-safe
+input.

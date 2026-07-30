@@ -210,13 +210,27 @@ class OpenAICompatibleDecisionSource:
             }
             for step in context.steps
         ]
+        user_context: dict[str, Any] = {
+            "task": context.task,
+            "previous_steps": previous_steps,
+        }
+        if context.user_interactions:
+            user_context["user_interactions"] = [
+                {
+                    "after_step_number": interaction.after_step_number,
+                    "kind": interaction.kind.value,
+                    "question": interaction.question,
+                    "response": interaction.response,
+                }
+                for interaction in context.user_interactions
+            ]
         return {
             "messages": [
                 {"role": "system", "content": _SYSTEM_MESSAGE},
                 {
                     "role": "user",
                     "content": json.dumps(
-                        {"task": context.task, "previous_steps": previous_steps},
+                        user_context,
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),

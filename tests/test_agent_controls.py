@@ -86,7 +86,15 @@ class AgentControlDefinitionsTests(unittest.TestCase):
                         "description": (
                             "Question that must be answered before continuing."
                         ),
-                    }
+                    },
+                    "confirmation_for_step": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "Claim that this question asks approval for the "
+                            "immediately preceding rejected step."
+                        ),
+                    },
                 },
                 "required": ["question"],
                 "additionalProperties": False,
@@ -244,6 +252,25 @@ class AgentControlValidationTests(unittest.TestCase):
                 "ask_user",
                 {"question": "Which file?", "extra": "x"},
             )
+
+    def test_ask_user_accepts_positive_confirmation_reference(self) -> None:
+        result = self.executor.execute(
+            "ask_user",
+            {"question": "Approve?", "confirmation_for_step": 4},
+        )
+        self.assertEqual(result.confirmation_for_step, 4)
+
+    def test_ask_user_rejects_invalid_confirmation_reference(self) -> None:
+        for value in (None, True, False, 0, -1, 1.5, "1"):
+            with self.subTest(value=value):
+                with self.assertRaises(InvalidAgentControlArgumentsError):
+                    self.executor.execute(
+                        "ask_user",
+                        {
+                            "question": "Approve?",
+                            "confirmation_for_step": value,
+                        },
+                    )
 
     def test_multiple_unexpected_fields_are_rendered_in_repr_order(self) -> None:
         with self.assertRaises(InvalidAgentControlArgumentsError) as raised:
