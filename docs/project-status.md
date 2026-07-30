@@ -7,16 +7,15 @@
 - **Current completed milestone:** Milestone 7, MVP Evaluation
   - This is the latest milestone whose implementation, review, tests, Learning
     Handoff, human commit, human push, and remote verification are complete.
-- **Current checkpoint:** documentation roadmap correction awaiting human
-  commit, push, and remote verification
+- **Latest completed documentation checkpoint:**
+  `f2cb304eaf26e4441dcc31207e637bf6acfa3237`
 - **Current implementation:** synchronous learning prototype, verified local
   Playwright MCP connectivity, dynamic MCP tool gateway, typed classification
   and policy enforcement, typed `finish` and `ask_user` controls,
   `AgentToolRouter`, a deterministic observation-driven agent loop, and a
   provider-neutral real decision source connected to that existing loop, plus
   a provider-neutral MVP evaluation framework
-- **Current phase:** COMMIT CHECKPOINT — awaiting human commit, push, and
-  remote verification
+- **Current phase:** PLAN — Milestone 8
 
 ## Completed
 
@@ -309,6 +308,17 @@
   `9721001a8f20bbb75ee90c16a7b8a679d83246bb` was ahead by 1 commit and
   behind by 0 commits, and the working tree was clean after the push.
 - Milestone 7, MVP Evaluation, is completed.
+- The documentation roadmap correction is complete. The human committed and
+  pushed checkpoint `f2cb304eaf26e4441dcc31207e637bf6acfa3237`,
+  with commit subject `docs: align roadmap with HTTP browser-agent MVP`.
+- Remote verification confirmed that the local and remote SHA both equal
+  `f2cb304eaf26e4441dcc31207e637bf6acfa3237`, the branch is up to date with
+  `origin/mvp/playwright-mcp-agent`, and the working tree was clean after the
+  push.
+- The documentation checkpoint recorded 379 insertions and 161 deletions and
+  changed exactly seven documentation files: `AGENTS.md`, `README.md`,
+  `ROADMAP.md`, `docs/architecture.md`, `docs/mvp-evaluation.md`,
+  `docs/openai-provider.md`, and `docs/project-status.md`.
 
 The gateway remains the browser-capability boundary and normalization layer.
 Dynamic discovery is capability information, not authorization. The policy
@@ -318,11 +328,9 @@ policy-enforced MCP path without collapsing their boundaries.
 
 ## In progress
 
-- The documentation roadmap correction implementation, static review, and
-  Learning Handoff are complete.
-- Human commit, push, and remote verification of this documentation checkpoint
-  remain outstanding.
+- Planning and review of the Milestone 8 Implementation Brief.
 - Milestone 8 implementation has not started.
+- FastAPI and the in-memory `RunManager` have not been implemented.
 
 ## Not started
 
@@ -420,10 +428,12 @@ policy-enforced MCP path without collapsing their boundaries.
 
 ## Immediate next step
 
-The human documentation checkpoint is next: commit, push, and remotely verify
-the reviewed documentation changes. After that verification, prepare and
-review the Milestone 8 Implementation Brief. Milestone 8 implementation has
-not started.
+Prepare and review the Milestone 8 Implementation Brief. Milestone 8
+implementation has not started. Its approved direction remains a mandatory
+FastAPI HTTP service backed by an in-memory `RunManager`, with a resumable
+custom agent loop for human responses and trusted confirmation. No
+database-backed or persistent session and no service-restart resume are
+planned for the MVP.
 
 ## Last verified checkpoint
 
@@ -650,14 +660,16 @@ commit and behind by 0 commits. The working tree was clean after the push.
 
 Milestone 7, MVP Evaluation, is completed.
 
-The repository is at an approved documentation-only roadmap correction
-checkpoint before Milestone 8 implementation. Milestone 8 is the FastAPI HTTP
-Run Service and Human-in-the-Loop Resume milestone; its implementation has not
-started. The authoritative Milestones 8–12 sequence is in
+The documentation-only roadmap correction checkpoint is complete and remotely
+verified. The repository is now planning Milestone 8, the FastAPI HTTP Run
+Service and Human-in-the-Loop Resume milestone; its implementation has not
+started. FastAPI and the in-memory `RunManager` have not been implemented. The
+authoritative Milestones 8–12 sequence is in
 [`ROADMAP.md`](../ROADMAP.md):
 
 - Milestone 8: mandatory FastAPI HTTP service, in-memory `RunManager`, and
-  resumable human interaction without persistent sessions or a database.
+  resumable custom agent-loop human interaction and trusted confirmation
+  without persistent sessions, a database, or service-restart resume.
 - Milestone 9: secure login and secret handling without exposing raw secrets
   to NVIDIA or serializable run history.
 - Milestone 10: controlled automatic file download, beginning with a
