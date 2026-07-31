@@ -1,8 +1,12 @@
 """Unit tests for application-owned agent controls."""
 
+from pathlib import Path
+import sys
 import unittest
 from types import MappingProxyType
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import browser_agent.agent_controls as agent_controls
 from browser_agent import (
@@ -11,6 +15,7 @@ from browser_agent import (
     AgentControlStatus,
     InvalidAgentControlArgumentsError,
     UnknownAgentControlError,
+    SecretField,
 )
 
 
@@ -25,6 +30,7 @@ class AgentControlDefinitionsTests(unittest.TestCase):
         self.assertEqual([definition.name for definition in definitions], [
             "ask_user",
             "finish",
+            "request_secret",
         ])
 
     def test_definitions_are_alphabetically_ordered(self) -> None:
@@ -289,6 +295,58 @@ class AgentControlValidationTests(unittest.TestCase):
             "Agent control 'finish' received unexpected field(s): "
             "'zeta', ('tuple',), 2.",
         )
+
+
+class RequestSecretControlTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.executor = AgentControlExecutor()
+
+    def test_exact_schema_and_safe_success(self) -> None:
+        definition = next(
+            item for item in self.executor.definitions()
+            if item.name == "request_secret"
+        )
+        self.assertEqual(definition.input_schema, {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "Safe question shown to the user."},
+                "fields": {"type": "array", "items": {"type": "string", "enum": ["username", "password", "otp"]}, "minItems": 1, "uniqueItems": True},
+            },
+            "required": ["question", "fields"],
+            "additionalProperties": False,
+        })
+        result = self.executor.execute(
+            "request_secret",
+            {"question": "Enter credentials", "fields": ["username", "password"]},
+        )
+        self.assertEqual(result.status, AgentControlStatus.AWAITING_SECRET)
+        self.assertEqual(result.secret_fields, (SecretField.PASSWORD, SecretField.USERNAME))
+        self.assertIsNone(result.final_result)
+
+    def test_otp_and_strict_rejections(self) -> None:
+        result = self.executor.execute(
+            "request_secret", {"question": "Enter OTP", "fields": ["otp"]}
+        )
+        self.assertEqual(result.secret_fields, (SecretField.OTP,))
+        invalid = (
+            {}, {"question": "Q"}, {"fields": ["otp"]},
+            {"question": "Q", "fields": []},
+            {"question": "Q", "fields": ("otp",)},
+            {"question": "Q", "fields": "otp"},
+            {"question": "Q", "fields": ["otp", "otp"]},
+            {"question": "Q", "fields": ["token"]},
+            {"question": "Q", "fields": [1]},
+            {"question": "Q", "fields": ["otp"], "values": {"otp": "x"}},
+            {"question": "Q", "fields": ["otp"], "password": "x"},
+        )
+        for arguments in invalid:
+            with self.subTest(arguments=tuple(arguments)):
+                with self.assertRaises(InvalidAgentControlArgumentsError):
+                    self.executor.execute("request_secret", arguments)
+
+    def test_non_secret_results_have_no_fields(self) -> None:
+        self.assertIsNone(self.executor.execute("finish", {"result": "done"}).secret_fields)
+        self.assertIsNone(self.executor.execute("ask_user", {"question": "Q"}).secret_fields)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,16 @@
 # Agent control tools
 
+## Milestone 9B `request_secret`
+
+`request_secret` is local-only and never reaches MCP. The model supplies only a
+safe `question` and a non-empty, unique `fields` array containing only
+`username`, `password`, or `otp`; it must never supply raw values. Both fields
+are required and additional properties are forbidden. Runtime validation
+requires an actual non-empty string and an actual list of unique approved
+string categories. Other containers, duplicates, unknown categories, value
+properties, and extra properties are rejected without rendering the payload.
+Success carries the question and a deterministic field tuple sorted by value.
+
 ## Boundary and ownership
 
 `finish` and `ask_user` are application-owned orchestration controls.

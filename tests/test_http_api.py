@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from fastapi.testclient import TestClient
+import httpx
 from pydantic import ValidationError
 
 from browser_agent import (
@@ -19,14 +19,68 @@ from browser_agent import (
     RunNotFoundError,
     RunSnapshot,
     RunStatus,
+    SecretField,
     create_http_app,
 )
 from browser_agent.http_api import (
     ConfirmationRunResponseRequest,
     RunHttpResponse,
     UserInputRunResponseRequest,
+    SecretRunResponseRequest,
     snapshot_to_http_response,
 )
+
+
+class TestClient:
+    """Synchronous facade over HTTPX ASGITransport for this test module."""
+
+    __test__ = False
+
+    def __init__(self, app, *, raise_server_exceptions: bool = True) -> None:
+        self.app = app
+        self.raise_server_exceptions = raise_server_exceptions
+        self._loop = asyncio.new_event_loop()
+        self._lifespan = None
+        self._client = None
+
+    def __enter__(self):
+        self._lifespan = self.app.router.lifespan_context(self.app)
+        self._loop.run_until_complete(self._lifespan.__aenter__())
+        transport = httpx.ASGITransport(
+            app=self.app,
+            raise_app_exceptions=self.raise_server_exceptions,
+        )
+        self._client = httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        )
+        self._loop.run_until_complete(self._client.__aenter__())
+        return self
+
+    def __exit__(self, _type, _value, _traceback) -> None:
+        try:
+            if self._client is not None:
+                self._loop.run_until_complete(self._client.__aexit__(
+                    _type, _value, _traceback
+                ))
+            if self._lifespan is not None:
+                self._loop.run_until_complete(self._lifespan.__aexit__(
+                    _type, _value, _traceback
+                ))
+        finally:
+            self._loop.close()
+
+    def get(self, path: str) -> httpx.Response:
+        return self._loop.run_until_complete(self._request("GET", path))
+
+    def post(self, path: str, *, json: object) -> httpx.Response:
+        return self._loop.run_until_complete(self._request("POST", path, json=json))
+
+    async def _request(
+        self, method: str, path: str, *, json: object | None = None
+    ) -> httpx.Response:
+        if self._client is None:
+            raise RuntimeError("test client is not entered")
+        return await self._client.request(method, path, json=json)
 
 
 def snapshot(
@@ -37,6 +91,7 @@ def snapshot(
     final_result: str | None = None,
     error_type: str | None = None,
     error_message: str | None = None,
+    secret_fields: tuple[SecretField, ...] | None = None,
 ) -> RunSnapshot:
     return RunSnapshot(
         run_id="run-1",
@@ -50,6 +105,7 @@ def snapshot(
         final_result=final_result,
         error_type=error_type,
         error_message=error_message,
+        secret_fields=secret_fields,
     )
 
 
@@ -89,6 +145,14 @@ class FakeRunManager:
     ) -> RunSnapshot:
         return self._return_or_raise(
             ("confirm", run_id, interaction_id, request_id, approved)
+        )
+
+    async def submit_secret(
+        self, run_id: str, interaction_id: str, request_id: str,
+        values: dict[SecretField, str],
+    ) -> RunSnapshot:
+        return self._return_or_raise(
+            ("submit_secret", run_id, interaction_id, request_id, values)
         )
 
     async def cancel(self, run_id: str, request_id: str) -> RunSnapshot:
@@ -492,6 +556,7 @@ class SnapshotTests(unittest.TestCase):
                 "interaction_id",
                 "final_result",
                 "error",
+                "secret_fields",
             },
         )
         self.assertTrue(
@@ -554,6 +619,67 @@ class OpenApiTests(unittest.TestCase):
         self.assertIn(
             "200", paths["/runs/{run_id}/cancel"]["post"]["responses"]
         )
+
+
+class SecretHttpTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manager = FakeRunManager()
+        self.client = TestClient(
+            create_http_app(self.manager),  # type: ignore[arg-type]
+            raise_server_exceptions=False,
+        )
+        self.client.__enter__()
+        self.addCleanup(self.client.__exit__, None, None, None)
+
+    def test_secret_request_delegates_and_redacts(self) -> None:
+        body = {
+            "type": "secret", "request_id": "request-secret",
+            "interaction_id": "interaction-secret",
+            "values": {"username": "synthetic-user", "password": "synthetic-pass"},
+        }
+        model = SecretRunResponseRequest.model_validate(body)
+        self.assertNotIn("synthetic-pass", repr(model))
+        self.assertNotIn("synthetic-pass", str(model))
+        self.assertNotIn("synthetic-user", repr(model))
+        self.assertNotIn("synthetic-user", str(model))
+        response = self.client.post("/runs/run-1/responses", json=body)
+        self.assertEqual(response.status_code, 202)
+        call = self.manager.calls[0]
+        self.assertEqual(call[:4], ("submit_secret", "run-1", "interaction-secret", "request-secret"))
+        self.assertEqual(set(call[4]), {SecretField.USERNAME, SecretField.PASSWORD})
+        self.assertNotIn("synthetic-pass", response.text)
+
+    def test_secret_snapshot_fields_are_safe(self) -> None:
+        for run_status, question, interaction in (
+            (RunStatus.AWAITING_SECRET, "Enter credentials", "interaction"),
+            (RunStatus.AWAITING_SECRET_APPLICATION, None, None),
+        ):
+            self.manager.result = snapshot(
+                status=run_status, question=question, interaction_id=interaction,
+                secret_fields=(SecretField.PASSWORD, SecretField.USERNAME),
+            )
+            response = self.client.get("/runs/run-1")
+            self.assertEqual(response.json()["secret_fields"], ["password", "username"])
+            self.assertNotIn("secret_id", response.text)
+
+    def test_secret_validation_is_generic_and_does_not_echo(self) -> None:
+        invalid_values = ({}, {"token": "synthetic"}, {"otp": None},
+                          {"otp": 1}, {"otp": True}, {"otp": "   "},
+                          ["synthetic"], {"otp": {"nested": "synthetic"}})
+        for values in invalid_values:
+            with self.subTest(kind=type(values).__name__):
+                response = self.client.post("/runs/run-1/responses", json={
+                    "type": "secret", "request_id": "r", "interaction_id": "i",
+                    "values": values,
+                })
+                self.assertEqual(response.status_code, 422)
+                self.assertEqual(response.json(), {"error": {"code": "validation_error", "message": "Request validation failed."}})
+        response = self.client.post("/runs/run-1/responses", json={
+            "type": "secret", "request_id": "r", "interaction_id": "i",
+            "values": {"otp": "synthetic-otp"}, "extra": "synthetic-extra",
+        })
+        self.assertEqual(response.status_code, 422)
+        self.assertNotIn("synthetic-otp", response.text)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,24 @@
 # Milestone 8C HTTP API
 
+## Milestone 9B secret response
+
+The existing `POST /runs/{run_id}/responses` accepts a third discriminator:
+
+```json
+{"type":"secret","request_id":"request-1","interaction_id":"interaction-1","values":{"username":"synthetic-user","password":"synthetic-password"}}
+```
+
+The strict non-empty object permits only `username`, `password`, and `otp`
+keys with actual non-whitespace strings. `SecretStr` redacts model repr/str;
+values are revealed only at final local conversion before `submit_secret`.
+Validation keeps the generic envelope and never echoes the body.
+
+`awaiting_secret` responses contain the safe question, interaction ID, and
+sorted `secret_fields`. `awaiting_secret_application` clears question and
+interaction while retaining those field categories. Responses never contain
+values, references, secret IDs, expiry, fingerprints, keys, or store details.
+There is no new endpoint and no browser login yet.
+
 ## Purpose and boundary
 
 Milestone 8C adds a FastAPI HTTP boundary over the existing in-memory
@@ -136,6 +155,9 @@ FastAPI lifespan shutdown awaits `run_manager.close()`. It is not called at
 application construction or after requests, and the HTTP layer invokes no
 other cleanup operation. Repeated application lifespans rely on the injected
 manager's idempotent close contract.
+HTTP tests enter the real `app.router.lifespan_context(app)` and use HTTPX
+`ASGITransport` on the same event loop for entry, requests, and exit. They do
+not substitute a direct manager close for lifespan cleanup.
 
 This milestone is an in-process, in-memory boundary. It has no persistence or
 resume after service restart, no multi-worker coordination, and no real

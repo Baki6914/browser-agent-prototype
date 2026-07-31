@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from dataclasses import FrozenInstanceError, fields
+from pathlib import Path
+import sys
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from browser_agent import (
     AgentPauseKind,
@@ -19,6 +24,9 @@ from browser_agent import (
     RunManagerError,
     RunNotFoundError,
     RunStatus,
+    SecretField,
+    SecretNotFoundError,
+    TransientSecretStore,
 )
 
 
@@ -29,6 +37,7 @@ def result(
     pause_kind: AgentPauseKind | None = None,
     final_result: str | None = None,
     pending_confirmation: PendingConfirmation | None = None,
+    secret_fields: tuple[SecretField, ...] | None = None,
 ) -> AgentRunResult:
     return AgentRunResult(
         status=status,
@@ -37,6 +46,7 @@ def result(
         question=question,
         pause_kind=pause_kind,
         pending_confirmation=pending_confirmation,
+        secret_fields=secret_fields,
     )
 
 
@@ -124,9 +134,65 @@ class FakeFactory:
         return self.handles.pop(0)
 
 
+class TrackingSecretStore(TransientSecretStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.discard_run_calls: list[str] = []
+        self.close_calls = 0
+        self.fail_put = False
+        self.fail_discard_run = False
+        self.fail_close = False
+
+    async def put(self, run_id, interaction_id, values):
+        if self.fail_put:
+            raise RuntimeError("SYNTHETIC-STORE-DETAIL")
+        return await super().put(run_id, interaction_id, values)
+
+    async def discard_run(self, run_id):
+        self.discard_run_calls.append(run_id)
+        await super().discard_run(run_id)
+        if self.fail_discard_run:
+            raise RuntimeError("SYNTHETIC-CLEANUP-DETAIL")
+
+    async def close(self):
+        self.close_calls += 1
+        await super().close()
+        if self.fail_close:
+            raise RuntimeError("SYNTHETIC-CLOSE-DETAIL")
+
+
+class ControlledSecretStore(TrackingSecretStore):
+    def __init__(self) -> None:
+        super().__init__()
+        self.put_error: BaseException | None = None
+        self.discard_run_error: BaseException | None = None
+        self.close_started = asyncio.Event()
+        self.close_release = asyncio.Event()
+        self.close_release.set()
+
+    async def put(self, run_id, interaction_id, values):
+        if self.put_error is not None:
+            raise self.put_error
+        return await super().put(run_id, interaction_id, values)
+
+    async def discard_run(self, run_id):
+        self.discard_run_calls.append(run_id)
+        if self.discard_run_error is not None:
+            raise self.discard_run_error
+        await TransientSecretStore.discard_run(self, run_id)
+
+    async def close(self):
+        self.close_calls += 1
+        self.close_started.set()
+        await self.close_release.wait()
+        await TransientSecretStore.close(self)
+        if self.fail_close:
+            raise RuntimeError("SYNTHETIC-CLOSE-DETAIL")
+
+
 class ShutdownTrackingRunManager(RunManager):
     def __init__(self, factory: FakeFactory) -> None:
-        super().__init__(factory)
+        super().__init__(factory, secret_store=TransientSecretStore())
         self.shutdown_entered = asyncio.Event()
 
     async def _shutdown_record(self, record: object) -> None:
@@ -140,10 +206,13 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self) -> None:
         for manager in self.managers:
-            await manager.close()
+            try:
+                await manager.close()
+            except RunManagerError:
+                pass
 
     def manager(self, factory: FakeFactory) -> RunManager:
-        manager = RunManager(factory)
+        manager = RunManager(factory, secret_store=TransientSecretStore())
         self.managers.append(manager)
         return manager
 
@@ -548,7 +617,7 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(after.error_type, "RuntimeError")
         self.assertEqual(after.version, before.version + 1)
         again = await manager._close_handle(record)
-        self.assertIsNone(again)
+        self.assertFalse(again)
         self.assertEqual(
             (await manager.get_run(pause.run_id)).version, after.version
         )
@@ -679,7 +748,7 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RunManagerError):
             await manager.get_run(True)  # type: ignore[arg-type]
         with self.assertRaises(RunConstructionError):
-            RunManager(None)  # type: ignore[arg-type]
+            RunManager(None, secret_store=TransientSecretStore())  # type: ignore[arg-type]
 
         session = FakeSession([result(AgentRunStatus.FINISHED, final_result="x")])
         manager2 = self.manager(FakeFactory([FakeHandle(session)]))
@@ -706,6 +775,359 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
             manager.close(),
         )
         self.assertEqual(handle.close_calls, 1)
+
+
+class RunManagerSecretTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.managers: list[RunManager] = []
+
+    async def asyncTearDown(self) -> None:
+        for manager in self.managers:
+            await manager.close()
+
+    async def settle(self, manager: RunManager, run_id: str) -> None:
+        task = manager._runs[run_id].active_task
+        if task is not None:
+            await task
+
+    async def secret_paused(self):
+        session = FakeSession([result(
+            AgentRunStatus.AWAITING_USER,
+            question="Enter credentials",
+            pause_kind=AgentPauseKind.SECRET,
+            secret_fields=(SecretField.PASSWORD, SecretField.USERNAME),
+        )])
+        store = TransientSecretStore()
+        manager = RunManager(FakeFactory([FakeHandle(session)]), secret_store=store)
+        self.managers.append(manager)
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        return manager, store, session, await manager.get_run(created.run_id)
+
+    async def test_secret_pause_submission_and_exact_retry(self) -> None:
+        manager, store, session, pause = await self.secret_paused()
+        self.assertEqual(pause.status, RunStatus.AWAITING_SECRET)
+        self.assertEqual(pause.secret_fields, (SecretField.PASSWORD, SecretField.USERNAME))
+        values = {SecretField.USERNAME: "synthetic-user", SecretField.PASSWORD: "synthetic-pass"}
+        accepted = await manager.submit_secret(
+            pause.run_id, pause.interaction_id, "secret-request", values
+        )
+        self.assertEqual(accepted.status, RunStatus.AWAITING_SECRET_APPLICATION)
+        self.assertIsNone(accepted.question)
+        self.assertIsNone(accepted.interaction_id)
+        self.assertEqual(len(session.calls), 1)
+        record = manager._runs[pause.run_id]
+        reference = record.secret_reference
+        self.assertIsNotNone(reference)
+        retry = await manager.submit_secret(
+            pause.run_id, pause.interaction_id, "secret-request", dict(reversed(tuple(values.items())))
+        )
+        self.assertEqual(retry, accepted)
+        consumed = await store.consume(reference)  # type: ignore[arg-type]
+        self.assertEqual(consumed, values)
+
+    async def test_mismatch_conflict_and_cancel_cleanup(self) -> None:
+        manager, store, _, pause = await self.secret_paused()
+        with self.assertRaises(RunConflictError):
+            await manager.submit_secret(
+                pause.run_id, pause.interaction_id, "missing",
+                {SecretField.PASSWORD: "synthetic-pass"},
+            )
+        await manager.submit_secret(
+            pause.run_id, pause.interaction_id, "accepted",
+            {SecretField.PASSWORD: "synthetic-pass", SecretField.USERNAME: "synthetic-user"},
+        )
+        reference = manager._runs[pause.run_id].secret_reference
+        with self.assertRaises(RunIdempotencyConflictError):
+            await manager.submit_secret(
+                pause.run_id, pause.interaction_id, "accepted",
+                {SecretField.PASSWORD: "changed", SecretField.USERNAME: "synthetic-user"},
+            )
+        await manager.cancel(pause.run_id, "cancel")
+        with self.assertRaises(SecretNotFoundError):
+            await store.consume(reference)  # type: ignore[arg-type]
+
+    async def test_constructor_and_invalid_secret_result(self) -> None:
+        with self.assertRaises(TypeError):
+            RunManager(FakeFactory([]))  # type: ignore[call-arg]
+        with self.assertRaises(RunConstructionError):
+            RunManager(FakeFactory([]), secret_store=object())  # type: ignore[arg-type]
+        invalid = result(
+            AgentRunStatus.AWAITING_USER,
+            question="Q",
+            pause_kind=AgentPauseKind.SECRET,
+            secret_fields=(SecretField.USERNAME, SecretField.PASSWORD),
+        )
+        with self.assertRaises(ValueError):
+            RunManager._translate(invalid)
+
+    async def test_strict_value_validation_and_defensive_copy(self) -> None:
+        manager, store, _, pause = await self.secret_paused()
+        invalid = (
+            None,
+            {},
+            {"password": "value"},
+            {SecretField.PASSWORD: None},
+            {SecretField.PASSWORD: True},
+            {SecretField.PASSWORD: "   "},
+        )
+        for values in invalid:
+            with self.subTest(kind=type(values).__name__):
+                with self.assertRaises(RunManagerError):
+                    await manager.submit_secret(
+                        pause.run_id, pause.interaction_id, "invalid", values  # type: ignore[arg-type]
+                    )
+        values = {
+            SecretField.PASSWORD: "synthetic-pass",
+            SecretField.USERNAME: "synthetic-user",
+        }
+        await manager.submit_secret(
+            pause.run_id, pause.interaction_id, "copy", values
+        )
+        reference = manager._runs[pause.run_id].secret_reference
+        values[SecretField.PASSWORD] = "mutated"
+        stored = await store.consume(reference)  # type: ignore[arg-type]
+        self.assertEqual(stored[SecretField.PASSWORD], "synthetic-pass")
+
+    async def test_request_id_conflicts_across_operations(self) -> None:
+        operations = ("respond", "confirm", "cancel")
+        for operation in operations:
+            manager, _, _, pause = await self.secret_paused()
+            await manager.submit_secret(
+                pause.run_id,
+                pause.interaction_id,
+                "shared",
+                {
+                    SecretField.PASSWORD: "synthetic-pass",
+                    SecretField.USERNAME: "synthetic-user",
+                },
+            )
+            with self.assertRaises(RunIdempotencyConflictError):
+                if operation == "respond":
+                    await manager.respond(
+                        pause.run_id, pause.interaction_id, "shared", "answer"
+                    )
+                elif operation == "confirm":
+                    await manager.confirm(
+                        pause.run_id, pause.interaction_id, "shared", True
+                    )
+                else:
+                    await manager.cancel(pause.run_id, "shared")
+
+    async def test_fingerprint_and_manager_repr_do_not_expose_key_or_digest(self) -> None:
+        manager, _, _, pause = await self.secret_paused()
+        first = manager._secret_fingerprint(
+            pause.interaction_id, {SecretField.OTP: "café"}
+        )
+        second = manager._secret_fingerprint(
+            pause.interaction_id, {SecretField.OTP: "cafe"}
+        )
+        self.assertNotEqual(first, second)
+        fingerprint = manager._runs[pause.run_id].requests
+        rendered = repr((manager, fingerprint))
+        self.assertNotIn(first.hex(), rendered)
+        self.assertNotIn(bytes(manager._hmac_key).hex(), rendered)
+
+    async def test_concurrent_submissions_have_one_transition(self) -> None:
+        manager, _, _, pause = await self.secret_paused()
+        values = {
+            SecretField.PASSWORD: "synthetic-pass",
+            SecretField.USERNAME: "synthetic-user",
+        }
+        identical = await asyncio.gather(
+            manager.submit_secret(pause.run_id, pause.interaction_id, "same", values),
+            manager.submit_secret(pause.run_id, pause.interaction_id, "same", dict(values)),
+        )
+        self.assertEqual(identical[0], identical[1])
+        self.assertEqual(identical[0].status, RunStatus.AWAITING_SECRET_APPLICATION)
+
+    async def test_secret_store_failures_are_fixed_and_unchained(self) -> None:
+        session = FakeSession([result(
+            AgentRunStatus.AWAITING_USER,
+            question="Question",
+            pause_kind=AgentPauseKind.SECRET,
+            secret_fields=(SecretField.OTP,),
+        )])
+        store = TrackingSecretStore()
+        manager = RunManager(FakeFactory([FakeHandle(session)]), secret_store=store)
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        pause = await manager.get_run(created.run_id)
+        store.fail_put = True
+        with self.assertRaisesRegex(RunManagerError, "^secret storage failed safely$") as raised:
+            await manager.submit_secret(
+                pause.run_id, pause.interaction_id, "request", {SecretField.OTP: "synthetic-otp"}
+            )
+        self.assertIsNone(raised.exception.__cause__)
+        self.assertIsNone(raised.exception.__context__)
+        self.assertNotIn("SYNTHETIC", str(raised.exception))
+        await manager.close()
+
+    async def test_cancelled_secret_put_preserves_pause_without_request_state(self) -> None:
+        session = FakeSession([result(
+            AgentRunStatus.AWAITING_USER,
+            question="Question",
+            pause_kind=AgentPauseKind.SECRET,
+            secret_fields=(SecretField.OTP,),
+        )])
+        store = ControlledSecretStore()
+        store.put_error = asyncio.CancelledError()
+        manager = RunManager(FakeFactory([FakeHandle(session)]), secret_store=store)
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        pause = await manager.get_run(created.run_id)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await manager.submit_secret(
+                pause.run_id,
+                pause.interaction_id,
+                "cancelled-request",
+                {SecretField.OTP: "synthetic-otp"},
+            )
+
+        unchanged = await manager.get_run(created.run_id)
+        record = manager._runs[created.run_id]
+        self.assertEqual(unchanged.status, RunStatus.AWAITING_SECRET)
+        self.assertEqual(unchanged.interaction_id, pause.interaction_id)
+        self.assertEqual(unchanged.question, pause.question)
+        self.assertIsNone(record.secret_reference)
+        self.assertNotIn("cancelled-request", record.requests)
+        store.put_error = None
+        accepted = await manager.submit_secret(
+            pause.run_id,
+            pause.interaction_id,
+            "usable-request",
+            {SecretField.OTP: "synthetic-otp"},
+        )
+        self.assertEqual(accepted.status, RunStatus.AWAITING_SECRET_APPLICATION)
+        await manager.close()
+
+    async def test_cancelled_discard_run_propagates_unchanged(self) -> None:
+        store = ControlledSecretStore()
+        store.discard_run_error = asyncio.CancelledError()
+        manager = RunManager(FakeFactory([]), secret_store=store)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await manager._run_secret_cleanup("synthetic-run")
+
+        store.discard_run_error = None
+        await manager.close()
+
+    def test_run_manager_has_no_silent_base_exception_handler(self) -> None:
+        source_path = Path(__file__).resolve().parents[1] / "browser_agent/run_manager.py"
+        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        silent_handlers = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ExceptHandler)
+            and isinstance(node.type, ast.Name)
+            and node.type.id == "BaseException"
+            and any(isinstance(statement, ast.Pass) for statement in node.body)
+        ]
+        self.assertEqual(silent_handlers, [])
+
+    async def test_cancelled_close_waiter_does_not_cancel_shared_worker(self) -> None:
+        store = ControlledSecretStore()
+        first_session = FakeSession([result(
+            AgentRunStatus.AWAITING_USER,
+            question="Q1",
+            pause_kind=AgentPauseKind.USER_INPUT,
+        )])
+        second_session = FakeSession([result(
+            AgentRunStatus.AWAITING_USER,
+            question="Q2",
+            pause_kind=AgentPauseKind.USER_INPUT,
+        )])
+        first_handle = BlockingHandle(first_session)
+        second_handle = FakeHandle(second_session)
+        manager = RunManager(
+            FakeFactory([first_handle, second_handle]), secret_store=store
+        )
+        created = [
+            await manager.create_run("url", "first"),
+            await manager.create_run("url", "second"),
+        ]
+        for item in created:
+            await self.settle(manager, item.run_id)
+
+        first_waiter = asyncio.create_task(manager.close())
+        await first_handle.close_started.wait()
+        close_worker = manager._close_task
+        self.assertIsNotNone(close_worker)
+        first_waiter.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first_waiter
+        self.assertFalse(close_worker.cancelled())
+        self.assertFalse(close_worker.done())
+        self.assertEqual(second_handle.close_calls, 0)
+        self.assertEqual(store.close_calls, 0)
+
+        later_waiter = asyncio.create_task(manager.close())
+        first_handle.close_release.set()
+        await later_waiter
+        self.assertEqual(first_handle.close_calls, 1)
+        self.assertEqual(second_handle.close_calls, 1)
+        self.assertEqual(store.close_calls, 1)
+        self.assertEqual(bytes(manager._hmac_key), b"\x00" * 32)
+
+    async def test_run_cleanup_failure_is_exhaustive_sticky_and_unchained(self) -> None:
+        store = ControlledSecretStore()
+        failed_handle = FakeHandle(
+            FakeSession([result(
+                AgentRunStatus.AWAITING_USER,
+                question="Q1",
+                pause_kind=AgentPauseKind.USER_INPUT,
+            )]),
+            RuntimeError("SYNTHETIC-RUN-CLEANUP-DETAIL"),
+        )
+        succeeding_handle = FakeHandle(FakeSession([result(
+            AgentRunStatus.AWAITING_USER,
+            question="Q2",
+            pause_kind=AgentPauseKind.USER_INPUT,
+        )]))
+        manager = RunManager(
+            FakeFactory([failed_handle, succeeding_handle]), secret_store=store
+        )
+        created = [
+            await manager.create_run("url", "first"),
+            await manager.create_run("url", "second"),
+        ]
+        for item in created:
+            await self.settle(manager, item.run_id)
+
+        for _ in range(2):
+            with self.assertRaisesRegex(
+                RunManagerError, "^run manager close failed safely$"
+            ) as raised:
+                await manager.close()
+            self.assertIsNone(raised.exception.__cause__)
+            self.assertIsNone(raised.exception.__context__)
+        self.assertEqual(failed_handle.close_calls, 1)
+        self.assertEqual(succeeding_handle.close_calls, 1)
+        self.assertEqual(store.close_calls, 1)
+        self.assertEqual(bytes(manager._hmac_key), b"\x00" * 32)
+
+    async def test_close_is_exhaustive_sticky_and_zeroizes_key(self) -> None:
+        store = TrackingSecretStore()
+        store.fail_discard_run = True
+        store.fail_close = True
+        sessions = [FakeSession([result(AgentRunStatus.AWAITING_USER, question="Q", pause_kind=AgentPauseKind.USER_INPUT)]) for _ in range(2)]
+        manager = RunManager(
+            FakeFactory([FakeHandle(item) for item in sessions]), secret_store=store
+        )
+        created = [await manager.create_run("url", f"task-{index}") for index in range(2)]
+        for item in created:
+            await self.settle(manager, item.run_id)
+        outcomes = await asyncio.gather(manager.close(), manager.close(), return_exceptions=True)
+        self.assertTrue(all(type(item) is RunManagerError for item in outcomes))
+        self.assertTrue(all(str(item) == "run manager close failed safely" for item in outcomes))
+        self.assertTrue(all(item.__cause__ is None and item.__context__ is None for item in outcomes))
+        self.assertEqual(set(store.discard_run_calls), {item.run_id for item in created})
+        self.assertEqual(store.close_calls, 1)
+        self.assertEqual(bytes(manager._hmac_key), b"\x00" * 32)
+        with self.assertRaisesRegex(RunManagerError, "^run manager close failed safely$"):
+            await manager.close()
+        self.assertEqual(store.close_calls, 1)
 
 
 if __name__ == "__main__":

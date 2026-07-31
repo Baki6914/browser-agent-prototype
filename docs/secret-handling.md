@@ -1,11 +1,30 @@
 # Milestone 9A: Transient Secret Handling
 
+## Milestone 9B integration
+
+The 9A store is now owned by `RunManager`. Raw values briefly enter the strict
+local HTTP model, then one defensive copy feeds exact HMAC fingerprinting and
+`TransientSecretStore.put`. Only its private repr-hidden `SecretReference`
+remains on the record; public state carries categories only. Keyed HMAC avoids
+an offline-testable unkeyed digest for low-entropy passwords and OTPs.
+
+Accepted submissions stop at `AWAITING_SECRET_APPLICATION`. Terminal,
+failure, cancellation, and shutdown discard run-owned store records; shutdown
+attempts every run cleanup and store closure even after failures, reports a
+sticky fixed safe result, and zeroizes the mutable key. Arbitrary store
+exceptions are not exposed or chained. Python immutable strings and
+temporary UTF-8 copies cannot be reliably zeroized, and no such claim is made.
+
+Milestone 9C is still required for browser filling, consumption, and resume.
+There is no persistence, authentication, OTP detection, NVIDIA, MCP,
+Playwright, or browser use, and Milestone 9 is not complete.
+
 Milestone 9A provides a dependency-free, process-local `TransientSecretStore`
 foundation for future secure-login work. It is strictly isolated from HTTP
 models, `RunManager`, run snapshots and history, the agent loop, model context,
 providers, MCP, Playwright, browsers, logs, reports, persistence, and
-checkpoints. It does not submit secrets, fill login forms, or detect OTP
-prompts. M9B and M9C remain future work.
+checkpoints. It does not fill login forms or detect OTP prompts. M9C remains
+future work for consumption, browser application, and session resume.
 
 `SecretField` permits exactly username, password, and OTP fields.
 `SecretReference` is immutable metadata: an opaque cryptographically strong

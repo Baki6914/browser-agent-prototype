@@ -18,6 +18,7 @@ from .agent_controls import (
 )
 from .mcp_gateway import McpGatewayError, ToolDefinition, ToolObservation
 from .tool_policy import ToolConfirmationRequiredError, ToolPolicyError
+from .secret_store import SecretField
 
 
 class AgentToolSource(str, Enum):
@@ -32,6 +33,7 @@ class AgentStepStatus(str, Enum):
     REJECTED = "rejected"
     FINISHED = "finished"
     AWAITING_USER = "awaiting_user"
+    AWAITING_SECRET = "awaiting_secret"
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,7 @@ class AgentStepObservation:
     error: str | None
     confirmation_required: bool = False
     confirmation_for_step: int | None = None
+    secret_fields: tuple[SecretField, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,7 @@ class AgentStepRecord:
 class AgentPauseKind(str, Enum):
     USER_INPUT = "user_input"
     CONFIRMATION = "confirmation"
+    SECRET = "secret"
 
 
 class AgentSessionError(Exception):
@@ -209,9 +213,13 @@ class AgentUserInput:
                 raise AgentUserResponseError(
                     "normal user response must be a non-empty string"
                 )
-        elif type(self.response) is not bool:
+        elif self.kind is AgentPauseKind.CONFIRMATION and type(self.response) is not bool:
             raise AgentUserResponseError(
                 "confirmation response must be a bool"
+            )
+        elif self.kind is AgentPauseKind.SECRET:
+            raise AgentUserResponseError(
+                "secret pauses do not accept AgentUserInput"
             )
 
 
@@ -298,6 +306,7 @@ class AgentRunResult:
     pause_kind: AgentPauseKind | None = None
     pending_confirmation: PendingConfirmation | None = None
     user_interactions: tuple[AgentUserInput, ...] = ()
+    secret_fields: tuple[SecretField, ...] | None = None
 
 
 class AgentDecisionSourceProtocol(Protocol):
@@ -423,11 +432,11 @@ class AgentToolRouter:
                 result = self._agent_controls.execute(
                     decision.tool_name, decision.arguments
                 )
-                status = (
-                    AgentStepStatus.FINISHED
-                    if result.status is AgentControlStatus.FINISHED
-                    else AgentStepStatus.AWAITING_USER
-                )
+                status = {
+                    AgentControlStatus.FINISHED: AgentStepStatus.FINISHED,
+                    AgentControlStatus.AWAITING_USER: AgentStepStatus.AWAITING_USER,
+                    AgentControlStatus.AWAITING_SECRET: AgentStepStatus.AWAITING_SECRET,
+                }[result.status]
                 return AgentStepObservation(
                     tool_name=decision.tool_name,
                     source=AgentToolSource.AGENT_CONTROL,
@@ -435,6 +444,7 @@ class AgentToolRouter:
                     text=result.text,
                     error=None,
                     confirmation_for_step=result.confirmation_for_step,
+                    secret_fields=result.secret_fields,
                 )
 
             if decision.tool_name in self._mcp_names:
@@ -524,6 +534,7 @@ class ResumableAgentSession:
         self._pending_confirmation: PendingConfirmation | None = None
         self._pause_kind: AgentPauseKind | None = None
         self._question: str | None = None
+        self._secret_fields: tuple[SecretField, ...] | None = None
         self._terminal_result: AgentRunResult | None = None
         self._started = False
         self._failed = False
@@ -635,6 +646,7 @@ class ResumableAgentSession:
     def _clear_pause(self) -> None:
         self._pause_kind = None
         self._question = None
+        self._secret_fields = None
 
     def _result(
         self,
@@ -649,6 +661,7 @@ class ResumableAgentSession:
             self._pause_kind,
             self._pending_confirmation,
             tuple(self._user_interactions),
+            self._secret_fields,
         )
 
     def _terminate(
@@ -712,5 +725,30 @@ class ResumableAgentSession:
                     self._pause_kind = AgentPauseKind.USER_INPUT
                 self._candidate = None
                 self._question = observation.text
+                return self._result(AgentRunStatus.AWAITING_USER)
+            if observation.status is AgentStepStatus.AWAITING_SECRET:
+                fields = observation.secret_fields
+                if (
+                    type(observation.text) is not str
+                    or not observation.text.strip()
+                    or type(fields) is not tuple
+                    or not fields
+                    or any(type(item) is not SecretField for item in fields)
+                    or fields
+                    != tuple(sorted(fields, key=lambda item: item.value))
+                    or len(set(fields)) != len(fields)
+                    or observation.confirmation_required is not False
+                    or observation.confirmation_for_step is not None
+                    or self._pending_confirmation is not None
+                ):
+                    self._failed = True
+                    raise AgentSessionStateError(
+                        "secret control returned invalid field metadata"
+                    )
+                self._candidate = None
+                self._pending_confirmation = None
+                self._pause_kind = AgentPauseKind.SECRET
+                self._question = observation.text
+                self._secret_fields = fields
                 return self._result(AgentRunStatus.AWAITING_USER)
         return self._terminate(AgentRunStatus.STEP_LIMIT_REACHED)

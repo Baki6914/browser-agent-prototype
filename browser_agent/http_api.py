@@ -9,7 +9,7 @@ from typing import Annotated, Literal, TypeAlias
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, StrictStr, field_validator
 
 from .run_manager import (
     RunConflictError,
@@ -22,6 +22,7 @@ from .run_manager import (
     RunSnapshot,
     RunStatus,
 )
+from .secret_store import SecretField
 
 _ERROR_MESSAGE_LIMIT = 500
 
@@ -53,6 +54,7 @@ class CancelRunRequest(_StrictHttpModel):
 class RunInteractionType(str, Enum):
     USER_INPUT = "user_input"
     CONFIRMATION = "confirmation"
+    SECRET = "secret"
 
 
 class _InteractionRequest(_StrictHttpModel):
@@ -77,8 +79,26 @@ class ConfirmationRunResponseRequest(_InteractionRequest):
     approved: StrictBool
 
 
+class SecretRunResponseRequest(_InteractionRequest):
+    type: Literal[RunInteractionType.SECRET]
+    values: dict[StrictStr, SecretStr]
+
+    @field_validator("values")
+    @classmethod
+    def _validate_values(
+        cls, values: dict[str, SecretStr]
+    ) -> dict[str, SecretStr]:
+        if not values:
+            raise ValueError("values must be non-empty")
+        if any(key not in {field.value for field in SecretField} for key in values):
+            raise ValueError("secret field key is invalid")
+        if any(not value.get_secret_value().strip() for value in values.values()):
+            raise ValueError("secret values must be non-empty strings")
+        return values
+
+
 RunResponseRequest: TypeAlias = Annotated[
-    UserInputRunResponseRequest | ConfirmationRunResponseRequest,
+    UserInputRunResponseRequest | ConfirmationRunResponseRequest | SecretRunResponseRequest,
     Field(discriminator="type"),
 ]
 
@@ -99,6 +119,7 @@ class RunHttpResponse(_StrictHttpModel):
     interaction_id: str | None
     final_result: str | None
     error: RunHttpSnapshotError | None
+    secret_fields: tuple[SecretField, ...] | None
 
 
 class HttpErrorBody(_StrictHttpModel):
@@ -133,6 +154,7 @@ def snapshot_to_http_response(snapshot: RunSnapshot) -> RunHttpResponse:
         interaction_id=snapshot.interaction_id,
         final_result=snapshot.final_result,
         error=error,
+        secret_fields=snapshot.secret_fields,
     )
 
 
@@ -148,7 +170,9 @@ def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
 
 def create_http_app(run_manager: RunManager) -> FastAPI:
     """Create an HTTP application around one externally owned RunManager."""
-    required_methods = ("create_run", "get_run", "respond", "confirm", "cancel", "close")
+    required_methods = (
+        "create_run", "get_run", "respond", "confirm", "submit_secret", "cancel", "close"
+    )
     if run_manager is None or any(
         not callable(getattr(run_manager, method, None))
         for method in required_methods
@@ -254,12 +278,23 @@ def create_http_app(run_manager: RunManager) -> FastAPI:
                 request.request_id,
                 request.text,
             )
-        else:
+        elif isinstance(request, ConfirmationRunResponseRequest):
             snapshot = await app.state.run_manager.confirm(
                 run_id,
                 request.interaction_id,
                 request.request_id,
                 request.approved,
+            )
+        else:
+            values = {
+                SecretField(field): value.get_secret_value()
+                for field, value in request.values.items()
+            }
+            snapshot = await app.state.run_manager.submit_secret(
+                run_id,
+                request.interaction_id,
+                request.request_id,
+                values,
             )
         return snapshot_to_http_response(snapshot)
 
@@ -277,4 +312,3 @@ def create_http_app(run_manager: RunManager) -> FastAPI:
         return snapshot_to_http_response(snapshot)
 
     return app
-

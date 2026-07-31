@@ -1,5 +1,27 @@
 # In-memory RunManager
 
+## Milestone 9B secret ownership
+
+`RunManager` requires and owns one keyword-only `TransientSecretStore`. A
+secret pause becomes `AWAITING_SECRET`; successful `submit_secret()` stores the
+defensive value copy, retains only a private repr-hidden `SecretReference`,
+clears question and interaction, and increments once into
+`AWAITING_SECRET_APPLICATION`. Snapshots expose only sorted `secret_fields`.
+The session stays paused and the secret is neither consumed nor applied.
+
+Secret idempotency uses a private process-local 32-byte HMAC-SHA256 key and
+length-prefixed operation, interaction, sorted field names, and exact UTF-8
+values. Raw values, an unkeyed hash, digest, and key are absent from public
+state and repr. Final close zeroizes the mutable key.
+
+Lock ordering is manager lock, then per-run lock, then the dependency-free
+store operation. Shared shielded cleanup runs outside the record lock.
+Cancellation, failure, terminal completion, and shutdown call idempotent
+`discard_run`; shutdown attempts cleanup for every run even after a failure,
+then always attempts store closure and zeroizes the HMAC key. The first fixed
+safe close failure is sticky for concurrent and later callers. Arbitrary
+secret-store exceptions are neither retained nor exception-chained.
+
 ## Purpose and boundary
 
 `RunManager` is the application-level owner of multiple resumable agent
@@ -81,7 +103,8 @@ records for inspection. For an already-terminal run, shutdown does not cancel
 an active task that is still finalizing result publication or cleanup; it
 awaits that finalization and the shared cleanup task. The manager therefore
 does not return while cleanup it knows about is still running. Cleanup
-continues when one handle fails.
+continues when one handle or secret cleanup fails. Store closure is still
+attempted, and close succeeds only if every required cleanup succeeds.
 
 Factory, invalid-handle, start, resume, result-consistency, and cleanup errors
 become failed snapshots. Cleanup failure preserves an already-cancelled

@@ -1,5 +1,17 @@
 # Resumable MCP-backed agent loop
 
+## Milestone 9B secret pause
+
+`AgentPauseKind.SECRET` uses generic `AgentRunStatus.AWAITING_USER` plus a safe
+question and deterministic field metadata. It clears confirmation state, adds
+no `AgentUserInput`, creates no response slot, and does not continue the
+decision source. `respond()` and `confirm()` reject it. Submitted values and
+references never enter context, history, or provider/model input. The session
+remains paused after submission; Milestone 9C must apply secrets and resume it.
+Before publishing the pause, the session validates a non-empty question, an
+exact non-empty sorted duplicate-free tuple of exact `SecretField` members,
+and the complete absence of confirmation metadata or pending confirmation.
+
 Milestone 8A adds a dependency-free, in-memory `ResumableAgentSession`.
 `DeterministicAgentLoop.run(task)` remains the compatible one-shot API: it
 creates a fresh session, calls `start(task)`, and returns on the first terminal

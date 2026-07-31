@@ -8,12 +8,15 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
+from .secret_store import SecretField
+
 
 class AgentControlStatus(str, Enum):
     """Terminal orchestration states produced by agent-control tools."""
 
     FINISHED = "finished"
     AWAITING_USER = "awaiting_user"
+    AWAITING_SECRET = "awaiting_secret"
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,7 @@ class AgentControlResult:
     final_result: str | None
     question: str | None
     confirmation_for_step: int | None = None
+    secret_fields: tuple[SecretField, ...] | None = None
 
 
 class AgentControlError(Exception):
@@ -79,6 +83,12 @@ _CONTROL_SPECS: Mapping[str, _ControlSpec] = MappingProxyType(
     }
 )
 
+_REQUEST_SECRET_DESCRIPTION = (
+    "Request secret values through the application. Specify only the required "
+    "field categories; raw credentials or OTP values must never be included in "
+    "tool arguments. This control executes locally and never reaches MCP."
+)
+
 
 class AgentControlExecutor:
     """Validate and execute controls owned by the Python orchestrator."""
@@ -87,7 +97,36 @@ class AgentControlExecutor:
         """Return fresh control definitions in deterministic alphabetical order."""
 
         definitions = []
-        for name, spec in sorted(_CONTROL_SPECS.items()):
+        for name in sorted((*_CONTROL_SPECS, "request_secret")):
+            if name == "request_secret":
+                definitions.append(
+                    AgentControlDefinition(
+                        name=name,
+                        description=_REQUEST_SECRET_DESCRIPTION,
+                        input_schema={
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "description": "Safe question shown to the user.",
+                                },
+                                "fields": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "string",
+                                        "enum": ["username", "password", "otp"],
+                                    },
+                                    "minItems": 1,
+                                    "uniqueItems": True,
+                                },
+                            },
+                            "required": ["question", "fields"],
+                            "additionalProperties": False,
+                        },
+                    )
+                )
+                continue
+            spec = _CONTROL_SPECS[name]
             properties: dict[str, Any] = {
                 spec.field_name: {
                     "type": "string",
@@ -125,7 +164,7 @@ class AgentControlExecutor:
         """Strictly validate and execute one known application-owned control."""
 
         spec = _CONTROL_SPECS.get(tool_name)
-        if spec is None:
+        if spec is None and tool_name != "request_secret":
             raise UnknownAgentControlError(
                 f"Unknown agent control {tool_name!r}."
             )
@@ -134,6 +173,11 @@ class AgentControlExecutor:
             raise InvalidAgentControlArgumentsError(
                 f"Agent control {tool_name!r} arguments must be a mapping."
             )
+
+        if tool_name == "request_secret":
+            return self._execute_request_secret(arguments)
+
+        assert spec is not None
 
         expected_fields = {spec.field_name}
         if tool_name == "ask_user":
@@ -199,4 +243,55 @@ class AgentControlExecutor:
         raise AgentControlError(
             f"Agent control {tool_name!r} is registered but has no implemented "
             "execution branch; refusing to execute."
+        )
+
+    @staticmethod
+    def _execute_request_secret(
+        arguments: Mapping[str, Any],
+    ) -> AgentControlResult:
+        actual_fields = set(arguments)
+        if "question" not in actual_fields:
+            raise InvalidAgentControlArgumentsError(
+                "Agent control 'request_secret' is missing required field 'question'."
+            )
+        if "fields" not in actual_fields:
+            raise InvalidAgentControlArgumentsError(
+                "Agent control 'request_secret' is missing required field 'fields'."
+            )
+        if actual_fields != {"question", "fields"}:
+            raise InvalidAgentControlArgumentsError(
+                "Agent control 'request_secret' received unexpected fields."
+            )
+        question = arguments["question"]
+        if type(question) is not str or not question.strip():
+            raise InvalidAgentControlArgumentsError(
+                "Agent control 'request_secret' field 'question' must be a non-empty string."
+            )
+        fields = arguments["fields"]
+        if type(fields) is not list or not fields:
+            raise InvalidAgentControlArgumentsError(
+                "Agent control 'request_secret' field 'fields' must be a non-empty list."
+            )
+        if any(type(field) is not str for field in fields):
+            raise InvalidAgentControlArgumentsError(
+                "Agent control 'request_secret' field names must be strings."
+            )
+        if len(set(fields)) != len(fields):
+            raise InvalidAgentControlArgumentsError(
+                "Agent control 'request_secret' field names must be unique."
+            )
+        allowed = {field.value: field for field in SecretField}
+        if any(field not in allowed for field in fields):
+            raise InvalidAgentControlArgumentsError(
+                "Agent control 'request_secret' contains an unsupported field category."
+            )
+        secret_fields = tuple(sorted((allowed[field] for field in fields), key=lambda item: item.value))
+        return AgentControlResult(
+            tool_name="request_secret",
+            status=AgentControlStatus.AWAITING_SECRET,
+            text=question,
+            final_result=None,
+            question=question,
+            confirmation_for_step=None,
+            secret_fields=secret_fields,
         )

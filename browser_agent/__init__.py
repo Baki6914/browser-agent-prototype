@@ -104,6 +104,7 @@ from .http_api import (
     RunHttpSnapshotError,
     RunInteractionType,
     RunResponseRequest,
+    SecretRunResponseRequest,
     create_http_app,
 )
 from .secret_store import (
@@ -186,6 +187,7 @@ __all__ = [
     "RunHttpSnapshotError",
     "RunInteractionType",
     "RunResponseRequest",
+    "SecretRunResponseRequest",
     "RunSessionFactoryProtocol",
     "RunSessionHandleProtocol",
     "RunSessionProtocol",

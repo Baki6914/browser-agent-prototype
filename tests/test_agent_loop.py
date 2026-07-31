@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+import sys
 import unittest
 from collections.abc import Mapping
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from browser_agent.agent_controls import AgentControlExecutor
 from browser_agent.agent_loop import (
@@ -14,6 +18,7 @@ from browser_agent.agent_loop import (
     AgentRunStatus,
     AgentSessionConstructionError,
     AgentSessionStateError,
+    AgentStepObservation,
     AgentStepStatus,
     AgentToolCall,
     AgentToolCatalogError,
@@ -24,6 +29,7 @@ from browser_agent.agent_loop import (
     PendingConfirmation,
     ResumableAgentSession,
     ScriptedDecisionSource,
+    SecretField,
 )
 from browser_agent.mcp_gateway import (
     InvalidToolArgumentsError,
@@ -175,13 +181,14 @@ class AgentToolRouterTests(unittest.IsolatedAsyncioTestCase):
         definitions = self.router.definitions()
         self.assertEqual(
             [definition.name for definition in definitions],
-            ["ask_user", "browser_snapshot", "finish"],
+            ["ask_user", "browser_snapshot", "finish", "request_secret"],
         )
         self.assertEqual(
             [definition.source for definition in definitions],
             [
                 AgentToolSource.AGENT_CONTROL,
                 AgentToolSource.MCP,
+                AgentToolSource.AGENT_CONTROL,
                 AgentToolSource.AGENT_CONTROL,
             ],
         )
@@ -873,3 +880,93 @@ class AgentLoopSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("browser_snapshot", message)
         self.assertIn("transport_error", message)
         self.assertIn("connection closed", message)
+
+
+class SecretPauseTests(unittest.IsolatedAsyncioTestCase):
+    async def test_router_and_session_pause_with_metadata_only(self) -> None:
+        router = AgentToolRouter(FakePolicyExecutor(), (), AgentControlExecutor())
+        decision = AgentToolCall(
+            "request_secret",
+            {"question": "Enter credentials", "fields": ["username", "password"]},
+        )
+        observation = await router.route(decision)
+        self.assertEqual(observation.status, AgentStepStatus.AWAITING_SECRET)
+        self.assertEqual(observation.secret_fields, (SecretField.PASSWORD, SecretField.USERNAME))
+        session = ResumableAgentSession(ScriptedDecisionSource([decision]), router, 3)
+        paused = await session.start("task")
+        self.assertEqual(paused.status, AgentRunStatus.AWAITING_USER)
+        self.assertEqual(paused.pause_kind, AgentPauseKind.SECRET)
+        self.assertEqual(paused.secret_fields, (SecretField.PASSWORD, SecretField.USERNAME))
+        self.assertEqual(paused.user_interactions, ())
+        with self.assertRaises(AgentSessionStateError):
+            await session.respond("synthetic")
+        with self.assertRaises(AgentSessionStateError):
+            await session.confirm(True)
+
+    def test_agent_user_input_rejects_secret_kind(self) -> None:
+        from browser_agent import AgentUserInput
+        with self.assertRaises(AgentUserResponseError):
+            AgentUserInput(1, AgentPauseKind.SECRET, "Question", "synthetic")
+
+    def test_provider_definition_has_categories_only(self) -> None:
+        router = AgentToolRouter(FakePolicyExecutor(), (), AgentControlExecutor())
+        definition = next(item for item in router.definitions() if item.name == "request_secret")
+        rendered = str(definition.input_schema)
+        self.assertIn("username", rendered)
+        self.assertNotIn("otp_value", rendered)
+
+    async def test_invalid_secret_pause_metadata_fails_without_resume_state(self) -> None:
+        decision = AgentToolCall("request_secret", {})
+        cases = (
+            {"text": "Question", "secret_fields": ("password",)},
+            {"text": "Question", "secret_fields": (SecretField.USERNAME, SecretField.PASSWORD)},
+            {"text": "Question", "secret_fields": (SecretField.OTP, SecretField.OTP)},
+            {"text": "Question", "secret_fields": ()},
+            {"text": None, "secret_fields": (SecretField.OTP,)},
+            {"text": "   ", "secret_fields": (SecretField.OTP,)},
+            {
+                "text": "Question",
+                "secret_fields": (SecretField.OTP,),
+                "confirmation_required": True,
+            },
+            {
+                "text": "Question",
+                "secret_fields": (SecretField.OTP,),
+                "confirmation_for_step": 1,
+            },
+        )
+
+        class InvalidSecretRouter:
+            def __init__(self, fields: dict[str, object]) -> None:
+                self.fields = fields
+
+            def definitions(self):
+                return ()
+
+            async def route(self, _decision, *, confirmation_granted=False):
+                return AgentStepObservation(
+                    tool_name="request_secret",
+                    source=AgentToolSource.AGENT_CONTROL,
+                    status=AgentStepStatus.AWAITING_SECRET,
+                    error=None,
+                    **self.fields,
+                )
+
+        for metadata in cases:
+            with self.subTest(metadata=tuple(metadata)):
+                source = ScriptedDecisionSource([decision])
+                session = ResumableAgentSession(
+                    source, InvalidSecretRouter(metadata), 2  # type: ignore[arg-type]
+                )
+                with self.assertRaises(AgentSessionStateError):
+                    await session.start("task")
+                self.assertIsNone(session.pause_kind)
+                self.assertIsNone(session.pending_confirmation)
+                self.assertEqual(session.user_interactions, ())
+                self.assertEqual(source._index, 1)
+                with self.assertRaises(AgentSessionStateError):
+                    await session.respond("answer")
+
+
+if __name__ == "__main__":
+    unittest.main()
