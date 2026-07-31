@@ -106,6 +106,17 @@ from .http_api import (
     RunResponseRequest,
     create_http_app,
 )
+from .secret_store import (
+    SecretBindingError,
+    SecretExpiredError,
+    SecretField,
+    SecretNotFoundError,
+    SecretReference,
+    SecretStoreClosedError,
+    SecretStoreError,
+    SecretValidationError,
+    TransientSecretStore,
+)
 
 __all__ = [
     "AgentDecisionSourceProtocol",
@@ -181,6 +192,15 @@ __all__ = [
     "RunSnapshot",
     "RunStatus",
     "ScriptedDecisionSource",
+    "SecretBindingError",
+    "SecretExpiredError",
+    "SecretField",
+    "SecretNotFoundError",
+    "SecretReference",
+    "SecretStoreClosedError",
+    "SecretStoreError",
+    "SecretValidationError",
+    "TransientSecretStore",
     "ToolDefinition",
     "ToolCategory",
     "ToolConfirmationRequiredError",
