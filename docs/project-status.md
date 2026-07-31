@@ -4,7 +4,8 @@
 
 - **Active branch:** `mvp/playwright-mcp-agent`
 - **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current completed milestone:** Milestone 7, MVP Evaluation
+- **Current completed milestone:** Milestone 8, FastAPI HTTP Run Service and
+  Human-in-the-Loop Resume
   - This is the latest milestone whose implementation, review, tests, Learning
     Handoff, human commit, human push, and remote verification are complete.
 - **Latest completed documentation checkpoint:**
@@ -12,10 +13,16 @@
 - **Current implementation:** synchronous learning prototype, verified local
   Playwright MCP connectivity, dynamic MCP tool gateway, typed classification
   and policy enforcement, typed `finish` and `ask_user` controls,
-  `AgentToolRouter`, a deterministic observation-driven agent loop, and a
-  provider-neutral real decision source connected to that existing loop, plus
-  a provider-neutral MVP evaluation framework
-- **Current phase:** PLAN — Milestone 8
+  `AgentToolRouter`, a deterministic observation-driven agent loop, a
+  provider-neutral real decision source and MVP evaluation framework, a
+  resumable agent session with typed pause kind and trusted confirmation
+  replay, an in-memory `RunManager` with immutable `RunSnapshot`, typed run
+  states, `request_id` idempotency, single-use `interaction_id` validation,
+  per-run concurrency, cancellation, terminal and shutdown cleanup, and a
+  FastAPI HTTP boundary with strict request validation, a stable HTTP error
+  envelope, and four endpoints: `POST /runs`, `GET /runs/{run_id}`,
+  `POST /runs/{run_id}/responses`, and `POST /runs/{run_id}/cancel`
+- **Current phase:** PLAN — Milestone 9
 
 ## Completed
 
@@ -326,17 +333,38 @@ layer enforces authorization decisions. The agent-control layer remains local
 to the orchestrator, and the router joins that local path with the
 policy-enforced MCP path without collapsing their boundaries.
 
+## Milestone 8 completed
+
+Milestone 8, FastAPI HTTP Run Service and Human-in-the-Loop Resume, is
+completed through these verified feature checkpoints:
+
+- M8A: `c6fc1174788fbee1dcf7ecdb1450fbb902b6055e`
+- M8B: `27859c9778ebadf3fc96d76b2d6d8b2ceef22cf5`
+- M8C: `e42269d2b4b448131c7324b89108dcd18b0d4fa6`
+
+M8A's final full suite recorded 240 passed. M8B's final full suite recorded
+267 passed. M8C's focused HTTP suite recorded 26 passed, and its final full
+suite recorded 293 passed. `py_compile` and `git diff --check` passed. Each
+feature checkpoint was committed and pushed by the human; local and remote
+SHAs were verified equal, and the working tree was clean after each final
+push.
+
+The implemented boundary provides HTTP creation, inspection, response,
+confirmation, and cancellation; in-memory pause and resume while the process
+remains alive; and shutdown cleanup. The following remain not implemented: a
+concrete production composition root that creates the real NVIDIA, MCP,
+Playwright, browser, and session resources for HTTP runs; secure credential or
+OTP handling; downloads or file delivery; authentication or authorization;
+persistence or restart resume; and production deployment or multi-worker
+operation. A user therefore cannot currently submit an HTTP task and drive a
+real browser end to end.
+
 ## In progress
 
-- Planning and review of the Milestone 8 Implementation Brief.
-- Milestone 8 implementation has not started.
-- FastAPI and the in-memory `RunManager` have not been implemented.
+- Planning and review for Milestone 9, Secure Login and Secret Handling.
 
 ## Not started
 
-- The mandatory FastAPI HTTP service and in-memory `RunManager`.
-- HTTP question presentation, user-response waiting and resume, and trusted
-  approval-state management.
 - Secure login and temporary secret handling.
 - Controlled automatic file download; its Playwright MCP mechanism has not
   yet been proven.
@@ -372,13 +400,15 @@ policy-enforced MCP path without collapsing their boundaries.
   registry is tied to the current committed 24-tool inventory. Any newly
   discovered unregistered tool fails closed as `DENY` and requires human
   review.
-- `confirmation_granted` is only an enforcement input. No confirmation UI,
-  trusted approval source, identity, or persisted approval exists.
+- `confirmation_granted` is an enforcement input. Trusted confirmation replay
+  now exists in the in-memory resumable session, but identity and persisted
+  approval do not.
 - `AgentControlExecutor` performs only local Python validation and result
   construction. `finish` and `ask_user` never invoke MCP or browser tools.
 - `finish` does not verify factual task completion.
-- `ask_user` produces `AWAITING_USER` only; it does not display a UI, wait for
-  an answer, persist it, or resume execution automatically.
+- `ask_user` produces `AWAITING_USER`; the HTTP run service can accept a
+  response and resume the in-memory session, but it does not provide a user
+  interface or persistence.
 - `ScriptedDecisionSource` is finite, deterministic, and memory-only. It tests
   only the loop execution contract; it is not a real LLM, a provider
   simulation, or a model of provider request and response internals.
@@ -389,11 +419,8 @@ policy-enforced MCP path without collapsing their boundaries.
 - `AgentToolRouter` joins the local control path and the policy-enforced MCP
   path. Agent controls never reach MCP, and browser tools never bypass policy
   enforcement.
-- `confirmation_granted` remains false in the loop. No trusted confirmation
-  workflow exists, so model-selected confirmation-required tools are rejected
-  and are not automatically retried.
-- `ask_user` does not display a UI, wait for an answer, persist state, or
-  resume execution.
+- Confirmation remains trusted application state rather than model authority.
+  Approved confirmation replay is single-use and in memory only.
 - Provider configuration includes an HTTP timeout, and provider failures
   propagate as typed provider exceptions from the decision source. No retries
   or streaming are implemented.
@@ -411,9 +438,10 @@ policy-enforced MCP path without collapsing their boundaries.
   handling, and cleanup have not yet been proven. Milestone 10 begins with a
   Playwright MCP download-capability spike.
 - File upload remains optional future work, disabled and denied by default.
-- FastAPI is the mandatory planned product interface, but it has not been
-  added yet.
-- Planned run state is in memory only. Persistent sessions, database-backed
+- FastAPI is the implemented HTTP boundary, but the concrete production
+  composition that wires real NVIDIA, MCP, Playwright, browser, and session
+  resources into HTTP runs is not implemented.
+- Run state is in memory only. Persistent sessions, database-backed
   sessions, and service-restart resume are out of scope for the MVP.
 - Docker, Docker Compose, PostgreSQL, SQLAlchemy, Alembic, local vLLM,
   GPU/VRAM planning, and offline model hosting are out of scope.
@@ -428,12 +456,9 @@ policy-enforced MCP path without collapsing their boundaries.
 
 ## Immediate next step
 
-Prepare and review the Milestone 8 Implementation Brief. Milestone 8
-implementation has not started. Its approved direction remains a mandatory
-FastAPI HTTP service backed by an in-memory `RunManager`, with a resumable
-custom agent loop for human responses and trusted confirmation. No
-database-backed or persistent session and no service-restart resume are
-planned for the MVP.
+Plan Milestone 9, Secure Login and Secret Handling. Raw credentials and
+one-time passwords must remain outside model-visible context, logs, reports,
+and serializable run history.
 
 ## Last verified checkpoint
 
@@ -661,15 +686,15 @@ commit and behind by 0 commits. The working tree was clean after the push.
 Milestone 7, MVP Evaluation, is completed.
 
 The documentation-only roadmap correction checkpoint is complete and remotely
-verified. The repository is now planning Milestone 8, the FastAPI HTTP Run
-Service and Human-in-the-Loop Resume milestone; its implementation has not
-started. FastAPI and the in-memory `RunManager` have not been implemented. The
-authoritative Milestones 8–12 sequence is in
+verified. After that checkpoint, Milestone 8 was implemented and completed.
+The repository is now planning Milestone 9, Secure Login and Secret Handling.
+The authoritative Milestones 8–12 sequence is in
 [`ROADMAP.md`](../ROADMAP.md):
 
-- Milestone 8: mandatory FastAPI HTTP service, in-memory `RunManager`, and
-  resumable custom agent-loop human interaction and trusted confirmation
-  without persistent sessions, a database, or service-restart resume.
+- Milestone 8: completed mandatory FastAPI HTTP boundary, in-memory
+  `RunManager`, and resumable custom agent-loop human interaction and trusted
+  confirmation without persistent sessions, a database, or service-restart
+  resume.
 - Milestone 9: secure login and secret handling without exposing raw secrets
   to NVIDIA or serializable run history.
 - Milestone 10: controlled automatic file download, beginning with a

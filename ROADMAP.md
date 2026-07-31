@@ -35,13 +35,18 @@ The implemented learning prototype:
 - runs a deterministic tool-call and observation loop;
 - supports an OpenAI-compatible LLM provider behind a replaceable interface;
 - evaluates representative tasks from all three MVP task families; and
+- supports resumable agent sessions and trusted confirmation replay;
+- provides an in-memory `RunManager` with per-run concurrency protection,
+  request and interaction idempotency, cancellation, and terminal cleanup;
+- exposes FastAPI HTTP start, inspect, respond, and cancel endpoints; and
+- performs lifespan shutdown through `RunManager.close()`;
 - does not expose arbitrary server-side code execution to the LLM.
 
-The product MVP additionally requires the planned FastAPI HTTP service,
-in-memory run management and resume while the service remains running, secure
-login, and controlled automatic downloads. Persistent sessions, database
-persistence, service-restart resume, Docker, local vLLM, and offline hosting
-are not required and are out of scope.
+The complete product MVP is not finished. Secure login and secret handling,
+controlled downloads, and a real HTTP composition root that constructs and
+wires NVIDIA, MCP, Playwright, browser, and session resources are not
+implemented. Persistence, service-restart resume, authentication, production
+deployment, and multi-worker coordination are also not implemented.
 
 ## Milestones
 
@@ -188,6 +193,20 @@ service remains running.
 - Browser and MCP resources are cleaned up on completion, cancellation, and
   failure.
 - No persistent session, database, or service-restart resume is added.
+
+**Completion note:** Milestone 8 is completed through three verified
+implementation checkpoints:
+
+- M8A: `c6fc1174788fbee1dcf7ecdb1450fbb902b6055e` (`feat: add secure
+  resumable agent sessions`)
+- M8B: `27859c9778ebadf3fc96d76b2d6d8b2ceef22cf5` (`feat: add in-memory run
+  manager`)
+- M8C: `e42269d2b4b448131c7324b89108dcd18b0d4fa6` (`feat: add FastAPI run
+  service`)
+
+Final M8C validation recorded 26 focused HTTP tests passed, 293 total tests
+passed, `py_compile` passed, and `git diff --check` passed. Human commit, push,
+and remote verification were completed.
 
 ### 9. Secure Login and Secret Handling
 
