@@ -4,8 +4,8 @@
 
 - **Active branch:** `mvp/playwright-mcp-agent`
 - **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current completed milestone:** Milestone 8, FastAPI HTTP Run Service and
-  Human-in-the-Loop Resume
+- **Current completed milestone:** Milestone 9, Secure Login and Secret
+  Handling
   - This is the latest milestone whose implementation, review, tests, Learning
     Handoff, human commit, human push, and remote verification are complete.
 - **Latest completed documentation checkpoint:**
@@ -21,8 +21,11 @@
   per-run concurrency, cancellation, terminal and shutdown cleanup, and a
   FastAPI HTTP boundary with strict request validation, a stable HTTP error
   envelope, and four endpoints: `POST /runs`, `GET /runs/{run_id}`,
-  `POST /runs/{run_id}/responses`, and `POST /runs/{run_id}/cancel`
-- **Current phase:** PLAN — Milestone 9
+  `POST /runs/{run_id}/responses`, and `POST /runs/{run_id}/cancel`; plus
+  app-owned secure secret requests, transient one-time secret storage, and
+  handle-bound secret form application outside model-visible and serializable
+  state
+- **Current phase:** PLAN — Milestone 10, Minimal Controlled Downloads
 
 ## Completed
 
@@ -353,19 +356,64 @@ The implemented boundary provides HTTP creation, inspection, response,
 confirmation, and cancellation; in-memory pause and resume while the process
 remains alive; and shutdown cleanup. The following remain not implemented: a
 concrete production composition root that creates the real NVIDIA, MCP,
-Playwright, browser, and session resources for HTTP runs; secure credential or
-OTP handling; downloads or file delivery; authentication or authorization;
-persistence or restart resume; and production deployment or multi-worker
-operation. A user therefore cannot currently submit an HTTP task and drive a
-real browser end to end.
+Playwright, browser, and session resources for HTTP runs; downloads or file
+delivery; authentication or authorization; persistence or restart resume; and
+production deployment or multi-worker operation. A user therefore cannot
+currently submit an HTTP task and drive a real browser end to end.
+
+## Milestone 9 completed
+
+Milestone 9, Secure Login and Secret Handling, is technically complete through
+these three feature checkpoints:
+
+- M9A: `14ffed5b6ec62d3379c2c5e6f923a93bb18fe14e` (`feat: add transient
+  secret store`)
+- M9B: `5020347ac382f326190fcf8283cf1c95987ddc97` (`feat: add secure secret
+  interaction flow`)
+- M9C: `b727e79c648b76750661ce24c69896f45e7ef820` (`feat: add secure secret
+  form application`)
+
+The implemented flow provides the app-owned `request_secret` control for
+username, password, and OTP categories. Requests are bound to the current-page
+field name and element ref. The existing HTTP response endpoint accepts the
+secret into transient process-local storage, where it is consumed once. A
+handle-bound `SecretFormApplier` targets the correct run/browser session and
+makes one policy-enforced `browser_fill_form` invocation. Only a sanitized
+secret-applied event is recorded before the agent session safely resumes. One
+run can later pause independently for a second OTP secret.
+
+Raw secret values are intentionally kept out of provider/model context,
+`AgentUserInput`, serializable run history, `RunSnapshot`, HTTP responses, and
+normal logs and reports. Complete memory zeroization is not claimed.
+
+Final automated validation recorded 371 tests passed, `py_compile` passed,
+and `git diff --check` passed.
+
+The live Playwright MCP smoke passed local stdio MCP startup, dynamic tool
+discovery, and `browser_fill_form` discovery before browser launch. It was
+**BLOCKED** at Chromium launch during `browser_navigate` by the
+Colab/container environment error
+`sandbox_host_linux.cc:41 shutdown: Operation not permitted (1)`. This is not
+an implementation failure and does not prove that live browser form filling
+succeeded. Element refs were not obtained, live `SecretFormApplier` invocation
+was not reached, and visible post-fill verification was not reached. The
+temporary smoke script was removed, and repository scope remained unchanged.
+
+Explicit limitations are automatic login-form submission, login-success
+detection, captcha handling, SSO or OAuth orchestration, authentication or
+authorization for the HTTP service, persistence or restart resume,
+browser-side rollback after partial filling, guaranteed erasure of immutable
+Python string copies, production composition, and live Playwright form-fill
+compatibility in the current Colab environment. These are not blockers for the
+current MVP checkpoint.
 
 ## In progress
 
-- Planning and review for Milestone 9, Secure Login and Secret Handling.
+- Planning for Milestone 10, Minimal Controlled Downloads, beginning with a
+  narrow Playwright MCP download-capability spike before implementation.
 
 ## Not started
 
-- Secure login and temporary secret handling.
 - Controlled automatic file download; its Playwright MCP mechanism has not
   yet been proven.
 - A timeout system.
@@ -456,9 +504,15 @@ real browser end to end.
 
 ## Immediate next step
 
-Plan Milestone 9, Secure Login and Secret Handling. Raw credentials and
-one-time passwords must remain outside model-visible context, logs, reports,
-and serializable run history.
+Begin Milestone 10, Minimal Controlled Downloads, with a narrow Playwright MCP
+download-capability spike before implementation. The MVP scope is limited to
+an agent-triggered website download saved under one configured allowed base
+directory; metadata containing file ID, safe filename, and size; delivery
+through the existing HTTP API; cleanup of failed or partial downloads; and
+safe duplicate-filename handling. Upload, a database or persistent file
+catalog, an antivirus platform, distributed locking, and checksum
+infrastructure remain out of scope unless a checksum is technically required
+by the minimal spike.
 
 ## Last verified checkpoint
 
@@ -687,7 +741,8 @@ Milestone 7, MVP Evaluation, is completed.
 
 The documentation-only roadmap correction checkpoint is complete and remotely
 verified. After that checkpoint, Milestone 8 was implemented and completed.
-The repository is now planning Milestone 9, Secure Login and Secret Handling.
+Milestone 9 is now technically complete, and the repository is planning
+Milestone 10, Minimal Controlled Downloads.
 The authoritative Milestones 8–12 sequence is in
 [`ROADMAP.md`](../ROADMAP.md):
 
@@ -695,9 +750,9 @@ The authoritative Milestones 8–12 sequence is in
   `RunManager`, and resumable custom agent-loop human interaction and trusted
   confirmation without persistent sessions, a database, or service-restart
   resume.
-- Milestone 9: secure login and secret handling without exposing raw secrets
-  to NVIDIA or serializable run history.
-- Milestone 10: controlled automatic file download, beginning with a
+- Milestone 9: completed secure secret interaction and form application without
+  exposing raw secrets to provider/model context or serializable run history.
+- Milestone 10: minimal controlled downloads, beginning with a narrow
   Playwright MCP capability spike; download behavior is not yet proven.
 - Milestone 11: end-to-end NVIDIA browser-agent MVP.
 - Milestone 12: installation, HTTP API, usage, and provider-adaptation

@@ -42,11 +42,12 @@ The implemented learning prototype:
 - performs lifespan shutdown through `RunManager.close()`;
 - does not expose arbitrary server-side code execution to the LLM.
 
-The complete product MVP is not finished. Secure login and secret handling,
-controlled downloads, and a real HTTP composition root that constructs and
-wires NVIDIA, MCP, Playwright, browser, and session resources are not
-implemented. Persistence, service-restart resume, authentication, production
-deployment, and multi-worker coordination are also not implemented.
+The complete product MVP is not finished. Milestone 9 secure secret handling
+is implemented, but controlled downloads and a real HTTP composition root that
+constructs and wires NVIDIA, MCP, Playwright, browser, and session resources
+are not implemented. Persistence, service-restart resume, HTTP-service
+authentication and authorization, production deployment, and multi-worker
+coordination are also not implemented.
 
 ## Milestones
 
@@ -224,23 +225,68 @@ to enter model-visible or serializable state.
 - Tests cover successful, failed, cancelled, duplicate, and invalid
   interactions.
 
-### 10. Controlled Automatic File Download
+**Completion note:** Milestone 9 is technically complete through three
+verified feature checkpoints:
+
+- M9A: `14ffed5b6ec62d3379c2c5e6f923a93bb18fe14e` (`feat: add transient
+  secret store`)
+- M9B: `5020347ac382f326190fcf8283cf1c95987ddc97` (`feat: add secure secret
+  interaction flow`)
+- M9C: `b727e79c648b76750661ce24c69896f45e7ef820` (`feat: add secure secret
+  form application`)
+
+The implementation provides the app-owned `request_secret` control for
+username, password, and OTP categories; binds each request to the current-page
+field name and element ref; accepts secrets through the existing HTTP response
+endpoint; and stores them transiently in process-local storage for one-time
+consumption. A handle-bound `SecretFormApplier` uses the correct run/browser
+session for one policy-enforced `browser_fill_form` invocation, records only a
+sanitized secret-applied event, and safely resumes the agent session. The same
+run may independently pause a second time for an OTP secret.
+
+Raw secret values are intentionally excluded from provider/model context,
+`AgentUserInput`, serializable run history, `RunSnapshot`, HTTP responses, and
+normal logs and reports. This design does not claim complete memory
+zeroization or guaranteed erasure of immutable Python string copies.
+
+Final automated validation recorded 371 tests passed, `py_compile` passed,
+and `git diff --check` passed. A live Playwright MCP smoke passed local stdio
+MCP startup, dynamic tool discovery, and `browser_fill_form` discovery before
+browser launch. It was **BLOCKED** during `browser_navigate` at Chromium launch
+by the Colab/container environment error
+`sandbox_host_linux.cc:41 shutdown: Operation not permitted (1)`. This was not
+an implementation failure and is not evidence that live browser form filling
+succeeded: no element refs were obtained, live `SecretFormApplier` invocation
+was not reached, and visible post-fill verification was not reached. The
+temporary smoke script was removed and repository scope remained unchanged.
+
+This checkpoint does not implement or prove automatic login-form submission,
+login-success detection, captcha handling, SSO or OAuth orchestration,
+authentication or authorization for the HTTP service, persistence or restart
+resume, browser-side rollback after partial filling, guaranteed erasure of
+immutable Python string copies, production composition, or live Playwright
+form-fill compatibility in the current Colab environment. These are explicit
+limitations, not blockers for this MVP checkpoint.
+
+### 10. Minimal Controlled Downloads
 
 **Purpose:** Let the agent trigger and safely manage a target-site download
-without requiring the user to click the site's download button manually.
+through the existing HTTP service.
 
 **Acceptance criteria:**
 
-- Work begins with a Playwright MCP download-capability spike because the
-  mechanism is not yet implemented or proven.
-- The agent automatically activates the target site's download action.
-- The resulting download is captured or otherwise safely managed.
-- A user-selected destination is accepted only within approved filesystem
-  boundaries, with a safe default destination when none is supplied.
-- Paths, filenames, collisions, partial downloads, failures, and cleanup are
-  handled.
-- The result exposes sanitized file metadata and the final local path.
+- Work begins with a narrow Playwright MCP download-capability spike before
+  implementation because the mechanism is not yet proven.
+- The agent triggers a website download.
+- The download is saved under one configured allowed base directory.
+- Generated metadata includes a file ID, safe filename, and size.
+- The existing HTTP API serves the file.
+- Failed or partial downloads are cleaned up, and duplicate filenames are
+  handled safely.
 - File upload remains out of scope for this milestone.
+- No database or persistent file catalog, antivirus platform, distributed
+  locking, or checksum infrastructure is added unless a checksum is
+  technically required by the minimal spike.
 
 ### 11. End-to-End NVIDIA Browser-Agent MVP
 
