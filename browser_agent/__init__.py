@@ -1,6 +1,8 @@
 """Public package interface for the browser-agent prototype."""
 
 from .agent_loop import (
+    AgentApplicationEvent,
+    AgentApplicationEventKind,
     AgentDecisionSourceProtocol,
     AgentLoopContext,
     AgentPauseKind,
@@ -24,6 +26,17 @@ from .agent_loop import (
     PendingConfirmation,
     ResumableAgentSession,
     ScriptedDecisionSource,
+)
+from .secret_application import (
+    SecretApplicationConstructionError,
+    SecretApplicationError,
+    SecretApplicationExecutionError,
+    SecretApplicationResult,
+    SecretApplicationValidationError,
+    SecretFieldTarget,
+    SecretFormApplier,
+    SecretFormApplierProtocol,
+    SecretTargetSummary,
 )
 from .agent_controls import (
     AgentControlDefinition,
@@ -120,6 +133,8 @@ from .secret_store import (
 )
 
 __all__ = [
+    "AgentApplicationEvent",
+    "AgentApplicationEventKind",
     "AgentDecisionSourceProtocol",
     "AgentLoopContext",
     "AgentPauseKind",
@@ -195,6 +210,15 @@ __all__ = [
     "RunStatus",
     "ScriptedDecisionSource",
     "SecretBindingError",
+    "SecretApplicationConstructionError",
+    "SecretApplicationError",
+    "SecretApplicationExecutionError",
+    "SecretApplicationResult",
+    "SecretApplicationValidationError",
+    "SecretFieldTarget",
+    "SecretFormApplier",
+    "SecretFormApplierProtocol",
+    "SecretTargetSummary",
     "SecretExpiredError",
     "SecretField",
     "SecretNotFoundError",

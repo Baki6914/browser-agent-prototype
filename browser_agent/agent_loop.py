@@ -7,7 +7,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
@@ -19,6 +19,7 @@ from .agent_controls import (
 from .mcp_gateway import McpGatewayError, ToolDefinition, ToolObservation
 from .tool_policy import ToolConfirmationRequiredError, ToolPolicyError
 from .secret_store import SecretField
+from .secret_application import SecretFieldTarget
 
 
 class AgentToolSource(str, Enum):
@@ -72,6 +73,7 @@ class AgentStepObservation:
     confirmation_required: bool = False
     confirmation_for_step: int | None = None
     secret_fields: tuple[SecretField, ...] | None = None
+    secret_targets: tuple[SecretFieldTarget, ...] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,27 @@ class AgentPauseKind(str, Enum):
     USER_INPUT = "user_input"
     CONFIRMATION = "confirmation"
     SECRET = "secret"
+
+
+class AgentApplicationEventKind(str, Enum):
+    SECRET_APPLIED = "secret_applied"
+
+
+@dataclass(frozen=True)
+class AgentApplicationEvent:
+    after_step_number: int
+    kind: AgentApplicationEventKind
+    fields: tuple[SecretField, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.after_step_number) is not int or self.after_step_number <= 0:
+            raise AgentSessionStateError("application event step is invalid")
+        if type(self.kind) is not AgentApplicationEventKind:
+            raise AgentSessionStateError("application event kind is invalid")
+        if (type(self.fields) is not tuple or not self.fields
+                or any(type(item) is not SecretField for item in self.fields)
+                or self.fields != tuple(sorted(set(self.fields), key=lambda item: item.value))):
+            raise AgentSessionStateError("application event fields are invalid")
 
 
 class AgentSessionError(Exception):
@@ -288,6 +311,7 @@ class AgentLoopContext:
     tools: tuple[AgentToolDefinition, ...]
     steps: tuple[AgentStepRecord, ...]
     user_interactions: tuple[AgentUserInput, ...] = ()
+    application_events: tuple[AgentApplicationEvent, ...] = ()
 
 
 class AgentRunStatus(str, Enum):
@@ -307,6 +331,8 @@ class AgentRunResult:
     pending_confirmation: PendingConfirmation | None = None
     user_interactions: tuple[AgentUserInput, ...] = ()
     secret_fields: tuple[SecretField, ...] | None = None
+    secret_targets: tuple[SecretFieldTarget, ...] | None = field(default=None, repr=False)
+    application_events: tuple[AgentApplicationEvent, ...] = ()
 
 
 class AgentDecisionSourceProtocol(Protocol):
@@ -445,6 +471,7 @@ class AgentToolRouter:
                     error=None,
                     confirmation_for_step=result.confirmation_for_step,
                     secret_fields=result.secret_fields,
+                    secret_targets=result.secret_targets,
                 )
 
             if decision.tool_name in self._mcp_names:
@@ -535,6 +562,8 @@ class ResumableAgentSession:
         self._pause_kind: AgentPauseKind | None = None
         self._question: str | None = None
         self._secret_fields: tuple[SecretField, ...] | None = None
+        self._secret_targets: tuple[SecretFieldTarget, ...] | None = None
+        self._application_events: list[AgentApplicationEvent] = []
         self._terminal_result: AgentRunResult | None = None
         self._started = False
         self._failed = False
@@ -631,6 +660,26 @@ class ResumableAgentSession:
                 return self._terminate(AgentRunStatus.STEP_LIMIT_REACHED)
             return await self._continue()
 
+    async def resume_after_secret_application(
+        self, fields: tuple[SecretField, ...]
+    ) -> AgentRunResult:
+        async with self._lock:
+            self._require_pause(AgentPauseKind.SECRET)
+            if (type(fields) is not tuple or not fields
+                    or any(type(item) is not SecretField for item in fields)
+                    or fields != tuple(sorted(set(fields), key=lambda item: item.value))
+                    or fields != self._secret_fields):
+                raise AgentSessionStateError("secret application fields do not match pause")
+            self._application_events.append(AgentApplicationEvent(
+                len(self._steps), AgentApplicationEventKind.SECRET_APPLIED, fields
+            ))
+            self._clear_pause()
+            try:
+                return await self._continue()
+            except BaseException:
+                self._failed = True
+                raise
+
     def _require_pause(self, kind: AgentPauseKind) -> None:
         if not self._started:
             raise AgentSessionStateError("session has not been started")
@@ -647,6 +696,7 @@ class ResumableAgentSession:
         self._pause_kind = None
         self._question = None
         self._secret_fields = None
+        self._secret_targets = None
 
     def _result(
         self,
@@ -662,6 +712,8 @@ class ResumableAgentSession:
             self._pending_confirmation,
             tuple(self._user_interactions),
             self._secret_fields,
+            self._secret_targets,
+            tuple(self._application_events),
         )
 
     def _terminate(
@@ -682,6 +734,7 @@ class ResumableAgentSession:
                 tools=self._router.definitions(),
                 steps=tuple(self._steps),
                 user_interactions=tuple(self._user_interactions),
+                application_events=tuple(self._application_events),
             )
             decision = await self._decision_source.next_decision(context)
             if decision is None:
@@ -728,6 +781,7 @@ class ResumableAgentSession:
                 return self._result(AgentRunStatus.AWAITING_USER)
             if observation.status is AgentStepStatus.AWAITING_SECRET:
                 fields = observation.secret_fields
+                targets = observation.secret_targets
                 if (
                     type(observation.text) is not str
                     or not observation.text.strip()
@@ -737,6 +791,11 @@ class ResumableAgentSession:
                     or fields
                     != tuple(sorted(fields, key=lambda item: item.value))
                     or len(set(fields)) != len(fields)
+                    or type(targets) is not tuple
+                    or not targets
+                    or any(type(item) is not SecretFieldTarget for item in targets)
+                    or tuple(item.field for item in targets) != fields
+                    or len({item.ref for item in targets}) != len(targets)
                     or observation.confirmation_required is not False
                     or observation.confirmation_for_step is not None
                     or self._pending_confirmation is not None
@@ -750,5 +809,6 @@ class ResumableAgentSession:
                 self._pause_kind = AgentPauseKind.SECRET
                 self._question = observation.text
                 self._secret_fields = fields
+                self._secret_targets = targets
                 return self._result(AgentRunStatus.AWAITING_USER)
         return self._terminate(AgentRunStatus.STEP_LIMIT_REACHED)

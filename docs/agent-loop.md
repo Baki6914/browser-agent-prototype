@@ -7,7 +7,7 @@ question and deterministic field metadata. It clears confirmation state, adds
 no `AgentUserInput`, creates no response slot, and does not continue the
 decision source. `respond()` and `confirm()` reject it. Submitted values and
 references never enter context, history, or provider/model input. The session
-remains paused after submission; Milestone 9C must apply secrets and resume it.
+remains paused until the application reports successful local filling.
 Before publishing the pause, the session validates a non-empty question, an
 exact non-empty sorted duplicate-free tuple of exact `SecretField` members,
 and the complete absence of confirmation metadata or pending confirmation.
@@ -114,4 +114,9 @@ download handling yet.
 
 `respond()` is not a secret-input path. Passwords, OTPs, credentials, API
 keys, confidential data, and institution data must not be supplied through
-it. Secret-safe interaction remains future Milestone 9 work.
+it. Secret values use the transient HTTP/store/application path; the loop sees
+only categories and sanitized application events.
+
+## Milestone 9C application resume
+
+Secret pauses carry immutable `SecretFieldTarget` metadata. After local filling, `resume_after_secret_application(fields)` records a safe `AgentApplicationEvent` and resumes without creating `AgentUserInput`. Events contain only the completed step number, `secret_applied`, and categories; the provider receives no values, refs, or target names. A resumed decision may create an independent second OTP pause.

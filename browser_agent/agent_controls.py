@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType
 from typing import Any
 
 from .secret_store import SecretField
+from .secret_application import SecretFieldTarget
 
 
 class AgentControlStatus(str, Enum):
@@ -39,6 +40,7 @@ class AgentControlResult:
     question: str | None
     confirmation_for_step: int | None = None
     secret_fields: tuple[SecretField, ...] | None = None
+    secret_targets: tuple[SecretFieldTarget, ...] | None = field(default=None, repr=False)
 
 
 class AgentControlError(Exception):
@@ -84,9 +86,10 @@ _CONTROL_SPECS: Mapping[str, _ControlSpec] = MappingProxyType(
 )
 
 _REQUEST_SECRET_DESCRIPTION = (
-    "Request secret values through the application. Specify only the required "
-    "field categories; raw credentials or OTP values must never be included in "
-    "tool arguments. This control executes locally and never reaches MCP."
+    "Request secret values through the application. The model identifies only "
+    "field categories and current-page targets from the current page snapshot; "
+    "raw username, password, or OTP values must never appear in arguments. "
+    "This control executes locally and does not invoke MCP."
 )
 
 
@@ -119,8 +122,22 @@ class AgentControlExecutor:
                                     "minItems": 1,
                                     "uniqueItems": True,
                                 },
+                                "targets": {
+                                    "type": "array",
+                                    "minItems": 1,
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "field": {"type": "string", "enum": ["username", "password", "otp"]},
+                                            "name": {"type": "string", "description": "Safe human-readable field name."},
+                                            "ref": {"type": "string", "description": "Exact element reference from the current page snapshot."},
+                                        },
+                                        "required": ["field", "name", "ref"],
+                                        "additionalProperties": False,
+                                    },
+                                },
                             },
-                            "required": ["question", "fields"],
+                            "required": ["question", "fields", "targets"],
                             "additionalProperties": False,
                         },
                     )
@@ -258,7 +275,11 @@ class AgentControlExecutor:
             raise InvalidAgentControlArgumentsError(
                 "Agent control 'request_secret' is missing required field 'fields'."
             )
-        if actual_fields != {"question", "fields"}:
+        if "targets" not in actual_fields:
+            raise InvalidAgentControlArgumentsError(
+                "Agent control 'request_secret' is missing required field 'targets'."
+            )
+        if actual_fields != {"question", "fields", "targets"}:
             raise InvalidAgentControlArgumentsError(
                 "Agent control 'request_secret' received unexpected fields."
             )
@@ -286,6 +307,33 @@ class AgentControlExecutor:
                 "Agent control 'request_secret' contains an unsupported field category."
             )
         secret_fields = tuple(sorted((allowed[field] for field in fields), key=lambda item: item.value))
+        targets = arguments["targets"]
+        if type(targets) is not list or not targets:
+            raise InvalidAgentControlArgumentsError(
+                "Agent control 'request_secret' targets must be a non-empty list."
+            )
+        parsed: list[SecretFieldTarget] = []
+        for target in targets:
+            if type(target) is not dict or set(target) != {"field", "name", "ref"}:
+                raise InvalidAgentControlArgumentsError(
+                    "Agent control 'request_secret' target is invalid."
+                )
+            category, name, ref = target["field"], target["name"], target["ref"]
+            if type(category) is not str or category not in allowed:
+                raise InvalidAgentControlArgumentsError("Agent control 'request_secret' target field is invalid.")
+            if type(name) is not str or not name.strip():
+                raise InvalidAgentControlArgumentsError("Agent control 'request_secret' target name is invalid.")
+            if type(ref) is not str or not ref.strip():
+                raise InvalidAgentControlArgumentsError("Agent control 'request_secret' target reference is invalid.")
+            parsed.append(SecretFieldTarget(allowed[category], name, ref))
+        parsed.sort(key=lambda item: item.field.value)
+        secret_targets = tuple(parsed)
+        if len({target.field for target in secret_targets}) != len(secret_targets):
+            raise InvalidAgentControlArgumentsError("Agent control 'request_secret' target fields must be unique.")
+        if len({target.ref for target in secret_targets}) != len(secret_targets):
+            raise InvalidAgentControlArgumentsError("Agent control 'request_secret' target references must be unique.")
+        if tuple(target.field for target in secret_targets) != secret_fields:
+            raise InvalidAgentControlArgumentsError("Agent control 'request_secret' fields and targets do not match.")
         return AgentControlResult(
             tool_name="request_secret",
             status=AgentControlStatus.AWAITING_SECRET,
@@ -294,4 +342,5 @@ class AgentControlExecutor:
             question=question,
             confirmation_for_step=None,
             secret_fields=secret_fields,
+            secret_targets=secret_targets,
         )

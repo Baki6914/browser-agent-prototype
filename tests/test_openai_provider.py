@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
+import sys
 import unittest
 from typing import Any
 
 import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from browser_agent.agent_loop import (
     AgentLoopContext,
@@ -19,7 +23,11 @@ from browser_agent.agent_loop import (
     AgentToolDefinition,
     AgentToolSource,
     AgentUserInput,
+    AgentApplicationEvent,
+    AgentApplicationEventKind,
 )
+from browser_agent.secret_store import SecretField
+from browser_agent.agent_controls import AgentControlExecutor
 from browser_agent.openai_provider import (
     OpenAICompatibleDecisionSource,
     OpenAICompatibleProviderConfig,
@@ -477,3 +485,71 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
             ["nested"]["items"]["type"],
             "string",
         )
+
+
+class SecretApplicationContextTests(unittest.TestCase):
+    def test_actual_request_secret_schema_is_converted_exactly(self) -> None:
+        control = AgentControlExecutor()
+        definition = next(item for item in control.definitions() if item.name == "request_secret")
+        context = _context()
+        supplied = AgentLoopContext(
+            context.task,
+            context.tools + (AgentToolDefinition(
+                definition.name, definition.description,
+                definition.input_schema, AgentToolSource.AGENT_CONTROL,
+            ),),
+            context.steps,
+        )
+        body = OpenAICompatibleDecisionSource._context_request_body(supplied)
+        schema = next(
+            tool["function"]["parameters"] for tool in body["tools"]
+            if tool["function"]["name"] == "request_secret"
+        )
+        self.assertEqual(schema["required"], ["question", "fields", "targets"])
+        self.assertEqual(set(schema["properties"]), {"question", "fields", "targets"})
+        target = schema["properties"]["targets"]["items"]
+        self.assertEqual(set(target["properties"]), {"field", "name", "ref"})
+        self.assertEqual(target["required"], ["field", "name", "ref"])
+        self.assertIs(target["additionalProperties"], False)
+
+    def test_application_events_are_safe_and_present_only_when_non_empty(self) -> None:
+        context = _context()
+        self.assertNotIn("application_events", OpenAICompatibleDecisionSource._context_request_body(context)["messages"][1]["content"])
+        safe = AgentLoopContext(
+            context.task, context.tools, context.steps, context.user_interactions,
+            (AgentApplicationEvent(1, AgentApplicationEventKind.SECRET_APPLIED, (SecretField.OTP,)),),
+        )
+        rendered = OpenAICompatibleDecisionSource._context_request_body(safe)["messages"][1]["content"]
+        self.assertIn('"application_events":[{"after_step_number":1,"fields":["otp"],"kind":"secret_applied"}]', rendered)
+        for forbidden in ("synthetic-user", "synthetic-pass", "synthetic-otp", "target-ref", "secret_id"):
+            self.assertNotIn(forbidden, rendered)
+
+    def test_multiple_application_events_have_only_safe_deterministic_keys(self) -> None:
+        context = _context()
+        events = (
+            AgentApplicationEvent(1, AgentApplicationEventKind.SECRET_APPLIED,
+                                  (SecretField.PASSWORD, SecretField.USERNAME)),
+            AgentApplicationEvent(2, AgentApplicationEventKind.SECRET_APPLIED,
+                                  (SecretField.OTP,)),
+        )
+        supplied = AgentLoopContext(
+            context.task, context.tools, context.steps,
+            (AgentUserInput(1, AgentPauseKind.USER_INPUT, "Question", "Answer"),),
+            events,
+        )
+        body = OpenAICompatibleDecisionSource._context_request_body(supplied)
+        user = json.loads(body["messages"][1]["content"])
+        self.assertEqual(
+            [tuple(item) for item in user["application_events"]],
+            [("after_step_number", "fields", "kind")] * 2,
+        )
+        self.assertEqual(user["user_interactions"][0]["response"], "Answer")
+        rendered = json.dumps(body, sort_keys=True)
+        for forbidden in ("synthetic-user", "synthetic-pass", "synthetic-otp",
+                          "target-ref", "target-name", "SecretReference",
+                          "secret_id", "expires_at", "digest", "hmac"):
+            self.assertNotIn(forbidden, rendered)
+
+
+if __name__ == "__main__":
+    unittest.main()

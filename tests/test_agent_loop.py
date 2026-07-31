@@ -30,6 +30,7 @@ from browser_agent.agent_loop import (
     ResumableAgentSession,
     ScriptedDecisionSource,
     SecretField,
+    SecretFieldTarget,
 )
 from browser_agent.mcp_gateway import (
     InvalidToolArgumentsError,
@@ -887,7 +888,10 @@ class SecretPauseTests(unittest.IsolatedAsyncioTestCase):
         router = AgentToolRouter(FakePolicyExecutor(), (), AgentControlExecutor())
         decision = AgentToolCall(
             "request_secret",
-            {"question": "Enter credentials", "fields": ["username", "password"]},
+            {"question": "Enter credentials", "fields": ["username", "password"], "targets": [
+                {"field": "username", "name": "Email", "ref": "u"},
+                {"field": "password", "name": "Password", "ref": "p"},
+            ]},
         )
         observation = await router.route(decision)
         self.assertEqual(observation.status, AgentStepStatus.AWAITING_SECRET)
@@ -902,6 +906,27 @@ class SecretPauseTests(unittest.IsolatedAsyncioTestCase):
             await session.respond("synthetic")
         with self.assertRaises(AgentSessionStateError):
             await session.confirm(True)
+
+    async def test_secret_application_event_resumes_without_user_input(self) -> None:
+        router = AgentToolRouter(FakePolicyExecutor(), (), AgentControlExecutor())
+        decisions = [
+            AgentToolCall("request_secret", {"question": "Enter code", "fields": ["otp"],
+                "targets": [{"field": "otp", "name": "Code", "ref": "otp-ref"}]}),
+            AgentToolCall("finish", {"result": "done"}),
+        ]
+        source = ScriptedDecisionSource(decisions)
+        session = ResumableAgentSession(source, router, 4)
+        paused = await session.start("task")
+        resumed = await session.resume_after_secret_application((SecretField.OTP,))
+        self.assertEqual(resumed.status, AgentRunStatus.FINISHED)
+        self.assertEqual(resumed.user_interactions, ())
+        self.assertEqual(len(resumed.application_events), 1)
+        event = resumed.application_events[0]
+        self.assertEqual(event.fields, (SecretField.OTP,))
+        self.assertFalse(hasattr(event, "secret_targets"))
+        self.assertNotIn("otp-ref", repr(event))
+        with self.assertRaises(TypeError):
+            await session.resume_after_secret_application((SecretField.OTP,), "raw")  # type: ignore[call-arg]
 
     def test_agent_user_input_rejects_secret_kind(self) -> None:
         from browser_agent import AgentUserInput
@@ -966,6 +991,93 @@ class SecretPauseTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(source._index, 1)
                 with self.assertRaises(AgentSessionStateError):
                     await session.respond("answer")
+
+    async def test_secret_target_shapes_and_confirmation_metadata_fail_closed(self) -> None:
+        decision = AgentToolCall("request_secret", {})
+        password = SecretFieldTarget(SecretField.PASSWORD, "Password", "p")
+        username = SecretFieldTarget(SecretField.USERNAME, "Username", "u")
+        invalid = (
+            None,
+            (),
+            (username,),
+            (username, password),
+            (password, SecretFieldTarget(SecretField.USERNAME, "Username", "p")),
+        )
+
+        class Router:
+            def __init__(self, targets, *, confirmation=False):
+                self.targets = targets
+                self.confirmation = confirmation
+            def definitions(self):
+                return ()
+            async def route(self, *_args, **_kwargs):
+                return AgentStepObservation(
+                    "request_secret", AgentToolSource.AGENT_CONTROL,
+                    AgentStepStatus.AWAITING_SECRET, "Question", None,
+                    confirmation_required=self.confirmation,
+                    secret_fields=(SecretField.PASSWORD, SecretField.USERNAME),
+                    secret_targets=self.targets,
+                )
+
+        for targets in invalid:
+            with self.subTest(targets=targets):
+                session = ResumableAgentSession(
+                    ScriptedDecisionSource([decision]), Router(targets), 2  # type: ignore[arg-type]
+                )
+                with self.assertRaises(AgentSessionStateError):
+                    await session.start("task")
+                self.assertIsNone(session.pause_kind)
+        session = ResumableAgentSession(
+            ScriptedDecisionSource([decision]),
+            Router((password, username), confirmation=True), 2,  # type: ignore[arg-type]
+        )
+        with self.assertRaises(AgentSessionStateError):
+            await session.start("task")
+
+    async def test_resume_validation_safe_context_and_independent_otp_pause(self) -> None:
+        router = AgentToolRouter(FakePolicyExecutor(), (), AgentControlExecutor())
+        source = RecordingDecisionSource([
+            AgentToolCall("request_secret", {
+                "question": "Credentials", "fields": ["username", "password"],
+                "targets": [
+                    {"field": "username", "name": "Email", "ref": "u-ref"},
+                    {"field": "password", "name": "Password", "ref": "p-ref"},
+                ],
+            }),
+            AgentToolCall("request_secret", {
+                "question": "OTP", "fields": ["otp"],
+                "targets": [{"field": "otp", "name": "Code", "ref": "o-ref"}],
+            }),
+            AgentToolCall("finish", {"result": "done"}),
+        ])
+        session = ResumableAgentSession(source, router, 6)
+        first = await session.start("task")
+        for fields in (
+            (SecretField.USERNAME,),
+            (SecretField.USERNAME, SecretField.PASSWORD),
+            (SecretField.PASSWORD, SecretField.PASSWORD),
+        ):
+            with self.subTest(fields=fields):
+                with self.assertRaises(AgentSessionStateError):
+                    await session.resume_after_secret_application(fields)
+        second = await session.resume_after_secret_application(
+            (SecretField.PASSWORD, SecretField.USERNAME)
+        )
+        self.assertEqual(second.pause_kind, AgentPauseKind.SECRET)
+        self.assertEqual(second.secret_fields, (SecretField.OTP,))
+        self.assertEqual(second.user_interactions, ())
+        self.assertEqual(len(second.application_events), 1)
+        self.assertEqual(source.contexts[1].application_events, second.application_events)
+        event_text = repr(second.application_events)
+        for forbidden in ("Email", "Password", "u-ref", "p-ref", "SecretReference", "value"):
+            self.assertNotIn(forbidden, event_text)
+        finished = await session.resume_after_secret_application((SecretField.OTP,))
+        self.assertEqual(finished.status, AgentRunStatus.FINISHED)
+        self.assertEqual(len(finished.application_events), 2)
+        self.assertIsNone(finished.secret_fields)
+        self.assertIsNone(finished.secret_targets)
+        self.assertEqual(finished.user_interactions, ())
+        self.assertEqual(first.user_interactions, ())
 
 
 if __name__ == "__main__":

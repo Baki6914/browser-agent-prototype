@@ -25,9 +25,8 @@ secret-store exceptions are neither retained nor exception-chained.
 ## Purpose and boundary
 
 `RunManager` is the application-level owner of multiple resumable agent
-sessions. It gives future interface code a stable lifecycle API without
-coupling run management to FastAPI. No HTTP endpoint is implemented in this
-milestone.
+sessions. The FastAPI layer delegates lifecycle operations to this API without
+moving HTTP concerns into the manager.
 
 The manager knows only `AgentRunResult` and three dependency-free protocols:
 
@@ -123,11 +122,11 @@ pending-confirmation state absent.
 ## Limitations and next work
 
 This manager is single-process and in-memory. It provides no persistence,
-cross-process coordination, or resume after service restart. It is not yet
-wired to FastAPI and implements no HTTP contract. Milestone 8C must add that
-interface and application composition without moving provider or browser
-construction into this manager.
+cross-process coordination, resume after service restart, authentication, or
+production composition. Its secret submission path stores values transiently,
+consumes them once, delegates one handle-bound fill, and resumes with categories
+only.
 
-This is not a secret-safe credential channel. Passwords, OTP values,
-credentials, API keys, confidential data, and institution data must not be
-sent through `RunManager` or the current M8A response path.
+## Milestone 9C application worker
+
+Each run handle owns an applier bound to the same browser session, discovered catalog, and policy-enforced executor. Submission returns `awaiting_secret_application`; a single worker consumes once, fills once, and resumes the session. Cancellation and manager close cancel that active worker and retain the shared-close lifecycle. Filling is never automatically retried, and cancellation may leave a browser field partially filled; rollback is not promised.

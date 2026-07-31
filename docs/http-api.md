@@ -164,8 +164,11 @@ resume after service restart, no multi-worker coordination, and no real
 provider, NVIDIA, MCP, Playwright, or browser composition. Future composition
 work must inject a fully constructed manager.
 
-There is no secret-safe credential path. Passwords, OTPs, credentials, API
-keys, confidential data, and institution data must not be sent through these
-endpoints. This milestone also provides no authentication, authorization,
+The secret response variant is the transient credential and OTP submission
+path. Other response variants must not carry secrets. This milestone provides
+no authentication, authorization,
 CORS, rate limiting, downloads, uploads, files, login, UI, WebSocket, SSE,
 Docker, or multi-worker support.
+## Milestone 9C secret summaries
+
+The existing responses endpoint is unchanged. Secret pauses and the immediate `awaiting_secret_application` response include summaries containing only `field` and `name`; element refs never cross HTTP. Clients poll the existing run GET endpoint for later completion. The application fills fields locally but does not click, press Enter, or submit the form.

@@ -89,6 +89,10 @@ missing fields, wrong types, empty text, invalid confirmation references, and
 additional fields raise `InvalidAgentControlArgumentsError`. Accepted text is
 preserved rather than trimmed.
 
-The resumable loop is process-memory only. These controls do not implement
-FastAPI, an HTTP RunManager, persistence, login, downloads, or secret-safe
-input.
+The resumable loop and target binding are process-memory only. This control
+implements secret-safe request metadata, but not HTTP submission, browser
+filling, authentication, persistence, login-success detection, or downloads.
+
+## Milestone 9C target binding
+
+`request_secret` now requires `question`, `fields`, and `targets`. Each target binds one category (`username`, `password`, or `otp`) to a safe human-readable `name` and the exact current-page snapshot `ref`. Input order is normalized by category; fields and targets must match exactly, with unique categories and refs. Raw credential and OTP values are prohibited. The control remains application-local and does not invoke MCP.

@@ -306,18 +306,15 @@ class RequestSecretControlTests(unittest.TestCase):
             item for item in self.executor.definitions()
             if item.name == "request_secret"
         )
-        self.assertEqual(definition.input_schema, {
-            "type": "object",
-            "properties": {
-                "question": {"type": "string", "description": "Safe question shown to the user."},
-                "fields": {"type": "array", "items": {"type": "string", "enum": ["username", "password", "otp"]}, "minItems": 1, "uniqueItems": True},
-            },
-            "required": ["question", "fields"],
-            "additionalProperties": False,
-        })
+        self.assertEqual(definition.input_schema["required"], ["question", "fields", "targets"])
+        self.assertFalse(definition.input_schema["additionalProperties"])
+        self.assertEqual(definition.input_schema["properties"]["targets"]["items"]["required"], ["field", "name", "ref"])
         result = self.executor.execute(
             "request_secret",
-            {"question": "Enter credentials", "fields": ["username", "password"]},
+            {"question": "Enter credentials", "fields": ["username", "password"], "targets": [
+                {"field": "username", "name": "Email", "ref": "u"},
+                {"field": "password", "name": "Password", "ref": "p"},
+            ]},
         )
         self.assertEqual(result.status, AgentControlStatus.AWAITING_SECRET)
         self.assertEqual(result.secret_fields, (SecretField.PASSWORD, SecretField.USERNAME))
@@ -325,19 +322,19 @@ class RequestSecretControlTests(unittest.TestCase):
 
     def test_otp_and_strict_rejections(self) -> None:
         result = self.executor.execute(
-            "request_secret", {"question": "Enter OTP", "fields": ["otp"]}
+            "request_secret", {"question": "Enter OTP", "fields": ["otp"], "targets": [{"field": "otp", "name": "Code", "ref": "o"}]}
         )
         self.assertEqual(result.secret_fields, (SecretField.OTP,))
         invalid = (
             {}, {"question": "Q"}, {"fields": ["otp"]},
-            {"question": "Q", "fields": []},
+            {"question": "Q", "fields": [], "targets": []},
             {"question": "Q", "fields": ("otp",)},
             {"question": "Q", "fields": "otp"},
             {"question": "Q", "fields": ["otp", "otp"]},
             {"question": "Q", "fields": ["token"]},
             {"question": "Q", "fields": [1]},
-            {"question": "Q", "fields": ["otp"], "values": {"otp": "x"}},
-            {"question": "Q", "fields": ["otp"], "password": "x"},
+            {"question": "Q", "fields": ["otp"], "targets": [], "values": {"otp": "x"}},
+            {"question": "Q", "fields": ["otp"], "targets": [], "password": "x"},
         )
         for arguments in invalid:
             with self.subTest(arguments=tuple(arguments)):

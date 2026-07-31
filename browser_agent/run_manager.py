@@ -19,6 +19,13 @@ from .secret_store import (
     SecretReference,
     TransientSecretStore,
 )
+from .secret_application import (
+    SecretApplicationError,
+    SecretApplicationResult,
+    SecretFieldTarget,
+    SecretFormApplierProtocol,
+    SecretTargetSummary,
+)
 
 _ERROR_MESSAGE_LIMIT = 500
 
@@ -62,6 +69,7 @@ class RunSnapshot:
     error_type: str | None
     error_message: str | None
     secret_fields: tuple[SecretField, ...] | None = None
+    secret_targets: tuple[SecretTargetSummary, ...] | None = None
 
 
 class RunManagerError(Exception):
@@ -95,9 +103,14 @@ class RunSessionProtocol(Protocol):
 
     async def confirm(self, approved: bool) -> AgentRunResult: ...
 
+    async def resume_after_secret_application(
+        self, fields: tuple[SecretField, ...]
+    ) -> AgentRunResult: ...
+
 
 class RunSessionHandleProtocol(Protocol):
     session: RunSessionProtocol
+    secret_applier: SecretFormApplierProtocol
 
     async def close(self) -> None: ...
 
@@ -138,6 +151,8 @@ class _RunRecord:
     requests: dict[str, _RequestFingerprint] = field(default_factory=dict, repr=False)
     secret_fields: tuple[SecretField, ...] | None = None
     secret_reference: SecretReference | None = field(default=None, repr=False)
+    secret_targets: tuple[SecretFieldTarget, ...] | None = field(default=None, repr=False)
+    secret_applier: SecretFormApplierProtocol | None = field(default=None, repr=False)
 
 
 def _required_string(value: object, name: str, error: type[RunManagerError]) -> str:
@@ -344,6 +359,8 @@ class RunManager:
                     )
                 if (
                     record.session is None
+                    or record.secret_applier is None
+                    or record.secret_targets is None
                     or record.active_task is not None
                     or record.secret_reference is not None
                 ):
@@ -358,6 +375,10 @@ class RunManager:
                     storage_failed = True
                 if storage_failed:
                     raise RunManagerError("secret storage failed safely") from None
+                prior_question = record.question
+                prior_interaction_id = record.interaction_id
+                prior_status = record.status
+                prior_version = record.version
                 try:
                     record.secret_reference = reference
                     record.requests[request_id] = fingerprint
@@ -365,8 +386,16 @@ class RunManager:
                     record.interaction_id = None
                     record.status = RunStatus.AWAITING_SECRET_APPLICATION
                     record.version += 1
-                    return self._snapshot(record)
-                except BaseException:
+                    accepted = self._snapshot(record)
+                    operation = asyncio.create_task(self._apply_secret(record))
+                    record.active_task = operation
+                    return accepted
+                except BaseException as startup_error:
+                    record.requests.pop(request_id, None)
+                    record.question = prior_question
+                    record.interaction_id = prior_interaction_id
+                    record.status = prior_status
+                    record.version = prior_version
                     record.secret_reference = None
                     discard_failed = False
                     try:
@@ -377,7 +406,14 @@ class RunManager:
                         raise RunManagerError(
                             "secret discard failed safely"
                         ) from None
-                    raise
+                    if isinstance(
+                        startup_error,
+                        (asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+                    ):
+                        raise
+                    raise RunManagerError(
+                        "secret application startup failed safely"
+                    ) from None
 
     async def _resume(
         self,
@@ -427,12 +463,13 @@ class RunManager:
             local_handle = await self._factory.create(
                 record.start_url, record.task
             )
-            session = self._validate_handle(local_handle)
+            session, applier = self._validate_handle(local_handle)
             async with record.lock:
                 if record.status is RunStatus.CANCELLED:
                     return
                 record.handle = local_handle
                 record.session = session
+                record.secret_applier = applier
                 local_handle = None
             result = await session.start(record.task)
             await self._publish_result(record, result)
@@ -467,11 +504,50 @@ class RunManager:
         finally:
             await self._clear_current_task(record)
 
+    async def _apply_secret(self, record: _RunRecord) -> None:
+        values: dict[SecretField, str] = {}
+        try:
+            async with record.lock:
+                reference = record.secret_reference
+                targets = record.secret_targets
+                fields = record.secret_fields
+                session = record.session
+                applier = record.secret_applier
+            if reference is None or targets is None or fields is None or session is None or applier is None:
+                raise SecretApplicationError("Secret application failed safely.")
+            try:
+                consumed = await self._secret_store.consume(reference)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                raise SecretApplicationError("Secret application failed safely.") from None
+            values.update(consumed)
+            if isinstance(consumed, dict):
+                consumed.clear()
+            async with record.lock:
+                if record.secret_reference == reference:
+                    record.secret_reference = None
+            result = await applier.apply(targets, values)
+            if type(result) is not SecretApplicationResult or result.fields != fields:
+                raise SecretApplicationError("Secret application failed safely.")
+            resumed = await session.resume_after_secret_application(fields)
+            self._translate(resumed)
+            await self._publish_result(record, resumed)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self._publish_failure(
+                record, SecretApplicationError("Secret application failed safely.")
+            )
+        finally:
+            values.clear()
+            await self._clear_current_task(record)
+
     async def _publish_result(
         self, record: _RunRecord, result: AgentRunResult
     ) -> None:
         try:
-            status, question, final_result, step_count, secret_fields = self._translate(result)
+            status, question, final_result, step_count, secret_fields, secret_targets = self._translate(result)
         except Exception as exc:
             await self._publish_failure(record, exc)
             return
@@ -494,6 +570,7 @@ class RunManager:
             )
             record.final_result = final_result
             record.secret_fields = secret_fields
+            record.secret_targets = secret_targets
             record.error_type = None
             record.error_message = None
         if status in _TERMINAL_STATUSES:
@@ -513,6 +590,7 @@ class RunManager:
             record.interaction_id = None
             record.final_result = None
             record.secret_fields = None
+            record.secret_targets = None
             record.secret_reference = None
             record.error_type = error_type
             record.error_message = error_message
@@ -528,6 +606,7 @@ class RunManager:
                 handle = record.handle
                 record.handle = None
                 record.session = None
+                record.secret_applier = None
                 cleanup_task = asyncio.create_task(
                     self._run_handle_cleanup(record, handle)
                 )
@@ -573,6 +652,7 @@ class RunManager:
                 record.interaction_id = None
                 record.final_result = None
                 record.secret_fields = None
+                record.secret_targets = None
                 record.secret_reference = None
             record.error_type = error_type
             record.error_message = error_message
@@ -613,6 +693,7 @@ class RunManager:
             record.secret_reference = None
             if record.status in _TERMINAL_STATUSES:
                 record.secret_fields = None
+                record.secret_targets = None
             cleanup_task = record.secret_cleanup_task
             if cleanup_task is None:
                 cleanup_task = asyncio.create_task(
@@ -650,21 +731,24 @@ class RunManager:
     @staticmethod
     def _validate_handle(
         handle: object,
-    ) -> RunSessionProtocol:
+    ) -> tuple[RunSessionProtocol, SecretFormApplierProtocol]:
         if handle is None or not callable(getattr(handle, "close", None)):
             raise TypeError("factory returned an invalid session handle")
         session = getattr(handle, "session", None)
         if session is None or any(
             not callable(getattr(session, name, None))
-            for name in ("start", "respond", "confirm")
+            for name in ("start", "respond", "confirm", "resume_after_secret_application")
         ):
             raise TypeError("factory handle has an invalid session")
-        return session
+        applier = getattr(handle, "secret_applier", None)
+        if applier is None or not callable(getattr(applier, "apply", None)):
+            raise TypeError("factory handle has an invalid secret applier")
+        return session, applier
 
     @staticmethod
     def _translate(
         result: AgentRunResult,
-    ) -> tuple[RunStatus, str | None, str | None, int, tuple[SecretField, ...] | None]:
+    ) -> tuple[RunStatus, str | None, str | None, int, tuple[SecretField, ...] | None, tuple[SecretFieldTarget, ...] | None]:
         if not isinstance(result, AgentRunResult) or type(result.steps) is not tuple:
             raise TypeError("session returned an invalid AgentRunResult")
         step_count = len(result.steps)
@@ -676,36 +760,43 @@ class RunManager:
             ):
                 raise ValueError("session returned an inconsistent pause result")
             if result.pause_kind is AgentPauseKind.USER_INPUT:
-                if result.pending_confirmation is not None or result.secret_fields is not None:
+                if result.pending_confirmation is not None or result.secret_fields is not None or result.secret_targets is not None:
                     raise ValueError(
                         "session returned an inconsistent pause result"
                     )
                 status = RunStatus.AWAITING_USER
             elif result.pause_kind is AgentPauseKind.CONFIRMATION:
-                if result.pending_confirmation is None or result.secret_fields is not None:
+                if result.pending_confirmation is None or result.secret_fields is not None or result.secret_targets is not None:
                     raise ValueError(
                         "session returned an inconsistent pause result"
                     )
                 status = RunStatus.AWAITING_CONFIRMATION
             elif result.pause_kind is AgentPauseKind.SECRET:
                 fields = result.secret_fields
+                targets = result.secret_targets
                 if (
                     type(fields) is not tuple
                     or not fields
                     or any(type(item) is not SecretField for item in fields)
                     or fields != tuple(sorted(set(fields), key=lambda item: item.value))
                     or result.pending_confirmation is not None
+                    or type(targets) is not tuple
+                    or not targets
+                    or any(type(item) is not SecretFieldTarget for item in targets)
+                    or tuple(item.field for item in targets) != fields
+                    or len({item.ref for item in targets}) != len(targets)
                 ):
                     raise ValueError("session returned an inconsistent secret pause result")
                 status = RunStatus.AWAITING_SECRET
             else:
                 raise ValueError("session returned an inconsistent pause result")
-            return status, result.question, None, step_count, result.secret_fields
+            return status, result.question, None, step_count, result.secret_fields, result.secret_targets
         if (
             result.question is not None
             or result.pause_kind is not None
             or result.pending_confirmation is not None
             or result.secret_fields is not None
+            or result.secret_targets is not None
         ):
             raise ValueError("session returned inconsistent terminal fields")
         if result.status is AgentRunStatus.FINISHED:
@@ -714,7 +805,7 @@ class RunManager:
                 or not result.final_result.strip()
             ):
                 raise ValueError("finished result must contain final_result")
-            return RunStatus.FINISHED, None, result.final_result, step_count, None
+            return RunStatus.FINISHED, None, result.final_result, step_count, None, None
         if result.final_result is not None:
             raise ValueError("non-finished result cannot contain final_result")
         mapping = {
@@ -723,7 +814,7 @@ class RunManager:
                 RunStatus.DECISION_SOURCE_EXHAUSTED,
         }
         try:
-            return mapping[result.status], None, None, step_count, None
+            return mapping[result.status], None, None, step_count, None, None
         except (KeyError, TypeError) as exc:
             raise ValueError("session returned an unsupported status") from exc
 
@@ -735,6 +826,7 @@ class RunManager:
         record.interaction_id = None
         record.final_result = None
         record.secret_fields = None
+        record.secret_targets = None
         record.secret_reference = None
 
     @staticmethod
@@ -752,6 +844,10 @@ class RunManager:
             error_type=record.error_type,
             error_message=record.error_message,
             secret_fields=record.secret_fields,
+            secret_targets=(
+                tuple(SecretTargetSummary.from_target(item) for item in record.secret_targets)
+                if record.secret_targets is not None else None
+            ),
         )
 
     @staticmethod

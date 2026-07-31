@@ -23,6 +23,7 @@ from .run_manager import (
     RunStatus,
 )
 from .secret_store import SecretField
+from .secret_application import SecretTargetSummary
 
 _ERROR_MESSAGE_LIMIT = 500
 
@@ -120,6 +121,7 @@ class RunHttpResponse(_StrictHttpModel):
     final_result: str | None
     error: RunHttpSnapshotError | None
     secret_fields: tuple[SecretField, ...] | None
+    secret_targets: tuple[SecretTargetSummary, ...] | None
 
 
 class HttpErrorBody(_StrictHttpModel):
@@ -155,6 +157,7 @@ def snapshot_to_http_response(snapshot: RunSnapshot) -> RunHttpResponse:
         final_result=snapshot.final_result,
         error=error,
         secret_fields=snapshot.secret_fields,
+        secret_targets=snapshot.secret_targets,
     )
 
 

@@ -8,6 +8,7 @@ from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -25,9 +26,14 @@ from browser_agent import (
     RunNotFoundError,
     RunStatus,
     SecretField,
+    SecretFieldTarget,
+    SecretApplicationResult,
+    SecretApplicationExecutionError,
     SecretNotFoundError,
     TransientSecretStore,
 )
+
+_DEFAULT_TARGETS = object()
 
 
 def result(
@@ -38,7 +44,13 @@ def result(
     final_result: str | None = None,
     pending_confirmation: PendingConfirmation | None = None,
     secret_fields: tuple[SecretField, ...] | None = None,
+    secret_targets: tuple[SecretFieldTarget, ...] | None | object = _DEFAULT_TARGETS,
 ) -> AgentRunResult:
+    if secret_targets is _DEFAULT_TARGETS and secret_fields is not None:
+        secret_targets = tuple(
+            SecretFieldTarget(item, item.value.title(), f"ref-{item.value}")
+            for item in secret_fields
+        )
     return AgentRunResult(
         status=status,
         steps=(),
@@ -47,6 +59,7 @@ def result(
         pause_kind=pause_kind,
         pending_confirmation=pending_confirmation,
         secret_fields=secret_fields,
+        secret_targets=secret_targets if secret_targets is not _DEFAULT_TARGETS else None,
     )
 
 
@@ -76,12 +89,35 @@ class FakeSession:
     async def confirm(self, approved: bool) -> AgentRunResult:
         return await self._call("confirm", approved)
 
+    async def resume_after_secret_application(self, fields):
+        return await self._call("secret_application", fields)
+
+
+class FakeSecretApplier:
+    def __init__(self) -> None:
+        self.calls = []
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.result: object | None = None
+        self.error: BaseException | None = None
+
+    async def apply(self, targets, values):
+        self.calls.append((targets, dict(values)))
+        self.entered.set()
+        await self.release.wait()
+        if self.error is not None:
+            raise self.error
+        if self.result is not None:
+            return self.result
+        return SecretApplicationResult(tuple(target.field for target in targets))
+
 
 class FakeHandle:
     def __init__(
         self, session: FakeSession, close_error: BaseException | None = None
     ) -> None:
         self.session = session
+        self.secret_applier = FakeSecretApplier()
         self.close_error = close_error
         self.close_calls = 0
         self.closed = asyncio.Event()
@@ -169,6 +205,12 @@ class ControlledSecretStore(TrackingSecretStore):
         self.close_started = asyncio.Event()
         self.close_release = asyncio.Event()
         self.close_release.set()
+        self.consume_calls = 0
+        self.consumed_references = []
+        self.consume_entered = asyncio.Event()
+        self.consume_release = asyncio.Event()
+        self.consume_release.set()
+        self.consume_error: BaseException | None = None
 
     async def put(self, run_id, interaction_id, values):
         if self.put_error is not None:
@@ -180,6 +222,15 @@ class ControlledSecretStore(TrackingSecretStore):
         if self.discard_run_error is not None:
             raise self.discard_run_error
         await TransientSecretStore.discard_run(self, run_id)
+
+    async def consume(self, reference):
+        self.consume_calls += 1
+        self.consumed_references.append(reference)
+        self.consume_entered.set()
+        await self.consume_release.wait()
+        if self.consume_error is not None:
+            raise self.consume_error
+        return await TransientSecretStore.consume(self, reference)
 
     async def close(self):
         self.close_calls += 1
@@ -668,6 +719,33 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
                 RunStatus.FAILED,
             )
 
+    async def test_result_translation_rejects_each_invalid_secret_shape(self) -> None:
+        password = SecretFieldTarget(SecretField.PASSWORD, "Password", "p")
+        username = SecretFieldTarget(SecretField.USERNAME, "Username", "u")
+        cases = (
+            result(AgentRunStatus.AWAITING_USER, question="Q", pause_kind=AgentPauseKind.SECRET,
+                   secret_fields=(SecretField.PASSWORD,), secret_targets=None),
+            result(AgentRunStatus.AWAITING_USER, question="Q", pause_kind=AgentPauseKind.SECRET,
+                   secret_fields=(SecretField.PASSWORD,), secret_targets=()),
+            result(AgentRunStatus.AWAITING_USER, question="Q", pause_kind=AgentPauseKind.SECRET,
+                   secret_fields=None, secret_targets=(password,)),
+            result(AgentRunStatus.AWAITING_USER, question="Q", pause_kind=AgentPauseKind.SECRET,
+                   secret_fields=(SecretField.USERNAME,), secret_targets=(password,)),
+            result(AgentRunStatus.AWAITING_USER, question="Q", pause_kind=AgentPauseKind.SECRET,
+                   secret_fields=(SecretField.PASSWORD, SecretField.USERNAME),
+                   secret_targets=(password, SecretFieldTarget(SecretField.USERNAME, "Username", "p"))),
+            result(AgentRunStatus.AWAITING_USER, question="Q", pause_kind=AgentPauseKind.SECRET,
+                   secret_fields=(SecretField.PASSWORD, SecretField.USERNAME),
+                   secret_targets=(username, password)),
+        )
+        for invalid in cases:
+            with self.subTest(targets=invalid.secret_targets):
+                session = FakeSession([invalid])
+                manager = self.manager(FakeFactory([FakeHandle(session)]))
+                created = await manager.create_run("url", "task")
+                await self.settle(manager, created.run_id)
+                self.assertEqual((await manager.get_run(created.run_id)).status, RunStatus.FAILED)
+
     async def test_valid_confirmation_pause_requires_pending_state(self) -> None:
         pending = PendingConfirmation(1, "browser_click", "{}")
         session = FakeSession(
@@ -817,14 +895,110 @@ class RunManagerSecretTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(accepted.interaction_id)
         self.assertEqual(len(session.calls), 1)
         record = manager._runs[pause.run_id]
-        reference = record.secret_reference
-        self.assertIsNotNone(reference)
         retry = await manager.submit_secret(
             pause.run_id, pause.interaction_id, "secret-request", dict(reversed(tuple(values.items())))
         )
         self.assertEqual(retry, accepted)
-        consumed = await store.consume(reference)  # type: ignore[arg-type]
-        self.assertEqual(consumed, values)
+        handle = manager._runs[pause.run_id].handle
+        await handle.secret_applier.entered.wait()
+        self.assertEqual(len(handle.secret_applier.calls), 1)
+        self.assertEqual(handle.secret_applier.calls[0][1], values)
+        self.assertIsNone(record.secret_reference)
+        handle.secret_applier.release.set()
+        await self.settle(manager, pause.run_id)
+
+    async def test_snapshot_failure_rolls_back_before_worker_start(self) -> None:
+        manager, store, session, pause = await self.secret_paused()
+        record = manager._runs[pause.run_id]
+        handle = record.handle
+        values = {
+            SecretField.PASSWORD: "synthetic-pass",
+            SecretField.USERNAME: "synthetic-user",
+        }
+        with patch.object(
+            manager,
+            "_snapshot",
+            side_effect=RuntimeError("synthetic-pass p-ref"),
+        ):
+            with self.assertRaisesRegex(
+                RunManagerError,
+                "^secret application startup failed safely$",
+            ) as raised:
+                await manager.submit_secret(
+                    pause.run_id,
+                    pause.interaction_id,
+                    "snapshot-failure",
+                    values,
+                )
+        self.assertNotIn("synthetic-pass", str(raised.exception))
+        self.assertEqual(record.status, RunStatus.AWAITING_SECRET)
+        self.assertEqual(record.interaction_id, pause.interaction_id)
+        self.assertIsNone(record.secret_reference)
+        self.assertIsNone(record.active_task)
+        self.assertEqual(handle.secret_applier.calls, [])
+        self.assertEqual(session.calls, [("start", "task")])
+        self.assertNotIn("snapshot-failure", record.requests)
+        self.assertEqual(store._records, {})
+
+    async def test_handle_bound_application_resumes_and_finishes(self) -> None:
+        targets = (
+            SecretFieldTarget(SecretField.PASSWORD, "Password", "p-ref"),
+            SecretFieldTarget(SecretField.USERNAME, "Email", "u-ref"),
+        )
+        session = FakeSession([
+            result(AgentRunStatus.AWAITING_USER, question="Credentials", pause_kind=AgentPauseKind.SECRET,
+                   secret_fields=(SecretField.PASSWORD, SecretField.USERNAME), secret_targets=targets),
+            result(AgentRunStatus.FINISHED, final_result="done"),
+        ])
+        handle = FakeHandle(session)
+        manager = RunManager(FakeFactory([handle]), secret_store=TransientSecretStore())
+        self.managers.append(manager)
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        pause = await manager.get_run(created.run_id)
+        self.assertEqual(tuple(item.name for item in pause.secret_targets or ()), ("Password", "Email"))
+        self.assertNotIn("p-ref", repr(pause))
+        accepted = await manager.submit_secret(pause.run_id, pause.interaction_id, "secret", {
+            SecretField.PASSWORD: "synthetic-pass", SecretField.USERNAME: "synthetic-user"
+        })
+        self.assertEqual(accepted.status, RunStatus.AWAITING_SECRET_APPLICATION)
+        await handle.secret_applier.entered.wait()
+        self.assertEqual(handle.secret_applier.calls[0][0], targets)
+        handle.secret_applier.release.set()
+        await self.settle(manager, created.run_id)
+        finished = await manager.get_run(created.run_id)
+        self.assertEqual(finished.status, RunStatus.FINISHED)
+        self.assertIsNone(finished.secret_targets)
+        self.assertEqual(session.calls[-1], ("secret_application", (SecretField.PASSWORD, SecretField.USERNAME)))
+
+    async def test_two_runs_keep_distinct_handle_appliers(self) -> None:
+        sessions = []
+        handles = []
+        for field in (SecretField.USERNAME, SecretField.OTP):
+            target = (SecretFieldTarget(field, field.value.title(), f"ref-{field.value}"),)
+            session = FakeSession([
+                result(AgentRunStatus.AWAITING_USER, question="Secret", pause_kind=AgentPauseKind.SECRET,
+                       secret_fields=(field,), secret_targets=target),
+                result(AgentRunStatus.FINISHED, final_result="done"),
+            ])
+            sessions.append(session)
+            handles.append(FakeHandle(session))
+        manager = RunManager(FakeFactory(handles), secret_store=TransientSecretStore())
+        self.managers.append(manager)
+        created = [await manager.create_run("url", f"task-{i}") for i in range(2)]
+        for item in created:
+            await self.settle(manager, item.run_id)
+        pauses = [await manager.get_run(item.run_id) for item in created]
+        for index, pause in enumerate(pauses):
+            field = (SecretField.USERNAME, SecretField.OTP)[index]
+            await manager.submit_secret(pause.run_id, pause.interaction_id, f"r-{index}", {field: f"synthetic-{index}"})
+            await handles[index].secret_applier.entered.wait()
+        self.assertEqual(len(handles[0].secret_applier.calls), 1)
+        self.assertEqual(len(handles[1].secret_applier.calls), 1)
+        for handle in handles:
+            handle.secret_applier.release.set()
+        for item in created:
+            await self.settle(manager, item.run_id)
 
     async def test_mismatch_conflict_and_cancel_cleanup(self) -> None:
         manager, store, _, pause = await self.secret_paused()
@@ -1128,6 +1302,218 @@ class RunManagerSecretTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RunManagerError, "^run manager close failed safely$"):
             await manager.close()
         self.assertEqual(store.close_calls, 1)
+
+    async def test_secret_worker_failure_matrix_is_sanitized_and_exactly_once(self) -> None:
+        cases = ("consume", "apply", "typed_apply", "resume", "wrong_result", "invalid_resume")
+        for case in cases:
+            with self.subTest(case=case):
+                targets = (SecretFieldTarget(SecretField.OTP, "Code", "otp-target-ref"),)
+                session = FakeSession([
+                    result(AgentRunStatus.AWAITING_USER, question="OTP",
+                           pause_kind=AgentPauseKind.SECRET,
+                           secret_fields=(SecretField.OTP,), secret_targets=targets),
+                    (RuntimeError("RAW-RESUME synthetic-otp otp-target-ref")
+                     if case == "resume" else
+                     object() if case == "invalid_resume" else
+                     result(AgentRunStatus.FINISHED, final_result="done")),
+                ])
+                handle = FakeHandle(session)
+                store = ControlledSecretStore()
+                if case == "consume":
+                    store.consume_error = RuntimeError("RAW-CONSUME synthetic-otp")
+                if case == "apply":
+                    handle.secret_applier.error = RuntimeError("RAW-APPLY synthetic-otp")
+                if case == "typed_apply":
+                    handle.secret_applier.error = SecretApplicationExecutionError("RAW-TYPED")
+                if case == "wrong_result":
+                    handle.secret_applier.result = SecretApplicationResult((SecretField.USERNAME,))
+                manager = RunManager(FakeFactory([handle]), secret_store=store)
+                self.managers.append(manager)
+                created = await manager.create_run("url", "task")
+                await self.settle(manager, created.run_id)
+                pause = await manager.get_run(created.run_id)
+                await manager.submit_secret(
+                    pause.run_id, pause.interaction_id, "request",
+                    {SecretField.OTP: "synthetic-otp"},
+                )
+                if case not in ("consume",):
+                    await handle.secret_applier.entered.wait()
+                    handle.secret_applier.release.set()
+                await self.settle(manager, created.run_id)
+                failed = await manager.get_run(created.run_id)
+                record = manager._runs[created.run_id]
+                self.assertEqual(failed.status, RunStatus.FAILED)
+                self.assertEqual((case, failed.error_type, failed.error_message),
+                                 (case, "SecretApplicationError", "Secret application failed safely."))
+                self.assertEqual(failed.error_message, "Secret application failed safely.")
+                rendered = repr(failed)
+                for forbidden in ("synthetic-otp", "otp-target-ref", "RAW-", "SecretReference"):
+                    self.assertNotIn(forbidden, rendered)
+                self.assertIsNone(record.secret_reference)
+                self.assertIsNone(record.secret_targets)
+                self.assertEqual(store.consume_calls, 1)
+                self.assertEqual(len(handle.secret_applier.calls), 0 if case == "consume" else 1)
+                resume_calls = [item for item in session.calls if item[0] == "secret_application"]
+                self.assertEqual(len(resume_calls), 1 if case in ("resume", "invalid_resume") else 0)
+                self.assertEqual(store.discard_run_calls, [created.run_id])
+                self.assertEqual(handle.close_calls, 1)
+
+    async def test_invalid_handle_secret_applier_shapes_are_rejected(self) -> None:
+        session = FakeSession([result(AgentRunStatus.FINISHED, final_result="done")])
+        for applier in (None, object()):
+            handle = FakeHandle(session)
+            handle.secret_applier = applier  # type: ignore[assignment]
+            manager = RunManager(FakeFactory([handle]), secret_store=TransientSecretStore())
+            self.managers.append(manager)
+            created = await manager.create_run("url", "task")
+            await self.settle(manager, created.run_id)
+            failed = await manager.get_run(created.run_id)
+            self.assertEqual(failed.status, RunStatus.FAILED)
+            self.assertEqual(failed.error_type, "TypeError")
+
+    async def test_cancel_at_each_secret_worker_boundary_cleans_metadata(self) -> None:
+        for boundary in ("consume", "apply", "resume"):
+            with self.subTest(boundary=boundary):
+                targets = (SecretFieldTarget(SecretField.OTP, "Code", "otp-ref"),)
+                session = FakeSession([
+                    result(AgentRunStatus.AWAITING_USER, question="OTP",
+                           pause_kind=AgentPauseKind.SECRET,
+                           secret_fields=(SecretField.OTP,), secret_targets=targets),
+                    result(AgentRunStatus.FINISHED, final_result="done"),
+                ])
+                handle = FakeHandle(session)
+                store = ControlledSecretStore()
+                manager = RunManager(FakeFactory([handle]), secret_store=store)
+                self.managers.append(manager)
+                created = await manager.create_run("url", "task")
+                await self.settle(manager, created.run_id)
+                pause = await manager.get_run(created.run_id)
+                if boundary == "consume":
+                    store.consume_release.clear()
+                if boundary == "resume":
+                    session.release.clear()
+                await manager.submit_secret(created.run_id, pause.interaction_id, "secret", {SecretField.OTP: "synthetic-otp"})
+                await store.consume_entered.wait()
+                if boundary in ("apply", "resume"):
+                    await handle.secret_applier.entered.wait()
+                    handle.secret_applier.release.set()
+                if boundary == "resume":
+                    await session.entered.wait()
+                cancelled = await manager.cancel(created.run_id, f"cancel-{boundary}")
+                self.assertEqual(cancelled.status, RunStatus.CANCELLED)
+                record = manager._runs[created.run_id]
+                self.assertIsNone(record.secret_reference)
+                self.assertIsNone(record.secret_targets)
+                self.assertEqual(store.consume_calls, 1)
+                self.assertLessEqual(len(handle.secret_applier.calls), 1)
+                self.assertLessEqual(len([c for c in session.calls if c[0] == "secret_application"]), 1)
+                self.assertEqual(handle.close_calls, 1)
+
+    async def test_full_credentials_then_independent_otp_flow(self) -> None:
+        credentials = (
+            SecretFieldTarget(SecretField.PASSWORD, "Password", "password-ref"),
+            SecretFieldTarget(SecretField.USERNAME, "Email", "username-ref"),
+        )
+        otp = (SecretFieldTarget(SecretField.OTP, "Code", "otp-ref"),)
+        from browser_agent import AgentApplicationEvent, AgentApplicationEventKind
+        session = FakeSession([
+            result(AgentRunStatus.AWAITING_USER, question="Credentials", pause_kind=AgentPauseKind.SECRET,
+                   secret_fields=(SecretField.PASSWORD, SecretField.USERNAME), secret_targets=credentials),
+            AgentRunResult(AgentRunStatus.AWAITING_USER, (), None, question="OTP", pause_kind=AgentPauseKind.SECRET,
+                           secret_fields=(SecretField.OTP,), secret_targets=otp,
+                           application_events=(AgentApplicationEvent(1, AgentApplicationEventKind.SECRET_APPLIED,
+                                                                    (SecretField.PASSWORD, SecretField.USERNAME)),)),
+            AgentRunResult(AgentRunStatus.FINISHED, (), "done", None,
+                           application_events=(
+                               AgentApplicationEvent(1, AgentApplicationEventKind.SECRET_APPLIED,
+                                                     (SecretField.PASSWORD, SecretField.USERNAME)),
+                               AgentApplicationEvent(2, AgentApplicationEventKind.SECRET_APPLIED, (SecretField.OTP,)),
+                           )),
+        ])
+        handle = FakeHandle(session)
+        store = ControlledSecretStore()
+        manager = RunManager(FakeFactory([handle]), secret_store=store)
+        self.managers.append(manager)
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        first = await manager.get_run(created.run_id)
+        first_id = first.interaction_id
+        await manager.submit_secret(created.run_id, first_id, "credentials", {
+            SecretField.PASSWORD: "synthetic-pass", SecretField.USERNAME: "synthetic-user"})
+        await handle.secret_applier.entered.wait(); handle.secret_applier.release.set()
+        await self.settle(manager, created.run_id)
+        second = await manager.get_run(created.run_id)
+        self.assertNotEqual(first_id, second.interaction_id)
+        self.assertEqual(second.secret_fields, (SecretField.OTP,))
+        self.assertEqual(tuple(item.name for item in second.secret_targets or ()), ("Code",))
+        handle.secret_applier.entered.clear(); handle.secret_applier.release.clear()
+        await manager.submit_secret(created.run_id, second.interaction_id, "otp", {SecretField.OTP: "synthetic-otp"})
+        await handle.secret_applier.entered.wait(); handle.secret_applier.release.set()
+        await self.settle(manager, created.run_id)
+        finished = await manager.get_run(created.run_id)
+        self.assertEqual(finished.status, RunStatus.FINISHED)
+        self.assertIsNone(finished.secret_fields)
+        self.assertIsNone(finished.secret_targets)
+        self.assertEqual(store.consume_calls, 2)
+        self.assertEqual(len(store.consumed_references), 2)
+        self.assertNotEqual(store.consumed_references[0], store.consumed_references[1])
+        self.assertEqual(len(handle.secret_applier.calls), 2)
+        self.assertEqual(len([c for c in session.calls if c[0] == "secret_application"]), 2)
+        self.assertNotIn("ref", repr(finished))
+
+    async def test_close_while_application_blocked_stops_worker_and_closes_store(self) -> None:
+        targets = (SecretFieldTarget(SecretField.OTP, "Code", "otp-ref"),)
+        session = FakeSession([
+            result(AgentRunStatus.AWAITING_USER, question="OTP",
+                   pause_kind=AgentPauseKind.SECRET,
+                   secret_fields=(SecretField.OTP,), secret_targets=targets),
+            result(AgentRunStatus.FINISHED, final_result="done"),
+        ])
+        handle = FakeHandle(session)
+        store = ControlledSecretStore()
+        manager = RunManager(FakeFactory([handle]), secret_store=store)
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        pause = await manager.get_run(created.run_id)
+        await manager.submit_secret(created.run_id, pause.interaction_id, "secret", {SecretField.OTP: "synthetic-otp"})
+        await handle.secret_applier.entered.wait()
+        await manager.close()
+        record = manager._runs[created.run_id]
+        self.assertEqual(record.status, RunStatus.CANCELLED)
+        self.assertIsNone(record.active_task)
+        self.assertIsNone(record.secret_reference)
+        self.assertIsNone(record.secret_targets)
+        self.assertEqual(store.consume_calls, 1)
+        self.assertEqual(len(handle.secret_applier.calls), 1)
+        self.assertEqual(len([c for c in session.calls if c[0] == "secret_application"]), 0)
+        self.assertEqual(handle.close_calls, 1)
+        self.assertEqual(store.close_calls, 1)
+
+    async def test_application_completion_racing_cancel_has_one_valid_terminal_outcome(self) -> None:
+        targets = (SecretFieldTarget(SecretField.OTP, "Code", "otp-ref"),)
+        session = FakeSession([
+            result(AgentRunStatus.AWAITING_USER, question="OTP", pause_kind=AgentPauseKind.SECRET,
+                   secret_fields=(SecretField.OTP,), secret_targets=targets),
+            result(AgentRunStatus.FINISHED, final_result="done"),
+        ])
+        handle = FakeHandle(session)
+        manager = RunManager(FakeFactory([handle]), secret_store=ControlledSecretStore())
+        self.managers.append(manager)
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        pause = await manager.get_run(created.run_id)
+        await manager.submit_secret(created.run_id, pause.interaction_id, "secret", {SecretField.OTP: "synthetic-otp"})
+        await handle.secret_applier.entered.wait()
+        handle.secret_applier.release.set()
+        cancel_result = await manager.cancel(created.run_id, "cancel")
+        terminal = await manager.get_run(created.run_id)
+        self.assertIn(terminal.status, (RunStatus.CANCELLED, RunStatus.FINISHED))
+        self.assertIn(cancel_result.status, (RunStatus.CANCELLED, RunStatus.FINISHED))
+        record = manager._runs[created.run_id]
+        self.assertIsNone(record.secret_reference)
+        self.assertIsNone(record.secret_targets)
+        self.assertEqual(len(handle.secret_applier.calls), 1)
+        self.assertLessEqual(len([c for c in session.calls if c[0] == "secret_application"]), 1)
 
 
 if __name__ == "__main__":

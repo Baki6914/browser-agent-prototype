@@ -8,16 +8,16 @@ local HTTP model, then one defensive copy feeds exact HMAC fingerprinting and
 remains on the record; public state carries categories only. Keyed HMAC avoids
 an offline-testable unkeyed digest for low-entropy passwords and OTPs.
 
-Accepted submissions stop at `AWAITING_SECRET_APPLICATION`. Terminal,
+Accepted submissions publish `AWAITING_SECRET_APPLICATION` before a worker
+consumes, fills, and resumes. Terminal,
 failure, cancellation, and shutdown discard run-owned store records; shutdown
 attempts every run cleanup and store closure even after failures, reports a
 sticky fixed safe result, and zeroizes the mutable key. Arbitrary store
 exceptions are not exposed or chained. Python immutable strings and
 temporary UTF-8 copies cannot be reliably zeroized, and no such claim is made.
 
-Milestone 9C is still required for browser filling, consumption, and resume.
-There is no persistence, authentication, OTP detection, NVIDIA, MCP,
-Playwright, or browser use, and Milestone 9 is not complete.
+There is no persistence, authentication, automatic OTP detection,
+login-success detection, or restart resume, and Milestone 9 is not complete.
 
 Milestone 9A provides a dependency-free, process-local `TransientSecretStore`
 foundation for future secure-login work. It is strictly isolated from HTTP
@@ -56,6 +56,11 @@ There is no background cleanup task. Consequently, an expired unused record
 may remain in process memory until a later access, discard, run cleanup, or
 close detaches and zeroizes it.
 
-The design adds no dependencies and no logging, serialization, model-context,
-run-history, HTTP, NVIDIA, MCP, Playwright, or browser integration. Secure
+The store itself adds no dependencies or logging. M9C integrates it with the
+HTTP submission, handle-bound MCP form fill, and safe session-resume path, but
+production composition and live MCP compatibility remain unproven. Secure
 login is not complete.
+
+## Milestone 9C application boundary
+
+Accepted secrets are consumed once from the transient store and passed briefly to the handle-bound form applier. Application-owned dictionaries and lists are cleared in `finally` blocks, but Python strings, executor or transport copies, interpreter/OS memory, MCP server copies, and browser/page state cannot be claimed as zeroized. MCP observations and dependency failures are sanitized, while safe application events record categories only. A later OTP pause is independent. There is no persistence, authentication, automatic form submission, or login-success guarantee. A live MCP compatibility smoke remains required before Milestone 9 closure.

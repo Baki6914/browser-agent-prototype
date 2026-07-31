@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+import sys
 import unittest
 
 import httpx
 from pydantic import ValidationError
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from browser_agent import (
     CancelRunRequest,
@@ -20,6 +24,7 @@ from browser_agent import (
     RunSnapshot,
     RunStatus,
     SecretField,
+    SecretTargetSummary,
     create_http_app,
 )
 from browser_agent.http_api import (
@@ -92,6 +97,7 @@ def snapshot(
     error_type: str | None = None,
     error_message: str | None = None,
     secret_fields: tuple[SecretField, ...] | None = None,
+    secret_targets: tuple[SecretTargetSummary, ...] | None = None,
 ) -> RunSnapshot:
     return RunSnapshot(
         run_id="run-1",
@@ -106,6 +112,7 @@ def snapshot(
         error_type=error_type,
         error_message=error_message,
         secret_fields=secret_fields,
+        secret_targets=secret_targets,
     )
 
 
@@ -160,7 +167,6 @@ class FakeRunManager:
 
     async def close(self) -> None:
         self.close_count += 1
-        await asyncio.sleep(0)
         self.close_completed = True
 
 
@@ -507,6 +513,15 @@ class ErrorMappingTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_secret_target_summary_json_contains_no_ref(self) -> None:
+        response = snapshot_to_http_response(snapshot(
+            status=RunStatus.AWAITING_SECRET,
+            secret_fields=(SecretField.PASSWORD,),
+            secret_targets=(SecretTargetSummary(SecretField.PASSWORD, "Password"),),
+        ))
+        rendered = response.model_dump(mode="json")
+        self.assertEqual(rendered["secret_targets"], [{"field": "password", "name": "Password"}])
+        self.assertNotIn("ref", str(rendered))
     def test_pause_finished_and_failed_fields(self) -> None:
         pause = snapshot_to_http_response(
             snapshot(
@@ -557,6 +572,7 @@ class SnapshotTests(unittest.TestCase):
                 "final_result",
                 "error",
                 "secret_fields",
+                "secret_targets",
             },
         )
         self.assertTrue(
@@ -680,6 +696,66 @@ class SecretHttpTests(unittest.TestCase):
         })
         self.assertEqual(response.status_code, 422)
         self.assertNotIn("synthetic-otp", response.text)
+
+    def test_asgi_secret_pause_submission_and_later_completion(self) -> None:
+        targets = (SecretTargetSummary(SecretField.PASSWORD, "Password"),)
+        self.manager.result = snapshot(
+            status=RunStatus.AWAITING_SECRET,
+            question="Enter password",
+            interaction_id="secret-interaction",
+            secret_fields=(SecretField.PASSWORD,),
+            secret_targets=targets,
+        )
+        paused = self.client.get("/runs/run-1")
+        self.assertEqual(paused.status_code, 200)
+        self.assertEqual(paused.json()["secret_fields"], ["password"])
+        self.assertEqual(paused.json()["secret_targets"], [
+            {"field": "password", "name": "Password"}
+        ])
+        self.assertNotIn("ref", paused.text)
+
+        self.manager.result = snapshot(
+            status=RunStatus.AWAITING_SECRET_APPLICATION,
+            secret_fields=(SecretField.PASSWORD,), secret_targets=targets,
+        )
+        submitted = self.client.post("/runs/run-1/responses", json={
+            "type": "secret", "request_id": "secret-request",
+            "interaction_id": "secret-interaction",
+            "values": {"password": "synthetic-password-value"},
+        })
+        self.assertEqual(submitted.status_code, 202)
+        self.assertEqual(submitted.json()["status"], "awaiting_secret_application")
+        self.assertEqual(submitted.json()["secret_targets"], [
+            {"field": "password", "name": "Password"}
+        ])
+        self.assertNotIn("synthetic-password-value", submitted.text)
+
+        self.manager.result = snapshot(
+            status=RunStatus.FINISHED, final_result="done",
+        )
+        finished = self.client.get("/runs/run-1")
+        self.assertEqual(finished.json()["status"], "finished")
+        self.assertIsNone(finished.json()["secret_fields"])
+        self.assertIsNone(finished.json()["secret_targets"])
+
+    def test_asgi_later_application_failure_is_fixed_and_contains_no_metadata(self) -> None:
+        self.manager.result = snapshot(
+            status=RunStatus.FAILED,
+            error_type="SecretApplicationError",
+            error_message="Secret application failed safely.",
+        )
+        response = self.client.get("/runs/run-1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["error"], {
+            "type": "SecretApplicationError",
+            "message": "Secret application failed safely.",
+        })
+        for forbidden in (
+            "synthetic-password-value", "dependency detail", "target-ref",
+            "SecretReference", "secret_id", "expires_at", "digest", "HMAC",
+            "MCP payload", "application_events",
+        ):
+            self.assertNotIn(forbidden, response.text)
 
 
 if __name__ == "__main__":
