@@ -32,8 +32,10 @@ The manager knows only `AgentRunResult` and three dependency-free protocols:
 
 - `RunSessionProtocol` starts a task and resumes it with either text or a
   trusted boolean confirmation.
-- `RunSessionHandleProtocol` exposes the session and closes all resources that
-  belong to it.
+- `RunSessionHandleProtocol` exposes the session, secret applier, and one
+  run-specific `RunDownloadStore`. Its `close()` owns browser, MCP, and session
+  cleanup; `RunManager` owns download finalization and removal after accepting
+  the handle.
 - `RunSessionFactoryProtocol` asynchronously constructs one handle for a new
   run.
 
@@ -55,8 +57,11 @@ session execution.
 `RunStatus` is the manager-facing lifecycle enum. It includes queued, running,
 the two distinct pause states, finished, failed, cancelled, step-limit, and
 decision-source-exhausted states. It does not replace `AgentRunStatus`.
-`RunSnapshot` is a frozen copy of the externally visible state. It never
-contains a session, handle, task, lock, mutable record, or idempotency map.
+`RunSnapshot` is a frozen copy of the externally visible state. Its `files`
+tuple contains only ordered immutable `DownloadMetadata` values.
+`get_download(run_id, file_id)` separately returns a validated `DownloadFile`
+for application use. A snapshot never contains a path, output directory,
+session, handle, task, lock, mutable record, or idempotency map.
 
 Every pause receives a fresh opaque `interaction_id`. The identifier is
 single-use and binds a response to the current pause and its expected
@@ -111,6 +116,14 @@ status. Error snapshots retain only the exception type name and a line-break
 normalized message truncated to 500 characters; exception and traceback
 objects are never retained. Background task exceptions are consumed by the
 task implementation.
+
+A finished run finalizes its store before handle and secret cleanup, removes
+all incoming artifacts, and retains managed completed files for HTTP access.
+Failed, cancelled, step-limit, and decision-source-exhausted runs remove their
+entire store after handle and secret cleanup. Factory/startup failures close a
+discoverable valid store before ownership transfer. Manager shutdown closes
+every remaining store, including finished-run retention, using exhaustive
+best-effort cleanup and the existing fixed safe close error.
 
 Result translation also validates pause ownership. A normal user-input pause
 must not contain pending-confirmation state. A confirmation pause must contain

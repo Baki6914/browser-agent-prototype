@@ -7,6 +7,7 @@ import asyncio
 from dataclasses import FrozenInstanceError, fields
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -17,12 +18,17 @@ from browser_agent import (
     AgentRunResult,
     AgentRunStatus,
     PendingConfirmation,
+    DownloadFile,
+    DownloadMetadata,
+    DownloadNotFoundError,
     RunConflictError,
     RunConstructionError,
     RunIdempotencyConflictError,
     RunManager,
     RunManagerClosedError,
     RunManagerError,
+    RunFileNotFoundError,
+    RunDownloadStore,
     RunNotFoundError,
     RunStatus,
     SecretField,
@@ -112,12 +118,45 @@ class FakeSecretApplier:
         return SecretApplicationResult(tuple(target.field for target in targets))
 
 
+class FakeDownloadStore:
+    def __init__(self) -> None:
+        self.output_directory = Path("/synthetic/incoming")
+        self.items: dict[str, DownloadFile] = {}
+        self.finalize_calls = 0
+        self.close_calls = 0
+        self.close_error: BaseException | None = None
+
+    def record_completed(self, relative_path: str) -> DownloadMetadata:
+        metadata = DownloadMetadata(f"file-{len(self.items)}", relative_path, 1)
+        self.items[metadata.file_id] = DownloadFile(metadata, Path("/synthetic/managed") / metadata.file_id)
+        return metadata
+
+    def list_metadata(self) -> tuple[DownloadMetadata, ...]:
+        return tuple(item.metadata for item in self.items.values())
+
+    def get_file(self, file_id: str) -> DownloadFile:
+        try:
+            return self.items[file_id]
+        except KeyError:
+            raise DownloadNotFoundError("download file not found") from None
+
+    def finalize(self) -> None:
+        self.finalize_calls += 1
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.items.clear()
+        if self.close_error is not None:
+            raise self.close_error
+
+
 class FakeHandle:
     def __init__(
         self, session: FakeSession, close_error: BaseException | None = None
     ) -> None:
         self.session = session
         self.secret_applier = FakeSecretApplier()
+        self.download_store = FakeDownloadStore()
         self.close_error = close_error
         self.close_calls = 0
         self.closed = asyncio.Event()
@@ -336,6 +375,8 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(finished.status, RunStatus.FINISHED)
         self.assertEqual(finished.final_result, "done")
         self.assertEqual(handle.close_calls, 1)
+        self.assertEqual(handle.download_store.finalize_calls, 1)
+        self.assertEqual(handle.download_store.close_calls, 0)
         self.assertLess(created.version, running.version)
         self.assertLess(running.version, finished.version)
 
@@ -402,6 +443,7 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
             await self.settle(manager, created.run_id)
             self.assertEqual((await manager.get_run(created.run_id)).status, run_status)
             self.assertEqual(handle.close_calls, 1)
+            self.assertEqual(handle.download_store.close_calls, 1)
 
     async def test_wrong_type_interaction_and_terminal_resumes_conflict(self) -> None:
         manager, _, _, pause = await self.paused()
@@ -485,6 +527,7 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
         retry = await manager.cancel(created.run_id, "cancel")
         self.assertEqual(retry.version, cancelled.version)
         self.assertEqual(handle.close_calls, 1)
+        self.assertEqual(handle.download_store.close_calls, 1)
         with self.assertRaises(RunConflictError):
             await manager.cancel(created.run_id, "new-cancel")
 
@@ -493,6 +536,75 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(cancelled2.interaction_id)
         self.assertIsNone(cancelled2.question)
         self.assertEqual(handle2.close_calls, 1)
+        self.assertEqual(handle2.download_store.close_calls, 1)
+
+    async def test_snapshot_files_and_download_lookup_are_safe(self) -> None:
+        session = FakeSession([
+            result(AgentRunStatus.AWAITING_USER, question="Question?", pause_kind=AgentPauseKind.USER_INPUT)
+        ])
+        handle = FakeHandle(session)
+        manager = self.manager(FakeFactory([handle]))
+        created = await manager.create_run("url", "task")
+        self.assertEqual(created.files, ())
+        await self.settle(manager, created.run_id)
+        metadata = handle.download_store.record_completed("report.pdf")
+        current = await manager.get_run(created.run_id)
+        self.assertEqual(current.files, (metadata,))
+        self.assertNotIn("synthetic/managed", repr(current))
+        download = await manager.get_download(created.run_id, metadata.file_id)
+        self.assertEqual(download.metadata, metadata)
+        with self.assertRaises(RunFileNotFoundError):
+            await manager.get_download(created.run_id, "unknown")
+        with self.assertRaises(RunNotFoundError):
+            await manager.get_download("unknown", metadata.file_id)
+
+    async def test_finished_files_are_retained_until_manager_close(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = FakeSession([result(AgentRunStatus.FINISHED, final_result="done")])
+            handle = FakeHandle(session)
+            store = RunDownloadStore(Path(directory) / "base")
+            handle.download_store = store  # type: ignore[assignment]
+            (store.output_directory / "report.pdf").write_bytes(b"report")
+            metadata = store.record_completed("report.pdf")
+            managed_path = store.get_file(metadata.file_id).path
+            manager = self.manager(FakeFactory([handle]))
+            created = await manager.create_run("url", "task")
+            await self.settle(manager, created.run_id)
+            self.assertEqual((await manager.get_run(created.run_id)).files, (metadata,))
+            self.assertEqual((await manager.get_download(created.run_id, metadata.file_id)).path, managed_path)
+            self.assertTrue(managed_path.exists())
+            await manager.close()
+            self.assertFalse(managed_path.exists())
+            self.assertEqual((await manager.get_run(created.run_id)).files, ())
+
+    async def test_failed_run_closes_download_store(self) -> None:
+        handle = FakeHandle(FakeSession([RuntimeError("start failed")]))
+        manager = self.manager(FakeFactory([handle]))
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        self.assertEqual((await manager.get_run(created.run_id)).status, RunStatus.FAILED)
+        self.assertEqual(handle.download_store.close_calls, 1)
+
+    async def test_invalid_handle_download_store_is_rejected_and_handle_closed(self) -> None:
+        handle = FakeHandle(FakeSession([result(AgentRunStatus.FINISHED, final_result="done")]))
+        handle.download_store = object()  # type: ignore[assignment]
+        manager = self.manager(FakeFactory([handle]))
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        failed = await manager.get_run(created.run_id)
+        self.assertEqual((failed.status, failed.error_type), (RunStatus.FAILED, "TypeError"))
+        self.assertEqual(handle.close_calls, 1)
+
+    async def test_download_cleanup_failure_uses_safe_failure_semantics(self) -> None:
+        handle = FakeHandle(FakeSession([
+            result(AgentRunStatus.AWAITING_USER, question="Question?", pause_kind=AgentPauseKind.USER_INPUT)
+        ]))
+        handle.download_store.close_error = RuntimeError("PRIVATE-PATH-DETAIL")
+        manager = self.manager(FakeFactory([handle]))
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        with self.assertRaisesRegex(RunManagerError, "run manager close failed safely"):
+            await manager.close()
 
     async def test_queued_cancel_does_not_construct_or_leak(self) -> None:
         factory = FakeFactory([])

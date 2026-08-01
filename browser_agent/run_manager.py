@@ -10,10 +10,18 @@ import struct
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
 from .agent_loop import AgentPauseKind, AgentRunResult, AgentRunStatus
+from .downloads import (
+    DownloadError,
+    DownloadFile,
+    DownloadMetadata,
+    DownloadNotFoundError,
+    RunDownloadStore,
+)
 from .secret_store import (
     SecretField,
     SecretReference,
@@ -70,6 +78,7 @@ class RunSnapshot:
     error_message: str | None
     secret_fields: tuple[SecretField, ...] | None = None
     secret_targets: tuple[SecretTargetSummary, ...] | None = None
+    files: tuple[DownloadMetadata, ...] = ()
 
 
 class RunManagerError(Exception):
@@ -86,6 +95,10 @@ class RunConstructionError(RunManagerError):
 
 class RunNotFoundError(RunManagerError):
     """No run exists for the supplied identifier."""
+
+
+class RunFileNotFoundError(RunManagerError):
+    """No retained file exists for the supplied run and file identifiers."""
 
 
 class RunConflictError(RunManagerError):
@@ -111,6 +124,7 @@ class RunSessionProtocol(Protocol):
 class RunSessionHandleProtocol(Protocol):
     session: RunSessionProtocol
     secret_applier: SecretFormApplierProtocol
+    download_store: RunDownloadStore
 
     async def close(self) -> None: ...
 
@@ -153,6 +167,7 @@ class _RunRecord:
     secret_reference: SecretReference | None = field(default=None, repr=False)
     secret_targets: tuple[SecretFieldTarget, ...] | None = field(default=None, repr=False)
     secret_applier: SecretFormApplierProtocol | None = field(default=None, repr=False)
+    download_store: RunDownloadStore | None = field(default=None, repr=False)
 
 
 def _required_string(value: object, name: str, error: type[RunManagerError]) -> str:
@@ -214,6 +229,24 @@ class RunManager:
         record = await self._find(run_id)
         async with record.lock:
             return self._snapshot(record)
+
+    async def get_download(self, run_id: str, file_id: str) -> DownloadFile:
+        run_id = _required_string(run_id, "run_id", RunManagerError)
+        file_id = _required_string(file_id, "file_id", RunManagerError)
+        record = await self._find(run_id)
+        async with record.lock:
+            store = record.download_store
+            if store is None:
+                raise RunFileNotFoundError("run file not found")
+            try:
+                download = store.get_file(file_id)
+            except DownloadNotFoundError:
+                raise RunFileNotFoundError("run file not found") from None
+            except DownloadError:
+                raise RunManagerError("run file access failed safely") from None
+            if not isinstance(download, DownloadFile):
+                raise RunManagerError("run file access failed safely")
+            return download
 
     async def respond(
         self,
@@ -283,7 +316,10 @@ class RunManager:
             except asyncio.CancelledError:
                 pass
         await self._close_handle(record)
-        await self._cleanup_secrets(record)
+        try:
+            await self._cleanup_secrets(record)
+        finally:
+            await self._close_download_store(record)
         async with record.lock:
             return self._snapshot(record)
 
@@ -463,13 +499,14 @@ class RunManager:
             local_handle = await self._factory.create(
                 record.start_url, record.task
             )
-            session, applier = self._validate_handle(local_handle)
+            session, applier, download_store = self._validate_handle(local_handle)
             async with record.lock:
                 if record.status is RunStatus.CANCELLED:
                     return
                 record.handle = local_handle
                 record.session = session
                 record.secret_applier = applier
+                record.download_store = download_store
                 local_handle = None
             result = await session.start(record.task)
             await self._publish_result(record, result)
@@ -480,6 +517,7 @@ class RunManager:
         finally:
             if local_handle is not None:
                 await self._close_local_handle(record, local_handle)
+                await self._close_local_download_store(record, local_handle)
             await self._clear_current_task(record)
 
     async def _run_resume(
@@ -574,8 +612,20 @@ class RunManager:
             record.error_type = None
             record.error_message = None
         if status in _TERMINAL_STATUSES:
+            if status is RunStatus.FINISHED:
+                try:
+                    if record.download_store is not None:
+                        record.download_store.finalize()
+                except Exception as exc:
+                    await self._record_cleanup_failure(record, exc)
             await self._close_handle(record)
-            await self._cleanup_secrets(record)
+            try:
+                await self._cleanup_secrets(record)
+            finally:
+                async with record.lock:
+                    retain_downloads = record.status is RunStatus.FINISHED
+                if not retain_downloads:
+                    await self._close_download_store(record)
 
     async def _publish_failure(
         self, record: _RunRecord, exc: BaseException
@@ -595,7 +645,10 @@ class RunManager:
             record.error_type = error_type
             record.error_message = error_message
         await self._close_handle(record)
-        await self._cleanup_secrets(record)
+        try:
+            await self._cleanup_secrets(record)
+        finally:
+            await self._close_download_store(record)
 
     async def _close_handle(self, record: _RunRecord) -> bool:
         async with record.lock:
@@ -632,6 +685,30 @@ class RunManager:
             await handle.close()
         except Exception as exc:
             await self._record_cleanup_failure(record, exc)
+
+    async def _close_local_download_store(
+        self, record: _RunRecord, handle: object
+    ) -> None:
+        store = getattr(handle, "download_store", None)
+        if not self._valid_download_store(store):
+            return
+        try:
+            store.close()
+        except Exception as exc:
+            await self._record_cleanup_failure(record, exc)
+
+    async def _close_download_store(self, record: _RunRecord) -> bool:
+        async with record.lock:
+            store = record.download_store
+            record.download_store = None
+        if store is None:
+            return True
+        try:
+            store.close()
+        except Exception as exc:
+            await self._record_cleanup_failure(record, exc)
+            return False
+        return True
 
     async def _record_cleanup_failure(
         self, record: _RunRecord, exc: BaseException
@@ -684,8 +761,12 @@ class RunManager:
                 if not task.cancelled():
                     raise
         handle_cleanup_succeeded = await self._close_handle(record)
-        await self._cleanup_secrets(record)
-        if not handle_cleanup_succeeded:
+        download_cleanup_succeeded = False
+        try:
+            await self._cleanup_secrets(record)
+        finally:
+            download_cleanup_succeeded = await self._close_download_store(record)
+        if not handle_cleanup_succeeded or not download_cleanup_succeeded:
             raise RunManagerError("run cleanup failed safely") from None
 
     async def _cleanup_secrets(self, record: _RunRecord) -> None:
@@ -731,7 +812,7 @@ class RunManager:
     @staticmethod
     def _validate_handle(
         handle: object,
-    ) -> tuple[RunSessionProtocol, SecretFormApplierProtocol]:
+    ) -> tuple[RunSessionProtocol, SecretFormApplierProtocol, RunDownloadStore]:
         if handle is None or not callable(getattr(handle, "close", None)):
             raise TypeError("factory returned an invalid session handle")
         session = getattr(handle, "session", None)
@@ -743,7 +824,23 @@ class RunManager:
         applier = getattr(handle, "secret_applier", None)
         if applier is None or not callable(getattr(applier, "apply", None)):
             raise TypeError("factory handle has an invalid secret applier")
-        return session, applier
+        download_store = getattr(handle, "download_store", None)
+        if not RunManager._valid_download_store(download_store):
+            raise TypeError("factory handle has an invalid download store")
+        return session, applier, download_store
+
+    @staticmethod
+    def _valid_download_store(store: object) -> bool:
+        return (
+            store is not None
+            and isinstance(getattr(store, "output_directory", None), Path)
+            and all(
+                callable(getattr(store, name, None))
+                for name in (
+                    "record_completed", "list_metadata", "get_file", "finalize", "close"
+                )
+            )
+        )
 
     @staticmethod
     def _translate(
@@ -831,6 +928,11 @@ class RunManager:
 
     @staticmethod
     def _snapshot(record: _RunRecord) -> RunSnapshot:
+        files = (
+            record.download_store.list_metadata()
+            if record.download_store is not None
+            else ()
+        )
         return RunSnapshot(
             run_id=record.run_id,
             status=record.status,
@@ -848,6 +950,7 @@ class RunManager:
                 tuple(SecretTargetSummary.from_target(item) for item in record.secret_targets)
                 if record.secret_targets is not None else None
             ),
+            files=files,
         )
 
     @staticmethod

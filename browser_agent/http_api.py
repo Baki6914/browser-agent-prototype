@@ -8,7 +8,7 @@ from typing import Annotated, Literal, TypeAlias
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, StrictStr, field_validator
 
 from .run_manager import (
@@ -18,10 +18,12 @@ from .run_manager import (
     RunManager,
     RunManagerClosedError,
     RunManagerError,
+    RunFileNotFoundError,
     RunNotFoundError,
     RunSnapshot,
     RunStatus,
 )
+from .downloads import DownloadMetadata
 from .secret_store import SecretField
 from .secret_application import SecretTargetSummary
 
@@ -122,6 +124,7 @@ class RunHttpResponse(_StrictHttpModel):
     error: RunHttpSnapshotError | None
     secret_fields: tuple[SecretField, ...] | None
     secret_targets: tuple[SecretTargetSummary, ...] | None
+    files: tuple[DownloadMetadata, ...]
 
 
 class HttpErrorBody(_StrictHttpModel):
@@ -158,6 +161,7 @@ def snapshot_to_http_response(snapshot: RunSnapshot) -> RunHttpResponse:
         error=error,
         secret_fields=snapshot.secret_fields,
         secret_targets=snapshot.secret_targets,
+        files=snapshot.files,
     )
 
 
@@ -174,7 +178,7 @@ def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
 def create_http_app(run_manager: RunManager) -> FastAPI:
     """Create an HTTP application around one externally owned RunManager."""
     required_methods = (
-        "create_run", "get_run", "respond", "confirm", "submit_secret", "cancel", "close"
+        "create_run", "get_run", "get_download", "respond", "confirm", "submit_secret", "cancel", "close"
     )
     if run_manager is None or any(
         not callable(getattr(run_manager, method, None))
@@ -202,6 +206,7 @@ def create_http_app(run_manager: RunManager) -> FastAPI:
     app.add_exception_handler(RequestValidationError, handle_validation_error)
 
     error_mappings = (
+        (RunFileNotFoundError, status.HTTP_404_NOT_FOUND, "run_file_not_found"),
         (RunNotFoundError, status.HTTP_404_NOT_FOUND, "run_not_found"),
         (
             RunIdempotencyConflictError,
@@ -265,6 +270,19 @@ def create_http_app(run_manager: RunManager) -> FastAPI:
     async def get_run(run_id: str) -> RunHttpResponse:
         snapshot = await app.state.run_manager.get_run(run_id)
         return snapshot_to_http_response(snapshot)
+
+    @app.get(
+        "/runs/{run_id}/files/{file_id}",
+        response_class=FileResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def get_download(run_id: str, file_id: str) -> FileResponse:
+        download = await app.state.run_manager.get_download(run_id, file_id)
+        return FileResponse(
+            path=download.path,
+            filename=download.metadata.filename,
+            media_type="application/octet-stream",
+        )
 
     @app.post(
         "/runs/{run_id}/responses",

@@ -35,12 +35,14 @@ responsibilities.
 
 ## Endpoints
 
-The application defines exactly four product endpoints:
+The application defines five product endpoints; the original four lifecycle
+endpoints retain their contracts:
 
 | Method | Path | Success | Manager call |
 | --- | --- | --- | --- |
 | `POST` | `/runs` | `202 Accepted` | `create_run(start_url, task)` |
 | `GET` | `/runs/{run_id}` | `200 OK` | `get_run(run_id)` |
+| `GET` | `/runs/{run_id}/files/{file_id}` | `200 OK` | `get_download(run_id, file_id)` |
 | `POST` | `/runs/{run_id}/responses` | `202 Accepted` | `respond(...)` or `confirm(...)` |
 | `POST` | `/runs/{run_id}/cancel` | `200 OK` | `cancel(run_id, request_id)` |
 
@@ -110,7 +112,12 @@ and whitespace-only required strings are rejected.
   "question": "Which year?",
   "interaction_id": "interaction-1",
   "final_result": null,
-  "error": null
+  "error": null,
+  "secret_fields": null,
+  "secret_targets": null,
+  "files": [
+    {"file_id": "8f4...", "filename": "report.pdf", "size": 1234}
+  ]
 }
 ```
 
@@ -119,6 +126,12 @@ only the sanitized `error_type` and `error_message` already provided by
 `RunManager`; they are represented as `error.type` and `error.message`.
 Internal records, sessions, tasks, locks, request maps, and factories are never
 serialized.
+
+`files` is always an ordered array of safe metadata and never contains a path
+or output directory. A file request returns the exact retained bytes with
+`Content-Type: application/octet-stream` and a normal `Content-Disposition`
+attachment filename derived from the safe metadata filename. The private
+server path is supplied only to `FileResponse`.
 
 ## Errors and validation
 
@@ -136,6 +149,7 @@ Errors use one stable envelope:
 | Exception | HTTP status | Code |
 | --- | --- | --- |
 | `RunNotFoundError` | 404 | `run_not_found` |
+| `RunFileNotFoundError` | 404 | `run_file_not_found` |
 | `RunIdempotencyConflictError` | 409 | `idempotency_conflict` |
 | `RunConflictError` | 409 | `run_conflict` |
 | `RunManagerClosedError` | 503 | `run_manager_closed` |
@@ -167,8 +181,12 @@ work must inject a fully constructed manager.
 The secret response variant is the transient credential and OTP submission
 path. Other response variants must not carry secrets. This milestone provides
 no authentication, authorization,
-CORS, rate limiting, downloads, uploads, files, login, UI, WebSocket, SSE,
+CORS, rate limiting, uploads, login, UI, WebSocket, SSE,
 Docker, or multi-worker support.
+
+Download access is process-local and unauthenticated in this prototype. It has
+no persistence, restart recovery, custom range handling, or real M10B factory
+composition; wiring the per-run output directory to MCP is deferred to M11.
 ## Milestone 9C secret summaries
 
 The existing responses endpoint is unchanged. Secret pauses and the immediate `awaiting_secret_application` response include summaries containing only `field` and `name`; element refs never cross HTTP. Clients poll the existing run GET endpoint for later completion. The application fills fields locally but does not click, press Enter, or submit the form.

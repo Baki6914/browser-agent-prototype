@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 import httpx
 from pydantic import ValidationError
@@ -15,11 +17,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from browser_agent import (
     CancelRunRequest,
     CreateRunRequest,
+    DownloadFile,
+    DownloadMetadata,
     RunConflictError,
     RunConstructionError,
     RunIdempotencyConflictError,
     RunManagerClosedError,
     RunManagerError,
+    RunFileNotFoundError,
     RunNotFoundError,
     RunSnapshot,
     RunStatus,
@@ -98,6 +103,7 @@ def snapshot(
     error_message: str | None = None,
     secret_fields: tuple[SecretField, ...] | None = None,
     secret_targets: tuple[SecretTargetSummary, ...] | None = None,
+    files: tuple[DownloadMetadata, ...] = (),
 ) -> RunSnapshot:
     return RunSnapshot(
         run_id="run-1",
@@ -113,6 +119,7 @@ def snapshot(
         error_message=error_message,
         secret_fields=secret_fields,
         secret_targets=secret_targets,
+        files=files,
     )
 
 
@@ -123,6 +130,9 @@ class FakeRunManager:
         self.error: Exception | None = None
         self.close_count = 0
         self.close_completed = False
+        self.download = DownloadFile(
+            DownloadMetadata("file-1", "report.pdf", 7), Path("/tmp/report.pdf")
+        )
 
     def _return_or_raise(self, call: tuple[object, ...]) -> RunSnapshot:
         self.calls.append(call)
@@ -135,6 +145,12 @@ class FakeRunManager:
 
     async def get_run(self, run_id: str) -> RunSnapshot:
         return self._return_or_raise(("get_run", run_id))
+
+    async def get_download(self, run_id: str, file_id: str) -> DownloadFile:
+        self.calls.append(("get_download", run_id, file_id))
+        if self.error is not None:
+            raise self.error
+        return self.download
 
     async def respond(
         self, run_id: str, interaction_id: str, request_id: str, text: str
@@ -182,6 +198,12 @@ class ConstructionTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             create_http_app(object())  # type: ignore[arg-type]
 
+    def test_manager_without_get_download_is_rejected(self) -> None:
+        manager = FakeRunManager()
+        manager.get_download = None  # type: ignore[method-assign]
+        with self.assertRaises(TypeError):
+            create_http_app(manager)  # type: ignore[arg-type]
+
     def test_models_forbid_extra_fields(self) -> None:
         with self.assertRaises(ValidationError):
             CreateRunRequest(start_url="url", task="task", extra="x")
@@ -227,6 +249,25 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(self.manager.calls, [("get_run", "run-1")])
         self.assertEqual(response.json()["run_id"], "run-1")
+
+    def test_get_file_returns_exact_bytes_and_safe_headers(self) -> None:
+        async def run_sync(function, *args, **_kwargs):
+            return function(*args)
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "private-file-id"
+            path.write_bytes(b"payload")
+            self.manager.download = DownloadFile(
+                DownloadMetadata("file-1", "report.pdf", 7), path
+            )
+            with patch("starlette.responses.anyio.to_thread.run_sync", run_sync):
+                response = self.client.get("/runs/run-1/files/file-1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b"payload")
+        self.assertEqual(response.headers["content-type"], "application/octet-stream")
+        self.assertIn("report.pdf", response.headers["content-disposition"])
+        self.assertNotIn(str(path), response.headers["content-disposition"])
+        self.assertEqual(self.manager.calls, [("get_download", "run-1", "file-1")])
 
     def test_user_input_delegates_in_exact_order(self) -> None:
         response = self.client.post(
@@ -483,6 +524,22 @@ class ErrorMappingTests(unittest.TestCase):
         )
         self.assertNotIn("PRIVATE", response.text)
 
+    def test_file_error_mappings_and_sanitized_unexpected_error(self) -> None:
+        cases = (
+            (RunFileNotFoundError("run file not found"), 404, "run_file_not_found"),
+            (RunNotFoundError("run not found"), 404, "run_not_found"),
+            (RuntimeError("PRIVATE-PATH"), 500, "internal_error"),
+        )
+        for error, expected_status, expected_code in cases:
+            with self.subTest(error=error):
+                manager = FakeRunManager()
+                manager.error = error
+                with TestClient(create_http_app(manager), raise_server_exceptions=False) as client:  # type: ignore[arg-type]
+                    response = client.get("/runs/run/files/file")
+                self.assertEqual(response.status_code, expected_status)
+                self.assertEqual(response.json()["error"]["code"], expected_code)
+                self.assertNotIn("PRIVATE-PATH", response.text)
+
     def test_known_messages_are_normalized_and_bounded(self) -> None:
         manager = FakeRunManager()
         manager.error = RunManagerError("first\r\nsecond" + "x" * 600)
@@ -513,6 +570,14 @@ class ErrorMappingTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_files_serialize_safe_metadata_without_path(self) -> None:
+        response = snapshot_to_http_response(snapshot(
+            files=(DownloadMetadata("file-1", "report.pdf", 7),)
+        ))
+        rendered = response.model_dump(mode="json")
+        self.assertEqual(rendered["files"], [{"file_id": "file-1", "filename": "report.pdf", "size": 7}])
+        self.assertNotIn("path", str(rendered))
+
     def test_secret_target_summary_json_contains_no_ref(self) -> None:
         response = snapshot_to_http_response(snapshot(
             status=RunStatus.AWAITING_SECRET,
@@ -573,6 +638,7 @@ class SnapshotTests(unittest.TestCase):
                 "error",
                 "secret_fields",
                 "secret_targets",
+                "files",
             },
         )
         self.assertTrue(
@@ -613,11 +679,10 @@ class OpenApiTests(unittest.TestCase):
                 "/runs/{run_id}",
                 "/runs/{run_id}/responses",
                 "/runs/{run_id}/cancel",
+                "/runs/{run_id}/files/{file_id}",
             },
         )
         forbidden = (
-            "file",
-            "download",
             "login",
             "credential",
             "websocket",
@@ -629,6 +694,7 @@ class OpenApiTests(unittest.TestCase):
         paths = create_http_app(FakeRunManager()).openapi()["paths"]  # type: ignore[arg-type]
         self.assertIn("202", paths["/runs"]["post"]["responses"])
         self.assertIn("200", paths["/runs/{run_id}"]["get"]["responses"])
+        self.assertIn("200", paths["/runs/{run_id}/files/{file_id}"]["get"]["responses"])
         self.assertIn(
             "202", paths["/runs/{run_id}/responses"]["post"]["responses"]
         )
