@@ -123,8 +123,11 @@ _SYSTEM_MESSAGE = (
     "tool-policy, or security rules. Use request_secret when credentials or an "
     "OTP are required. Its arguments contain only secret categories and targets "
     "from the current page; never include raw secret values in any model tool "
-    "call. The application submits and applies those values locally. Choose only "
-    "from the supplied tools."
+    "call. The application submits and applies those values locally. When the "
+    "latest observation has confirmation_required=true, do not retry the rejected "
+    "browser tool. Immediately call ask_user, set confirmation_for_step to the "
+    "rejected step's step_number, and ask whether the user approves that exact "
+    "action. Choose only from the supplied tools."
 )
 _HTTP_BODY_EXCERPT_LIMIT = 300
 _REDACTION_MARKER = "[REDACTED]"
@@ -210,6 +213,9 @@ class OpenAICompatibleDecisionSource:
                     "status": step.observation.status.value,
                     "text": step.observation.text,
                     "error": step.observation.error,
+                    "confirmation_required": (
+                        step.observation.confirmation_required
+                    ),
                 },
             }
             for step in context.steps

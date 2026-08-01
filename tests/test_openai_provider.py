@@ -231,6 +231,7 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
             {
                 "arguments": {"url": "https://example.com"},
                 "observation": {
+                    "confirmation_required": False,
                     "error": None,
                     "source": "mcp",
                     "status": "success",
@@ -276,6 +277,7 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
                         {
                             "arguments": {"url": "https://example.com"},
                             "observation": {
+                                "confirmation_required": False,
                                 "error": None,
                                 "source": "mcp",
                                 "status": "success",
@@ -305,6 +307,70 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
                 separators=(",", ":"),
             ),
         )
+
+    async def test_confirmation_required_step_is_explicit_in_context(self) -> None:
+        context = _context()
+        context = AgentLoopContext(
+            task="Submit the exact form.",
+            tools=context.tools,
+            steps=(
+                AgentStepRecord(
+                    step_number=4,
+                    decision=AgentToolCall(
+                        "browser_fill_form",
+                        {"fields": [{"name": "email", "value": "user@example.com"}]},
+                    ),
+                    observation=AgentStepObservation(
+                        tool_name="browser_fill_form",
+                        source=AgentToolSource.MCP,
+                        status=AgentStepStatus.REJECTED,
+                        text="Exact rejected observation",
+                        error="ToolConfirmationRequiredError: approval required",
+                        confirmation_required=True,
+                    ),
+                ),
+            ),
+        )
+
+        result, request = await self._request(
+            httpx.Response(200, json=_payload()), context=context
+        )
+
+        body = json.loads(request.content)
+        previous_step = json.loads(body["messages"][1]["content"])[
+            "previous_steps"
+        ][0]
+        self.assertEqual(
+            previous_step,
+            {
+                "arguments": {
+                    "fields": [
+                        {"name": "email", "value": "user@example.com"}
+                    ]
+                },
+                "observation": {
+                    "confirmation_required": True,
+                    "error": "ToolConfirmationRequiredError: approval required",
+                    "source": "mcp",
+                    "status": "rejected",
+                    "text": "Exact rejected observation",
+                },
+                "step_number": 4,
+                "tool_name": "browser_fill_form",
+            },
+        )
+        system_message = body["messages"][0]["content"]
+        for guidance in (
+            "confirmation_required=true",
+            "do not retry",
+            "Immediately call ask_user",
+            "confirmation_for_step",
+            "rejected step's step_number",
+            "approves that exact action",
+        ):
+            with self.subTest(guidance=guidance):
+                self.assertIn(guidance, system_message)
+        self.assertEqual(result, AgentToolCall("browser_snapshot", {}))
 
     async def test_valid_tool_call_returns_agent_tool_call(self) -> None:
         result, _ = await self._request(

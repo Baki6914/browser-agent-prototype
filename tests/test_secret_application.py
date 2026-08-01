@@ -72,6 +72,7 @@ class TargetTests(unittest.TestCase):
         first = SecretFieldTarget(SecretField.PASSWORD, "Password", "synthetic-ref")
         second = SecretFieldTarget(SecretField.PASSWORD, "Password", "other-ref")
         self.assertNotEqual(first, second)
+        self.assertEqual(first.ref, "synthetic-ref")
         self.assertNotIn("synthetic-ref", repr(first))
         with self.assertRaises(FrozenInstanceError):
             first.name = "changed"  # type: ignore[misc]
@@ -136,13 +137,31 @@ class ApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, SecretApplicationResult((SecretField.PASSWORD, SecretField.USERNAME)))
         self.assertEqual(result.message, "Requested secret fields were applied by the application.")
         self.assertEqual(executor.calls, [("browser_fill_form", {"fields": [
-            {"name": "Password", "type": "textbox", "ref": "p-ref", "value": "synthetic-pass"},
-            {"name": "Email", "type": "textbox", "ref": "u-ref", "value": "synthetic-user"},
+            {"name": "Password", "type": "textbox", "target": "p-ref", "value": "synthetic-pass"},
+            {"name": "Email", "type": "textbox", "target": "u-ref", "value": "synthetic-user"},
         ]}, True)])
+        for field in executor.calls[0][1]["fields"]:
+            self.assertEqual(set(field), {"target", "name", "type", "value"})
+            self.assertNotIn("ref", field)
         self.assertEqual(executor.local_arguments, {})
         self.assertEqual(self.values[SecretField.PASSWORD], "synthetic-pass")
         self.assertNotIn("synthetic-pass", repr(result))
         self.assertNotIn("p-ref", repr(result))
+
+    async def test_internal_ref_maps_to_external_target_without_mutation(self):
+        target = SecretFieldTarget(
+            SecretField.PASSWORD, "Password", "synthetic-ref"
+        )
+        executor = FakeExecutor()
+
+        await SecretFormApplier(executor, [definition()]).apply(
+            (target,), {SecretField.PASSWORD: "synthetic-pass"}
+        )
+
+        outbound_field = executor.calls[0][1]["fields"][0]
+        self.assertEqual(outbound_field["target"], "synthetic-ref")
+        self.assertNotIn("ref", outbound_field)
+        self.assertEqual(target.ref, "synthetic-ref")
 
     async def test_strict_validation(self):
         applier = SecretFormApplier(FakeExecutor(), [definition()])

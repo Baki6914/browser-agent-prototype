@@ -142,7 +142,7 @@ class SecretFormApplier:
                 fields_payload.append({
                     "name": target.name,
                     "type": "textbox",
-                    "ref": target.ref,
+                    "target": target.ref,
                     "value": values[target.field],
                 })
             arguments["fields"] = fields_payload
