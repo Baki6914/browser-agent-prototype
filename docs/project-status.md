@@ -4,12 +4,13 @@
 
 - **Active branch:** `mvp/playwright-mcp-agent`
 - **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current completed milestone:** Milestone 9, Secure Login and Secret
-  Handling
+- **Current completed milestone:** Milestone 10, Minimal Controlled Downloads
   - This is the latest milestone whose implementation, review, tests, Learning
     Handoff, human commit, human push, and remote verification are complete.
 - **Latest completed documentation checkpoint:**
-  `f2cb304eaf26e4441dcc31207e637bf6acfa3237`
+  `11fcf02a2e06cd5a4f78fa94bb226a17ca9cce87`. This is the latest completed
+  and remotely verified documentation checkpoint before the current
+  uncommitted Milestone 10 closure edit; no SHA is assigned to this edit.
 - **Current implementation:** synchronous learning prototype, verified local
   Playwright MCP connectivity, dynamic MCP tool gateway, typed classification
   and policy enforcement, typed `finish` and `ask_user` controls,
@@ -20,12 +21,15 @@
   states, `request_id` idempotency, single-use `interaction_id` validation,
   per-run concurrency, cancellation, terminal and shutdown cleanup, and a
   FastAPI HTTP boundary with strict request validation, a stable HTTP error
-  envelope, and four endpoints: `POST /runs`, `GET /runs/{run_id}`,
-  `POST /runs/{run_id}/responses`, and `POST /runs/{run_id}/cancel`; plus
+  envelope, and five endpoints: `POST /runs`, `GET /runs/{run_id}`,
+  `POST /runs/{run_id}/responses`, `POST /runs/{run_id}/cancel`, and
+  `GET /runs/{run_id}/files/{file_id}`; plus
   app-owned secure secret requests, transient one-time secret storage, and
   handle-bound secret form application outside model-visible and serializable
-  state
-- **Current phase:** PLAN — Milestone 10, Minimal Controlled Downloads
+  state; a run-specific `RunDownloadStore`, `DownloadTrackingExecutor`,
+  path-free download metadata, lifecycle cleanup, and HTTP file delivery
+- **Current phase:** PLAN — Milestone 11, End-to-End NVIDIA Browser-Agent MVP.
+  Milestone 11 implementation has not started.
 
 ## Completed
 
@@ -352,14 +356,15 @@ feature checkpoint was committed and pushed by the human; local and remote
 SHAs were verified equal, and the working tree was clean after each final
 push.
 
-The implemented boundary provides HTTP creation, inspection, response,
-confirmation, and cancellation; in-memory pause and resume while the process
-remains alive; and shutdown cleanup. The following remain not implemented: a
-concrete production composition root that creates the real NVIDIA, MCP,
-Playwright, browser, and session resources for HTTP runs; downloads or file
-delivery; authentication or authorization; persistence or restart resume; and
-production deployment or multi-worker operation. A user therefore cannot
-currently submit an HTTP task and drive a real browser end to end.
+At the Milestone 8 checkpoint, the implemented boundary provided HTTP
+creation, inspection, response, confirmation, and cancellation; in-memory
+pause and resume while the process remained alive; and shutdown cleanup.
+Downloads and file delivery were absent at that historical checkpoint. The
+concrete production composition root, authentication or authorization,
+persistence or restart resume, and production deployment or multi-worker
+operation also remained unimplemented. A user still cannot submit an HTTP task
+and drive a real browser end to end because the composition boundary remains
+unfinished.
 
 ## Milestone 9 completed
 
@@ -407,17 +412,62 @@ Python string copies, production composition, and live Playwright form-fill
 compatibility in the current Colab environment. These are not blockers for the
 current MVP checkpoint.
 
+## Milestone 10 completed
+
+Milestone 10, Minimal Controlled Downloads, is completed through:
+
+- M10A: `22153a419b4d865073bc056e227405eeb3379212` (`test: prove controlled
+  download capability`)
+- M10B: `a5781ee81c088e9e212eddeaee16c4e2d2a25ec7` (`feat: add minimal
+  controlled downloads`)
+
+M10A recorded **SUPPORTED** with Playwright MCP `0.0.78`: local stdio
+initialization and discovery succeeded, no dedicated download tool was found,
+localhost navigation and snapshot ref `e2` succeeded, and trusted-confirmed,
+policy-enforced `browser_click` downloaded `m10-demo-download.txt` through
+`--output-dir <path>`. Its exact 31-byte payload matched, no relevant partial
+remained, cleanup completed, stderr was empty, and exit code was 0. Validation
+recorded 19 focused pytest, 19 direct unittest, and 390 full-suite tests passed.
+
+M10B implements immutable path-free `DownloadMetadata`, private
+`DownloadFile`, run-specific `RunDownloadStore` incoming and managed
+directories, strict rejection of invalid paths, traversal, symlinks,
+directories, missing and partial files, opaque physical IDs, and duplicate
+visible-filename isolation. Exact MCP completion parsing drives
+`DownloadTrackingExecutor` around policy-enforced execution without changing
+the original `ToolObservation`. `RunSnapshot.files`,
+`RunManager.get_download`, success retention until shutdown, unsuccessful-run
+cleanup, `RunManager.close` cleanup, and
+`GET /runs/{run_id}/files/{file_id}` with `application/octet-stream`,
+`run_file_not_found`, and no private path exposure complete the boundary.
+Focused validation recorded 19 download, 56 `RunManager`, and 36 HTTP API tests
+passed; the full suite recorded 418 passed. `py_compile` and
+`git diff --check` passed for both checkpoints. Both commits were created and
+pushed by the human; local and remote SHAs were verified equal and the tree was
+clean.
+
+M10 supplies a typed and tested download application boundary. M11 owns the
+real factory and composition root, which does not yet wire NVIDIA, MCP,
+Playwright, browser, `SecretFormApplier`, `RunDownloadStore`, session,
+`RunManager`, and FastAPI; pass `RunDownloadStore.output_directory` through
+MCP `--output-dir`; or wrap the real per-run `PolicyEnforcedToolExecutor` with
+`DownloadTrackingExecutor`. No HTTP-submitted NVIDIA/browser/download/file-
+retrieval end-to-end run has been demonstrated.
+
+Explicit limitations remain: no persistence, restart recovery, database-backed
+sessions or persistent file catalog, production authentication or
+authorization, multi-worker coordination, upload, antivirus, checksums,
+quotas, file-type inspection, or broad external-site download compatibility
+proof. Path validation alone is not production security.
+
 ## In progress
 
-- Planning for Milestone 10, Minimal Controlled Downloads, beginning with a
-  narrow Playwright MCP download-capability spike before implementation.
+- Planning Milestone 11, End-to-End NVIDIA Browser-Agent MVP. Implementation
+  has not started.
 
 ## Not started
 
-- Controlled automatic file download; its Playwright MCP mechanism has not
-  yet been proven.
 - A timeout system.
-- The Milestone 11 end-to-end NVIDIA browser-agent MVP.
 - Milestone 12 installation, HTTP API, usage, and adaptation documentation.
 
 ## Known constraints
@@ -482,9 +532,10 @@ current MVP checkpoint.
   confidential-data suitability, or production readiness.
 - Allowed origins are a defensive configuration, not a complete security
   boundary. Local MCP transport does not make target web content trusted.
-- Automatic download is required future MVP work, but safe capture, destination
-  handling, and cleanup have not yet been proven. Milestone 10 begins with a
-  Playwright MCP download-capability spike.
+- The `--output-dir` mechanism and typed download boundary are proven, but
+  broad external-site compatibility and real product composition are not.
+- Downloads have no antivirus scanning, checksums, quotas, or file-type
+  inspection. Path validation alone is not production security.
 - File upload remains optional future work, disabled and denied by default.
 - FastAPI is the implemented HTTP boundary, but the concrete production
   composition that wires real NVIDIA, MCP, Playwright, browser, and session
@@ -504,15 +555,10 @@ current MVP checkpoint.
 
 ## Immediate next step
 
-Begin Milestone 10, Minimal Controlled Downloads, with a narrow Playwright MCP
-download-capability spike before implementation. The MVP scope is limited to
-an agent-triggered website download saved under one configured allowed base
-directory; metadata containing file ID, safe filename, and size; delivery
-through the existing HTTP API; cleanup of failed or partial downloads; and
-safe duplicate-filename handling. Upload, a database or persistent file
-catalog, an antivirus platform, distributed locking, and checksum
-infrastructure remain out of scope unless a checksum is technically required
-by the minimal spike.
+Plan Milestone 11, End-to-End NVIDIA Browser-Agent MVP, without beginning
+implementation. Define the real factory and composition wiring needed for an
+HTTP-submitted NVIDIA/browser/download/file-retrieval run while preserving
+policy enforcement, secret isolation, and lifecycle cleanup.
 
 ## Last verified checkpoint
 
@@ -741,8 +787,9 @@ Milestone 7, MVP Evaluation, is completed.
 
 The documentation-only roadmap correction checkpoint is complete and remotely
 verified. After that checkpoint, Milestone 8 was implemented and completed.
-Milestone 9 is now technically complete, and the repository is planning
-Milestone 10, Minimal Controlled Downloads.
+Milestone 10 is now complete, and the repository is planning Milestone 11,
+End-to-End NVIDIA Browser-Agent MVP. Milestone 11 implementation has not
+started.
 The authoritative Milestones 8–12 sequence is in
 [`ROADMAP.md`](../ROADMAP.md):
 
@@ -752,9 +799,10 @@ The authoritative Milestones 8–12 sequence is in
   resume.
 - Milestone 9: completed secure secret interaction and form application without
   exposing raw secrets to provider/model context or serializable run history.
-- Milestone 10: minimal controlled downloads, beginning with a narrow
-  Playwright MCP capability spike; download behavior is not yet proven.
-- Milestone 11: end-to-end NVIDIA browser-agent MVP.
+- Milestone 10: completed minimal controlled downloads with proven
+  `--output-dir` capability and a typed, tested application boundary.
+- Milestone 11: end-to-end NVIDIA browser-agent MVP, currently in PLAN with
+  implementation not started.
 - Milestone 12: installation, HTTP API, usage, and provider-adaptation
   documentation.
 

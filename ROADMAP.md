@@ -31,21 +31,29 @@ The implemented learning prototype:
 - discovers the available MCP tools at runtime;
 - exposes an approved subset of those tools to the agent;
 - classifies and checks tools before execution;
-- supports agent-control tools such as `finish` and `ask_user`;
+- supports application-owned `finish`, `ask_user`, and `request_secret`
+  controls;
 - runs a deterministic tool-call and observation loop;
 - supports an OpenAI-compatible LLM provider behind a replaceable interface;
 - evaluates representative tasks from all three MVP task families; and
 - supports resumable agent sessions and trusted confirmation replay;
 - provides an in-memory `RunManager` with per-run concurrency protection,
   request and interaction idempotency, cancellation, and terminal cleanup;
-- exposes FastAPI HTTP start, inspect, respond, and cancel endpoints; and
+- exposes five FastAPI endpoints: `POST /runs`, `GET /runs/{run_id}`,
+  `POST /runs/{run_id}/responses`, `POST /runs/{run_id}/cancel`, and
+  `GET /runs/{run_id}/files/{file_id}`;
+- keeps raw secrets in transient storage outside model-visible and serializable
+  state and applies them through a handle-bound `SecretFormApplier`;
+- tracks controlled downloads with a run-specific `RunDownloadStore`, a
+  `DownloadTrackingExecutor`, and path-free metadata in `RunSnapshot`;
 - performs lifespan shutdown through `RunManager.close()`;
 - does not expose arbitrary server-side code execution to the LLM.
 
-The complete product MVP is not finished. Milestone 9 secure secret handling
-is implemented, but controlled downloads and a real HTTP composition root that
-constructs and wires NVIDIA, MCP, Playwright, browser, and session resources
-are not implemented. Persistence, service-restart resume, HTTP-service
+The complete product MVP is not finished. Controlled-download metadata and
+HTTP file retrieval are implemented, but the real HTTP composition root that
+constructs and wires NVIDIA, MCP, Playwright, browser, secret application,
+download storage and tracking, session, and run-manager resources is not
+implemented. Persistence, service-restart resume, HTTP-service
 authentication and authorization, production deployment, and multi-worker
 coordination are also not implemented.
 
@@ -275,8 +283,7 @@ through the existing HTTP service.
 
 **Acceptance criteria:**
 
-- Work begins with a narrow Playwright MCP download-capability spike before
-  implementation because the mechanism is not yet proven.
+- A narrow Playwright MCP capability spike proves the download mechanism.
 - The agent triggers a website download.
 - The download is saved under one configured allowed base directory.
 - Generated metadata includes a file ID, safe filename, and size.
@@ -287,6 +294,51 @@ through the existing HTTP service.
 - No database or persistent file catalog, antivirus platform, distributed
   locking, or checksum infrastructure is added unless a checksum is
   technically required by the minimal spike.
+
+**Completion note:** Milestone 10 is completed through two human-created,
+pushed, and remotely verified checkpoints. Local and remote SHAs were equal and
+the working tree was clean after each verification:
+
+- M10A: `22153a419b4d865073bc056e227405eeb3379212` (`test: prove controlled
+  download capability`). With Playwright MCP `0.0.78`, local stdio
+  initialization and dynamic discovery succeeded. No dedicated download tool
+  was discovered. Synthetic localhost navigation produced snapshot ref `e2`,
+  and a policy-enforced `browser_click` with trusted confirmation downloaded
+  `m10-demo-download.txt` through `--output-dir <path>`. The 31-byte payload
+  matched exactly, no relevant partial remained, cleanup completed, stderr was
+  empty, and exit code was 0. Validation recorded 19 focused pytest tests, 19
+  direct unittest tests, and 390 full-suite tests passed, plus passing
+  `py_compile` and `git diff --check`. The capability result was **SUPPORTED**.
+- M10B: `a5781ee81c088e9e212eddeaee16c4e2d2a25ec7` (`feat: add minimal
+  controlled downloads`). Validation recorded 19 download tests, 56
+  `RunManager` tests, 36 HTTP API tests, and 418 full-suite tests passed, plus
+  passing `py_compile` and `git diff --check`.
+
+M10B adds immutable path-free `DownloadMetadata`, private `DownloadFile`, and
+a run-specific `RunDownloadStore` with incoming and managed directories. It
+rejects invalid paths, traversal, symlinks, directories, missing files, and
+partial files; assigns opaque physical file IDs; and isolates duplicate visible
+filenames. Exact MCP completion-message parsing feeds a
+`DownloadTrackingExecutor` around policy-enforced execution while preserving
+the original `ToolObservation`. `RunSnapshot.files`,
+`RunManager.get_download`, successful-run retention until shutdown,
+unsuccessful-run cleanup, and `RunManager.close` cleanup complete the lifecycle.
+`GET /runs/{run_id}/files/{file_id}` serves `application/octet-stream`, returns
+`run_file_not_found` when appropriate, and never exposes private paths.
+
+Milestone 10 provides the typed and tested download application boundary.
+Milestone 11 owns the real factory and composition wiring. Its implementation
+has not started; the current phase is PLAN. In particular, the real factory
+does not yet pass `RunDownloadStore.output_directory` to MCP via `--output-dir`
+or wrap each real `PolicyEnforcedToolExecutor` with
+`DownloadTrackingExecutor`, and no HTTP-submitted NVIDIA/browser/download/file-
+retrieval end-to-end run has been demonstrated.
+
+Explicit limitations remain: no persistence, restart recovery, database-backed
+sessions or persistent file catalog, production authentication or
+authorization, multi-worker coordination, upload, antivirus, checksums,
+quotas, file-type inspection, or broad external-site compatibility proof.
+Path validation alone is not production security.
 
 ### 11. End-to-End NVIDIA Browser-Agent MVP
 

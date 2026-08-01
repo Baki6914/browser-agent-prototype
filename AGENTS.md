@@ -26,7 +26,8 @@ Do not depart from it silently. When proposing an alternative, first explain:
 
 ## Current architecture and development stage
 
-The current code is a synchronous learning prototype.
+The current code is a synchronous learning prototype with a mandatory FastAPI
+HTTP boundary and resumable in-memory runs.
 
 The MVP architecture uses Microsoft's open-source Playwright MCP as a local
 process on the same computer:
@@ -38,74 +39,59 @@ process on the same computer:
   are exposed to the LLM.
 - The orchestrator validates policy before executing a selected tool and feeds
   the result back to the LLM.
-- Application-owned agent-control tools include `finish` and `ask_user`.
+- Application-owned agent-control tools are `finish`, `ask_user`, and
+  `request_secret`.
 - The active reference provider is NVIDIA's OpenAI-compatible API. Base URL,
   model, API key, and timeout remain configurable so another approved
   OpenAI-compatible endpoint can be used without redesigning the agent loop.
 - The custom agent loop remains the selected MVP orchestration approach.
-- The planned product interface is a mandatory FastAPI HTTP service backed by
-  an in-memory `RunManager`; neither is implemented yet.
-- Runs may pause across HTTP requests while the service remains running. No
-  persistent session, database-backed session, or service-restart resume is
-  planned for the MVP.
+- Resumable in-memory agent sessions support trusted confirmation replay.
+- The mandatory FastAPI HTTP service is backed by an in-memory `RunManager`.
+  It exposes `POST /runs`, `GET /runs/{run_id}`,
+  `POST /runs/{run_id}/responses`, `POST /runs/{run_id}/cancel`, and
+  `GET /runs/{run_id}/files/{file_id}`.
+- Transient secret storage and handle-bound `SecretFormApplier` execution keep
+  raw secrets outside model-visible and serializable state.
+- A run-specific `RunDownloadStore`, `DownloadTrackingExecutor`, path-free
+  `DownloadMetadata` in `RunSnapshot`, and HTTP file retrieval provide the
+  typed controlled-download application boundary.
 - `browser_run_code_unsafe`, or any equivalent arbitrary host or server-side
   code execution capability, must never be exposed to the LLM.
 - `browser_evaluate` is not exposed by default. It may be enabled only for a
   narrowly justified page-context task through an explicitly approved policy.
-- Controlled automatic file download is required future MVP work. Its technical
-  mechanism is not yet proven and must begin with a Playwright MCP capability
-  spike.
 - File upload is optional future work. `browser_file_upload` remains denied by
   default unless a separately approved milestone changes it.
 
-Milestone 1 is completed. Milestone 2, Dynamic MCP Tool Gateway, is completed.
-Milestone 3, Tool Classification and Policy Layer, is completed. Milestone 4,
-Agent Control Tools, is completed. Milestone 5, Deterministic MCP-backed Mock
-Agent Loop, is completed. Milestone 6, OpenAI-Compatible LLM Provider, is
-completed. Milestone 7 technical implementation, review, 217 passing tests,
-Learning Handoff, live verification, human feature commit, human push, and
-remote feature-checkpoint verification are complete. Milestone 7, MVP
-Evaluation, is completed. Its verified feature checkpoint is
-`d2e2716f646d3aaaff6eab1624a91609a3688b00` (`feat: add MVP evaluation
-framework`). Milestone 7 adds provider-neutral evaluation types and
-deterministic `PASS`, `FAIL`, and `ERROR` scoring, with `ERROR` taking
-exit-code precedence over `FAIL`; exactly three public-data scenarios using
-`https://example.com`; sanitized JSON reports; an import-safe executable
-runner; and one fresh MCP/browser session per scenario with internal-only
-`browser_close` cleanup. The scenarios cover title extraction, read-only link
-extraction, and the policy-enforced confirmation boundary.
+Milestones 1 through 10 are completed. Milestone 10 was completed through M10A
+`22153a419b4d865073bc056e227405eeb3379212` (`test: prove controlled
+download capability`) and M10B
+`a5781ee81c088e9e212eddeaee16c4e2d2a25ec7` (`feat: add minimal controlled
+downloads`); M10B's full suite recorded 418 passed. The current phase is
+PLAN — Milestone 11, End-to-End NVIDIA Browser-Agent MVP. Milestone 11
+implementation has not started.
 
 Provider visibility is not execution authority. `AgentToolRouter`,
 `McpToolPolicy`, `PolicyEnforcedToolExecutor`, `McpToolGateway`, and the local
-agent controls remain the enforcement and execution boundaries. Milestone 7
-offline validation recorded 217 passing tests, passing `py_compile`, and
-passing `git diff --check`. Its first valid live baseline on `2026-07-29`,
-using temporary external model `z-ai/glm-5.2` and only public
-`https://example.com` data, remains documented as 2 PASS / 1 FAIL / 0 ERROR,
-66.67%, exit code 1. The sole failure exposed a stale oracle that expected
-`More information` instead of the fixture's visible `Learn more`; this
-historical baseline was not replaced or rewritten. After correcting the
-declared expectation and relevant task text without prompt tuning, scoring
-relaxation, or acceptance-criteria weakening, a separate live verification
-recorded 3 PASS / 0 FAIL / 0 ERROR, 100.00%, exit code 0, and empty stderr.
-The confirmation scenario observed `browser_click REJECTED` followed by
-`ask_user AWAITING_USER`: the model proposed decisions, no automatic
-confirmation was granted, and the rejected click did not execute.
+agent controls remain the enforcement and execution boundaries. Dynamic
+discovery remains distinct from authorization.
 
-These live results prove only external real-model integration,
-public `example.com` browser use, integration of the existing
-MCP/policy/agent-loop/evaluator boundaries, and safe confirmation-boundary
-behavior in these scenarios. They do not prove offline operation, on-premises
-deployment, confidential or institution-data safety, local vLLM integration,
-broad statistical reliability, or production readiness. The repository is at
-an approved documentation-only roadmap correction checkpoint before Milestone
-8 implementation. Milestone 8 implementation has not started.
+Do not recreate the lost asynchronous `BrowserService` draft unless a
+separately approved plan explicitly requires it.
 
-FastAPI, trusted approval, user-response waiting and resume, secure login, and
-controlled downloads remain future work described in `ROADMAP.md`.
-Dynamic discovery remains distinct from authorization. Do not recreate the
-lost asynchronous `BrowserService` draft unless a separately approved plan
-explicitly requires it.
+The complete real composition boundary is still missing: no real composition
+root or run-session factory yet constructs and wires NVIDIA, MCP, Playwright,
+the browser, `SecretFormApplier`, `RunDownloadStore`, the session,
+`RunManager`, and FastAPI. `RunDownloadStore.output_directory` is not yet
+passed to the real MCP process through `--output-dir`, and the real per-run
+`PolicyEnforcedToolExecutor` is not yet wrapped with
+`DownloadTrackingExecutor`. No HTTP-submitted NVIDIA/browser/download/file-
+retrieval end-to-end run has been demonstrated.
+
+There is no persistence, restart recovery, database-backed session or
+persistent file catalog, production authentication or authorization,
+multi-worker coordination, upload, antivirus scanning, checksums, quotas, or
+file-type inspection. Broad external-site download compatibility is unproven,
+and path validation alone is not production security.
 
 The following are currently out of scope:
 
