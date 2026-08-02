@@ -111,6 +111,7 @@ class FakeMcpSession:
 class Harness:
     def __init__(self):
         self.records: list[RuntimeRecord] = []
+        self.record_created = asyncio.Event()
         self.scripts: list[dict] = []
 
     def queue(self, decisions: list[AgentToolCall], *, download=False, blocking=False):
@@ -121,6 +122,7 @@ class Harness:
         args = parameters.args
         record.output_directory = Path(args[args.index("--output-dir") + 1])
         self.records.append(record)
+        self.record_created.set()
         return _Context((object(), object()), record, "stdio_enter", "stdio_exit")
 
     def client(self, *_streams):
@@ -322,10 +324,9 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_cancellation_and_cleanup(self):
         self.harness.queue([], blocking=True)
         run_id, _ = await self.create()
-        record = self.harness.records[0] if self.harness.records else None
-        if record is None:
-            await self.poll(run_id, "running")
-            record = self.harness.records[0]
+        if not self.harness.records:
+            await asyncio.wait_for(self.harness.record_created.wait(), 1)
+        record = self.harness.records[0]
         await asyncio.wait_for(record.decision_started.wait(), 1)
         root = record.output_directory.parent
         response = await self.client.post(f"/runs/{run_id}/cancel", json={"request_id": "cancel-1"})

@@ -63,6 +63,20 @@ def _safe_basename(value: object) -> str:
     return value
 
 
+def _completed_download_basename(value: object) -> str:
+    """Return the safe final filename from an untrusted MCP path claim."""
+    if (
+        type(value) is not str
+        or not value
+        or "\x00" in value
+        or "\\" in value
+        or value.endswith("/")
+        or bool(PureWindowsPath(value).drive)
+    ):
+        raise DownloadValidationError("filename must be a safe plain basename")
+    return _safe_basename(value.rsplit("/", 1)[-1])
+
+
 @dataclass(frozen=True)
 class DownloadMetadata:
     file_id: str
@@ -241,7 +255,7 @@ def extract_completed_download_paths(observation_text: str) -> tuple[str, ...]:
         if match is None:
             raise DownloadTrackingError("completed download message is invalid")
         try:
-            path = _safe_basename(match.group(1))
+            path = _completed_download_basename(match.group(1))
         except DownloadValidationError:
             raise DownloadTrackingError("completed download message is invalid") from None
         if path not in seen:

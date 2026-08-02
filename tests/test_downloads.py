@@ -23,6 +23,7 @@ from browser_agent import (
     ToolObservation,
     extract_completed_download_paths,
 )
+from browser_agent.downloads import _completed_download_basename
 
 
 class StoreTests(unittest.TestCase):
@@ -134,12 +135,34 @@ class StoreTests(unittest.TestCase):
 
 
 class ParserTests(unittest.TestCase):
-    def test_exact_completed_lines_are_ordered_and_deduplicated(self) -> None:
+    def test_completed_download_basename_rejects_non_string(self) -> None:
+        with self.assertRaises(DownloadValidationError):
+            _completed_download_basename(None)
+
+    def test_plain_basename_completed_lines_are_ordered_and_deduplicated(self) -> None:
         first = '- Downloaded file report.pdf to "report.pdf"'
         second = '- Downloaded file data.csv to "data.csv"'
         self.assertEqual(
             extract_completed_download_paths(f"{first}\n{second}\n{first}"),
             ("report.pdf", "data.csv"),
+        )
+
+    def test_real_mcp_path_returns_only_final_basename(self) -> None:
+        text = (
+            '- Downloaded file m11c-report.txt to '
+            '"some/run/scoped/path/incoming/m11c-report.txt"'
+        )
+        self.assertEqual(
+            extract_completed_download_paths(text),
+            ("m11c-report.txt",),
+        )
+
+    def test_paths_resolving_to_same_basename_are_deduplicated(self) -> None:
+        first = '- Downloaded file report.pdf to "first/incoming/report.pdf"'
+        second = '- Downloaded file report.pdf to "second/incoming/report.pdf"'
+        self.assertEqual(
+            extract_completed_download_paths(f"{first}\n{second}"),
+            ("report.pdf",),
         )
 
     def test_non_completion_output_is_ignored(self) -> None:
@@ -153,9 +176,26 @@ class ParserTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(extract_completed_download_paths(text), ())
 
-    def test_invalid_claimed_completion_path_raises(self) -> None:
-        with self.assertRaises(DownloadTrackingError):
-            extract_completed_download_paths('- Downloaded file x to "../x"')
+    def test_invalid_claimed_completion_paths_raise_safe_error(self) -> None:
+        invalid_values = (
+            "",
+            "path/",
+            ".",
+            "..",
+            "path/.",
+            "path/..",
+            "path/nu\x00l",
+            r"path\file.txt",
+            "C:/path/file.txt",
+            r"\\server\share\file.txt",
+        )
+        for value in invalid_values:
+            text = f'- Downloaded file x to "{value}"'
+            with self.subTest(value=value), self.assertRaisesRegex(
+                DownloadTrackingError,
+                "^completed download message is invalid$",
+            ):
+                extract_completed_download_paths(text)
 
 
 class FakeExecutor:
@@ -191,6 +231,49 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(returned, observation)
         self.assertEqual(executor.calls, [("invoke", "browser_click", arguments, True)])
         self.assertEqual(self.store.list_metadata()[0].filename, "report.pdf")
+
+    async def test_reported_prefix_is_not_used_for_filesystem_access(self) -> None:
+        external = Path(self.temp.name) / "claimed" / "incoming" / "report.pdf"
+        external.parent.mkdir(parents=True)
+        external.write_bytes(b"external")
+        observation = ToolObservation(
+            "browser_click",
+            "success",
+            f'- Downloaded file report.pdf to "{external.as_posix()}"',
+            None,
+            None,
+        )
+        wrapper = DownloadTrackingExecutor(FakeExecutor(observation), self.store)
+
+        with self.assertRaisesRegex(
+            DownloadTrackingError,
+            "^completed download tracking failed safely$",
+        ):
+            await wrapper.invoke("browser_click", {})
+
+        self.assertEqual(external.read_bytes(), b"external")
+        self.assertEqual(self.store.list_metadata(), ())
+
+    async def test_real_mcp_path_tracks_run_scoped_incoming_basename(self) -> None:
+        incoming = self.store.output_directory / "report.pdf"
+        incoming.write_bytes(b"run-scoped")
+        observation = ToolObservation(
+            "browser_click",
+            "success",
+            '- Downloaded file report.pdf to "untrusted/prefix/incoming/report.pdf"',
+            None,
+            None,
+        )
+        wrapper = DownloadTrackingExecutor(FakeExecutor(observation), self.store)
+
+        await wrapper.invoke("browser_click", {})
+
+        metadata = self.store.list_metadata()[0]
+        self.assertEqual((metadata.filename, metadata.size), ("report.pdf", 10))
+        self.assertEqual(
+            self.store.get_file(metadata.file_id).path.read_bytes(),
+            b"run-scoped",
+        )
 
     async def test_success_without_completion_does_not_track(self) -> None:
         observation = ToolObservation("browser_snapshot", "success", "plain", None, None)

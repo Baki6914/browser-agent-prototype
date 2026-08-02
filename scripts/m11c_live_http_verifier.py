@@ -7,10 +7,10 @@ in parent mode or by the explicitly selected private worker mode.
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import subprocess
@@ -22,7 +22,6 @@ from dataclasses import dataclass
 from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from collections.abc import Sequence as SequenceABC
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -31,18 +30,11 @@ DOWNLOAD_FILENAME = "m11c-report.txt"
 DOWNLOAD_BYTES = b"M11C synthetic public report\n"
 SUCCESS_FIELDS = (
     "M11C_RESULT",
-    "HTTP_BOUNDARY",
-    "NVIDIA_PROVIDER",
-    "MCP_STDIO",
-    "POLICY_CONTROLS",
-    "USER_RESUME",
-    "TRUSTED_CONFIRMATION",
-    "SECRET_APPLICATION",
-    "SECRET_DISCLOSURE_SCAN",
-    "DOWNLOAD_METADATA",
-    "DOWNLOAD_BYTES",
+    "REAL_PROVIDER_SMOKE",
+    "DETERMINISTIC_EXECUTION",
     "CANCELLATION",
     "CLEANUP",
+    "DISCLOSURE_SCAN",
 )
 KNOWN_STATUSES = frozenset(
     {
@@ -57,9 +49,6 @@ TERMINAL_STATUSES = frozenset(
 )
 PROHIBITED_TOOLS = frozenset(
     {"browser_close", "browser_file_upload", "browser_evaluate", "browser_run_code_unsafe"}
-)
-EXPECTED_CONFIRMATION_TOOLS = frozenset(
-    {"browser_fill_form", "browser_select_option", "browser_click"}
 )
 PROVIDER_ENVIRONMENT_KEYS = (
     "BROWSER_AGENT_LLM_BASE_URL",
@@ -121,90 +110,105 @@ class DecisionRecord:
     arguments: Mapping[str, Any]
 
 
-class ConfirmationActionTracker:
-    """Resolve confirmation references and enforce the one approved action sequence."""
+SMOKE_TASK = (
+    "Observe the current synthetic page once with browser_snapshot, then call "
+    "finish with the exact public result 'provider smoke complete'. Do nothing else."
+)
+DETERMINISTIC_TASK = "M11C deterministic full execution"
+CANCELLATION_TASK = "M11C deterministic cancellation"
+PUBLIC_RESULT = "deterministic workflow complete"
 
-    def __init__(self) -> None:
-        self._confirmed_steps: set[int] = set()
-        self._next_action = 0
 
-    def resolve(self, decisions: Sequence[DecisionRecord], snapshot_step_count: object) -> DecisionRecord:
-        if not decisions or decisions[-1].tool_name != "ask_user":
-            raise VerificationFailure(FailureCategory.INTERACTION)
-        if type(snapshot_step_count) is not int or snapshot_step_count <= 0:
-            raise VerificationFailure(FailureCategory.INTERACTION)
-        steps = [decision.step for decision in decisions]
-        if any(type(step) is not int or step <= 0 for step in steps) or len(steps) != len(set(steps)):
-            raise VerificationFailure(FailureCategory.INTERACTION)
-        pending_ask = decisions[-1]
-        if pending_ask.step != snapshot_step_count:
-            raise VerificationFailure(FailureCategory.INTERACTION)
-        recorded_reference = decisions[-1].arguments.get("confirmation_for_step")
-        if type(recorded_reference) is not int or recorded_reference != snapshot_step_count - 1:
-            raise VerificationFailure(FailureCategory.INTERACTION)
-        by_step = {decision.step: decision for decision in decisions}
-        referenced = by_step.get(recorded_reference)
-        pending_actions = [
-            decision for decision in decisions[:-1]
-            if decision.tool_name in EXPECTED_CONFIRMATION_TOOLS
-            and decision.step not in self._confirmed_steps
-        ]
+def derive_target(snapshot: str, accessible_name: str) -> str:
+    """Extract one current Playwright ref from an accessible snapshot line."""
+    if not isinstance(snapshot, str) or not snapshot or not accessible_name:
+        raise VerificationFailure(FailureCategory.INTERACTION)
+    name = re.escape(accessible_name)
+    matches = re.findall(
+        rf'^\s*-\s+[^\n]*["\']{name}["\'][^\n]*\[ref=([^\]\s]+)\]',
+        snapshot,
+        flags=re.MULTILINE,
+    )
+    if len(matches) != 1 or not matches[0]:
+        raise VerificationFailure(FailureCategory.INTERACTION)
+    return matches[0]
+
+
+def _successful_observation(context: Any, tool_name: str) -> str:
+    steps = getattr(context, "steps", ())
+    for step in reversed(steps):
+        status = getattr(getattr(step, "observation", None), "status", None)
         if (
-            referenced is None
-            or referenced.step >= decisions[-1].step
-            or referenced.step in self._confirmed_steps
-            or referenced.tool_name not in EXPECTED_CONFIRMATION_TOOLS
-            or not pending_actions
-            or pending_actions[-1].step != referenced.step
+            getattr(getattr(step, "decision", None), "tool_name", None) == tool_name
+            and getattr(status, "value", None) == "success"
         ):
-            raise VerificationFailure(FailureCategory.INTERACTION)
-        self._validate_action(referenced)
-        self._confirmed_steps.add(referenced.step)
-        self._next_action += 1
-        return referenced
+            text = getattr(step.observation, "text", None)
+            if isinstance(text, str):
+                return text
+    raise VerificationFailure(FailureCategory.INTERACTION)
 
-    def _validate_action(self, decision: DecisionRecord) -> None:
-        if self._next_action >= 4:
-            raise VerificationFailure(FailureCategory.INTERACTION)
-        arguments = decision.arguments
-        if not isinstance(arguments, Mapping):
-            raise VerificationFailure(FailureCategory.INTERACTION)
-        valid = False
-        if self._next_action == 0 and decision.tool_name == "browser_fill_form":
-            fields = arguments.get("fields")
-            valid = (
-                set(arguments) == {"fields"}
-                and isinstance(fields, list)
-                and len(fields) == 1
-                and isinstance(fields[0], Mapping)
-                and fields[0].get("name") == "Public note"
-                and fields[0].get("value") == "public verification note"
-                and set(fields[0]) <= {"name", "type", "ref", "value"}
-                and isinstance(fields[0].get("ref"), str)
-                and bool(fields[0]["ref"])
-            )
-        elif self._next_action == 1 and decision.tool_name == "browser_select_option":
-            valid = (
-                set(arguments) == {"element", "ref", "values"}
-                and arguments.get("element") == "Report type"
-                and isinstance(arguments.get("ref"), str)
-                and bool(arguments["ref"])
-                and arguments.get("values") == ["Detailed"]
-            )
-        elif self._next_action in {2, 3} and decision.tool_name == "browser_click":
-            expected = "Apply synthetic choices" if self._next_action == 2 else "Download synthetic report"
-            valid = (
-                set(arguments) == {"element", "ref"}
-                and arguments.get("element") == expected
-                and isinstance(arguments.get("ref"), str)
-                and bool(arguments["ref"])
-            )
-        if not valid or contains_prohibited_marker(json.dumps(arguments, sort_keys=True), ["password"]):
-            raise VerificationFailure(FailureCategory.INTERACTION)
 
-    @property
-    def complete(self) -> bool:
-        return self._next_action == 4
+class DeterministicDecisionSource:
+    """Verifier-local decisions; it never receives or stores secret values."""
+
+    def __init__(self, _config: object, record: "AuditRecord") -> None:
+        self._record = record
+
+    async def next_decision(self, context: Any) -> Any:
+        from browser_agent.agent_loop import AgentToolCall
+
+        names = {item.name for item in context.tools}
+        if names & PROHIBITED_TOOLS:
+            raise VerificationFailure(FailureCategory.TOOL_EXPOSURE)
+        self._record.tool_sets.append(names)
+        task = context.task
+        steps = context.steps
+        if task == CANCELLATION_TASK:
+            call = AgentToolCall("ask_user", {"question": "Pause this synthetic cancellation run?"})
+        elif task != DETERMINISTIC_TASK:
+            raise VerificationFailure(FailureCategory.INTERACTION)
+        elif len(steps) == 0:
+            call = AgentToolCall("ask_user", {"question": "Which public profile should be used?"})
+        elif len(steps) == 1:
+            call = AgentToolCall("browser_snapshot", {})
+        elif len(steps) == 2:
+            ref = derive_target(_successful_observation(context, "browser_snapshot"), "Synthetic password")
+            call = AgentToolCall("request_secret", {
+                "question": "Enter the synthetic password.",
+                "fields": ["password"],
+                "targets": [{"field": "password", "name": "Synthetic password", "ref": ref}],
+            })
+        elif len(steps) == 3:
+            call = AgentToolCall("browser_snapshot", {})
+        elif len(steps) == 4:
+            observation = _successful_observation(context, "browser_snapshot")
+            if "Synthetic secret applied" not in observation:
+                raise VerificationFailure(FailureCategory.INTERACTION)
+            snapshot_ref = derive_target(observation, "Download synthetic report")
+            call = AgentToolCall(
+                "browser_click",
+                {"element": "Download synthetic report", "target": snapshot_ref},
+            )
+        elif len(steps) == 5:
+            call = AgentToolCall("ask_user", {
+                "question": "Approve the synthetic report download?",
+                "confirmation_for_step": 5,
+            })
+        elif len(steps) == 7:
+            replay = steps[-1]
+            original = steps[4]
+            if (
+                getattr(replay, "replay_of_step_number", None) != 5
+                or replay.decision != original.decision
+                or replay.observation.status.value != "success"
+            ):
+                raise VerificationFailure(FailureCategory.INTERACTION)
+            call = AgentToolCall("finish", {"result": PUBLIC_RESULT})
+        else:
+            raise VerificationFailure(FailureCategory.INTERACTION)
+        step = len(steps) + 1
+        self._record.decisions.append(DecisionRecord(step, call.tool_name, call.arguments))
+        return call
 
 
 def repository_root(anchor: Path | None = None) -> Path:
@@ -216,6 +220,15 @@ def repository_root(anchor: Path | None = None) -> Path:
         if (current / "browser_agent").is_dir() and (current / "package.json").is_file():
             return current
     raise VerificationFailure(FailureCategory.MISSING_RUNTIME)
+
+
+def bootstrap_repository_import_path() -> Path:
+    """Make the validated repository root importable for direct CLI execution."""
+    root = repository_root(Path(__file__))
+    root_text = str(root)
+    if root_text not in sys.path:
+        sys.path.insert(0, root_text)
+    return root
 
 
 def resolve_mcp_cli(root: Path) -> Path:
@@ -275,6 +288,11 @@ def validate_exact_origin_config(config: Mapping[str, Any], origin: str) -> None
 
 def load_runtime_environment(environ: Mapping[str, str]) -> RuntimeEnvironment:
     """Validate provider settings without exposing their values."""
+    try:
+        from browser_agent.openai_provider import OpenAICompatibleProviderConfig
+    except (ImportError, ModuleNotFoundError):
+        raise VerificationFailure(FailureCategory.MISSING_RUNTIME) from None
+
     base_url = environ.get("BROWSER_AGENT_LLM_BASE_URL")
     model = environ.get("BROWSER_AGENT_LLM_MODEL")
     api_key = environ.get("BROWSER_AGENT_LLM_API_KEY")
@@ -287,7 +305,6 @@ def load_runtime_environment(environ: Mapping[str, str]) -> RuntimeEnvironment:
         timeout = 60.0 if raw_timeout is None else float(raw_timeout)
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError
-        from browser_agent.openai_provider import OpenAICompatibleProviderConfig
         validated = OpenAICompatibleProviderConfig(base_url, model, api_key, timeout)
     except Exception:
         raise VerificationFailure(FailureCategory.INVALID_ENVIRONMENT) from None
@@ -334,7 +351,7 @@ def validate_download_metadata(files: object) -> Mapping[str, Any]:
     item = files[0]
     if set(item) != {"file_id", "filename", "size"} or item.get("filename") != DOWNLOAD_FILENAME or item.get("size") != len(DOWNLOAD_BYTES):
         raise VerificationFailure(FailureCategory.DOWNLOAD)
-    if not isinstance(item.get("file_id"), str) or not item["file_id"]:
+    if not isinstance(item.get("file_id"), str) or re.fullmatch(r"[0-9a-f]{32}", item["file_id"]) is None:
         raise VerificationFailure(FailureCategory.DOWNLOAD)
     return item
 
@@ -432,17 +449,13 @@ class _SyntheticHandler(BaseHTTPRequestHandler):
 def _synthetic_html() -> bytes:
     return b"""<!doctype html><html><head><title>M11C Synthetic Form</title></head>
 <body><main aria-label="M11C synthetic application"><h1>Browser Agent Verification</h1>
-<p id="instructions">Complete the public synthetic workflow.</p>
-<label>Public note <input aria-label="Public note" id="note"></label>
-<label>Report type <select aria-label="Report type" id="kind"><option>Summary</option><option>Detailed</option></select></label>
+<p id="instructions">Complete the minimal synthetic workflow.</p>
 <label id="password-label">Synthetic password <input type="password" aria-label="Synthetic password" id="secret"></label>
-<button aria-label="Apply synthetic choices" id="apply">Apply synthetic choices</button>
 <a aria-label="Download synthetic report" href="/download" download="m11c-report.txt">Download synthetic report</a>
-<p id="complete" hidden>WORKFLOW COMPLETE</p></main><script>
+</main><script>
 const secret=document.getElementById('secret');secret.addEventListener('input',()=>setTimeout(()=>{
  const label=document.getElementById('password-label'); const replacement=document.createElement('span');
  replacement.id='secret-applied'; replacement.textContent='Synthetic secret applied'; label.replaceWith(replacement);},0));
-document.getElementById('apply').addEventListener('click',()=>{document.getElementById('complete').hidden=false;});
 </script></body></html>"""
 
 
@@ -493,35 +506,13 @@ class AuditRecord:
         self.tool_sets: list[set[str]] = []
         self.http_bodies: list[bytes] = []
         self.prohibited_markers = tuple(prohibited_markers)
-        self.confirmation_sequence_complete = False
-        self.user_resume_accepted = False
-        self.secret_submission_accepted = False
-        self.user_resume_provider_calls: int | None = None
-        self.secret_submission_provider_calls: int | None = None
+        self.browser_observations = 0
+        self.confirmations = 0
 
 
 def make_audit_source(real_type: type, record: AuditRecord) -> type:
     class AuditedDecisionSource(real_type):
         async def next_decision(self, context: Any) -> Any:
-            prior_steps = getattr(context, "steps", None)
-            if (
-                not isinstance(prior_steps, SequenceABC)
-                or isinstance(prior_steps, (str, bytes, bytearray))
-            ):
-                raise VerificationFailure(FailureCategory.INTERACTION)
-            actual_steps: list[int] = []
-            for prior in prior_steps:
-                step = getattr(prior, "step_number", None)
-                if type(step) is not int or step <= 0:
-                    raise VerificationFailure(FailureCategory.INTERACTION)
-                actual_steps.append(step)
-            if len(actual_steps) != len(set(actual_steps)):
-                raise VerificationFailure(FailureCategory.INTERACTION)
-            pending_step = len(prior_steps) + 1
-            if actual_steps and pending_step <= max(actual_steps):
-                raise VerificationFailure(FailureCategory.INTERACTION)
-            if pending_step in actual_steps or any(item.step == pending_step for item in record.decisions):
-                raise VerificationFailure(FailureCategory.INTERACTION)
             body = self._request_body(context)
             encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             if contains_prohibited_marker(encoded, record.prohibited_markers):
@@ -530,11 +521,34 @@ def make_audit_source(real_type: type, record: AuditRecord) -> type:
             if names & PROHIBITED_TOOLS:
                 raise VerificationFailure(FailureCategory.TOOL_EXPOSURE)
             record.tool_sets.append(names)
+            successful_snapshots = sum(
+                1 for step in context.steps
+                if step.decision.tool_name == "browser_snapshot"
+                and step.observation.status.value == "success"
+            )
+            record.browser_observations = max(record.browser_observations, successful_snapshots)
             decision = await super().next_decision(context)
             record.provider_calls += 1
-            record.decisions.append(DecisionRecord(pending_step, decision.tool_name, copy.deepcopy(decision.arguments)))
+            record.decisions.append(DecisionRecord(len(context.steps) + 1, decision.tool_name, decision.arguments))
             return decision
     return AuditedDecisionSource
+
+
+def make_routing_source(real_type: type, record: AuditRecord) -> type:
+    """Use the provider only for smoke; replace only decisions in other runs."""
+    audited_type = make_audit_source(real_type, record)
+
+    class RoutingDecisionSource:
+        def __init__(self, config: object) -> None:
+            self._real = audited_type(config)
+            self._deterministic = DeterministicDecisionSource(config, record)
+
+        async def next_decision(self, context: Any) -> Any:
+            if context.task == SMOKE_TASK:
+                return await self._real.next_decision(context)
+            return await self._deterministic.next_decision(context)
+
+    return RoutingDecisionSource
 
 
 async def _request(client: Any, method: str, path: str, record: AuditRecord, sentinel: str, **kwargs: Any) -> Any:
@@ -565,32 +579,61 @@ def _request_id() -> str:
     return secrets.token_hex(16)
 
 
-async def _drive_success(client: Any, origin: str, sentinel: str, record: AuditRecord, timeout: float) -> tuple[str, Mapping[str, Any]]:
-    task = (
-        "Use only the synthetic page. First ask_user which public profile to use. After the response, inspect with browser_snapshot. "
-        "Fill Public note with 'public verification note'; select Detailed in Report type; request_secret for the password field using its current target ref. "
-        "Then click Apply synthetic choices, click Download synthetic report, inspect again to verify WORKFLOW COMPLETE, and finish with result 'synthetic workflow complete'."
-    )
+async def _create_run(client: Any, origin: str, task: str, sentinel: str, record: AuditRecord) -> str:
     created = await _request(client, "POST", "/runs", record, sentinel, json={"start_url": origin, "task": task})
     if created.status_code != 202:
         raise VerificationFailure(FailureCategory.STARTUP)
     run_id = created.json().get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise VerificationFailure(FailureCategory.RUN_STATE)
-    deadline = time.monotonic() + max(90.0, timeout * 16)
-    seen = set()
-    confirmations = ConfirmationActionTracker()
+    return run_id
+
+
+async def _drive_provider_smoke(
+    client: Any, origin: str, sentinel: str, record: AuditRecord, timeout: float,
+) -> str:
+    before = record.provider_calls
+    decision_offset = len(record.decisions)
+    observation_before = record.browser_observations
+    run_id = await _create_run(client, origin, SMOKE_TASK, sentinel, record)
+    snapshot = await _poll(client, run_id, record, sentinel, time.monotonic() + max(45.0, timeout * 4))
+    if (
+        snapshot.get("status") != "finished"
+        or snapshot.get("final_result") != "provider smoke complete"
+        or record.provider_calls <= before
+    ):
+        raise VerificationFailure(FailureCategory.PROVIDER)
+    smoke = record.decisions[decision_offset:]
+    tools = [item.tool_name for item in smoke]
+    if (
+        not tools or tools[-1] != "finish" or "browser_snapshot" not in tools[:-1]
+        or set(tools) - {"browser_snapshot", "finish"}
+        or record.browser_observations <= observation_before
+    ):
+        raise VerificationFailure(FailureCategory.MCP_BROWSER)
+    return run_id
+
+
+async def _drive_deterministic(
+    client: Any, origin: str, sentinel: str, record: AuditRecord, timeout: float,
+) -> tuple[str, Mapping[str, Any]]:
+    run_id = await _create_run(client, origin, DETERMINISTIC_TASK, sentinel, record)
+    deadline = time.monotonic() + max(90.0, timeout * 8)
+    seen: list[str] = []
     while True:
         snapshot = await _poll(client, run_id, record, sentinel, deadline)
         status = snapshot["status"]
-        seen.add(status)
+        seen.append(status)
         if status == "finished":
-            required = {"awaiting_user", "awaiting_confirmation", "awaiting_secret"}
-            if not required <= seen:
+            if (
+                snapshot.get("final_result") != PUBLIC_RESULT
+                or not {"awaiting_user", "awaiting_confirmation", "awaiting_secret"} <= set(seen)
+                or seen.count("awaiting_confirmation") != 1
+            ):
                 raise VerificationFailure(FailureCategory.INTERACTION)
             return run_id, snapshot
         if status in TERMINAL_STATUSES:
-            raise VerificationFailure(FailureCategory.PROVIDER if status == "failed" else FailureCategory.RUN_STATE)
+            raise VerificationFailure(FailureCategory.RUN_STATE)
         if status == "awaiting_user":
             if not record.decisions or record.decisions[-1].tool_name != "ask_user":
                 raise VerificationFailure(FailureCategory.INTERACTION)
@@ -602,7 +645,9 @@ async def _drive_success(client: Any, origin: str, sentinel: str, record: AuditR
                 raise VerificationFailure(FailureCategory.DISCLOSURE)
             value = sentinel
         elif status == "awaiting_confirmation":
-            confirmations.resolve(record.decisions, snapshot.get("step_count"))
+            if record.confirmations or snapshot.get("step_count") != 6:
+                raise VerificationFailure(FailureCategory.INTERACTION)
+            record.confirmations += 1
             value = True
         else:
             raise VerificationFailure(FailureCategory.RUN_STATE)
@@ -610,28 +655,13 @@ async def _drive_success(client: Any, origin: str, sentinel: str, record: AuditR
         response = await _request(client, "POST", f"/runs/{run_id}/responses", record, sentinel, json=payload)
         if response.status_code != 202:
             raise VerificationFailure(FailureCategory.INTERACTION)
-        if status == "awaiting_user":
-            record.user_resume_accepted = True
-            record.user_resume_provider_calls = record.provider_calls
-        elif status == "awaiting_secret":
+        if status == "awaiting_secret":
             if response.json().get("status") != "awaiting_secret_application":
                 raise VerificationFailure(FailureCategory.INTERACTION)
-            record.secret_submission_accepted = True
-            record.secret_submission_provider_calls = record.provider_calls
-        if status == "awaiting_confirmation" and confirmations.complete:
-            record.confirmation_sequence_complete = True
 
 
 async def _drive_cancellation(client: Any, origin: str, sentinel: str, record: AuditRecord, timeout: float) -> str:
-    created = await _request(client, "POST", "/runs", record, sentinel, json={
-        "start_url": origin,
-        "task": "Immediately call ask_user with the question 'Pause this synthetic cancellation run?' and do nothing else.",
-    })
-    if created.status_code != 202:
-        raise VerificationFailure(FailureCategory.CANCELLATION)
-    run_id = created.json().get("run_id")
-    if not isinstance(run_id, str):
-        raise VerificationFailure(FailureCategory.CANCELLATION)
+    run_id = await _create_run(client, origin, CANCELLATION_TASK, sentinel, record)
     snapshot = await asyncio.wait_for(_poll(client, run_id, record, sentinel, time.monotonic() + max(30.0, timeout * 2)), timeout=max(35.0, timeout * 2 + 5))
     if snapshot.get("status") != "awaiting_user" or not record.decisions or record.decisions[-1].tool_name != "ask_user":
         raise VerificationFailure(FailureCategory.CANCELLATION)
@@ -662,12 +692,11 @@ async def _worker_async(private_root: Path, sentinel: str) -> WorkerResult:
     checks = {field: False for field in SUCCESS_FIELDS[1:]}
     primary_category: FailureCategory | None = None
     cleanup_category: FailureCategory | None = None
-    first_run: str | None = None
-    second_run: str | None = None
+    smoke_run: str | None = None
+    deterministic_run: str | None = None
+    cancellation_run: str | None = None
     download_cleanup_verified = False
     lifespan_exited = False
-    cancellation_completed = False
-    http_scenario_completed = False
     try:
         server.start()
         origin = server.origin
@@ -682,48 +711,37 @@ async def _worker_async(private_root: Path, sentinel: str) -> WorkerResult:
         from browser_agent.openai_provider import OpenAICompatibleDecisionSource, OpenAICompatibleProviderConfig
         provider = OpenAICompatibleProviderConfig(environment.base_url, environment.model, environment.api_key, environment.timeout)
         app_config = BrowserAgentApplicationConfig(provider, downloads, node, cli, config_path, 24)
-        audit_type = make_audit_source(OpenAICompatibleDecisionSource, record)
-        with patch.object(application_module, "OpenAICompatibleDecisionSource", audit_type):
+        routing_type = make_routing_source(OpenAICompatibleDecisionSource, record)
+        with patch.object(application_module, "OpenAICompatibleDecisionSource", routing_type):
             app = create_application(app_config)
             async with app.router.lifespan_context(app):
                 async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://asgi.invalid") as client:
-                    first_run, finished = await _drive_success(client, origin, sentinel, record, environment.timeout)
+                    smoke_run = await _drive_provider_smoke(client, origin, sentinel, record, environment.timeout)
+                    checks["REAL_PROVIDER_SMOKE"] = True
+                    deterministic_run, finished = await _drive_deterministic(
+                        client, origin, sentinel, record, environment.timeout
+                    )
                     metadata = validate_download_metadata(finished.get("files"))
-                    checks["DOWNLOAD_METADATA"] = True
                     file_id = metadata["file_id"]
-                    downloaded = await _request(client, "GET", f"/runs/{first_run}/files/{file_id}", record, sentinel)
+                    downloaded = await _request(client, "GET", f"/runs/{deterministic_run}/files/{file_id}", record, sentinel)
                     disposition = downloaded.headers.get("content-disposition", "")
                     if downloaded.status_code != 200 or downloaded.content != DOWNLOAD_BYTES or DOWNLOAD_FILENAME not in disposition or "attachment" not in disposition.lower():
                         raise VerificationFailure(FailureCategory.DOWNLOAD)
-                    checks["DOWNLOAD_BYTES"] = True
-                    second_run = await _drive_cancellation(client, origin, sentinel, record, environment.timeout)
-                    cancellation_completed = True
-                    isolated = await _request(client, "GET", f"/runs/{second_run}/files/{file_id}", record, sentinel)
+                    if record.confirmations != 1:
+                        raise VerificationFailure(FailureCategory.INTERACTION)
+                    checks["DETERMINISTIC_EXECUTION"] = True
+                    cancellation_run = await _drive_cancellation(client, origin, sentinel, record, environment.timeout)
+                    isolated = await _request(client, "GET", f"/runs/{cancellation_run}/files/{file_id}", record, sentinel)
                     if isolated.status_code != 404:
                         raise VerificationFailure(FailureCategory.DOWNLOAD)
                     checks["CANCELLATION"] = True
-                    http_scenario_completed = True
             lifespan_exited = True
-        checks["HTTP_BOUNDARY"] = http_scenario_completed
-        checks["NVIDIA_PROVIDER"] = record.provider_calls == len(record.decisions) and record.provider_calls > 0
         catalogs_safe = bool(record.tool_sets) and all(not names & PROHIBITED_TOOLS for names in record.tool_sets)
-        checks["POLICY_CONTROLS"] = catalogs_safe and record.confirmation_sequence_complete
-        checks["TRUSTED_CONFIRMATION"] = record.confirmation_sequence_complete
-        checks["USER_RESUME"] = (
-            record.user_resume_accepted
-            and record.user_resume_provider_calls is not None
-            and record.provider_calls > record.user_resume_provider_calls
-        )
-        checks["SECRET_APPLICATION"] = (
-            record.secret_submission_accepted
-            and record.secret_submission_provider_calls is not None
-            and record.provider_calls > record.secret_submission_provider_calls
-            and finished.get("status") == "finished"
-        )
-        checks["MCP_STDIO"] = bool(first_run and second_run and cancellation_completed and lifespan_exited)
+        if not catalogs_safe or not all((smoke_run, deterministic_run, cancellation_run, lifespan_exited)):
+            raise VerificationFailure(FailureCategory.TOOL_EXPOSURE)
         validate_download_base_cleanup(downloads)
         download_cleanup_verified = True
-        required_decisions = {"ask_user", "browser_snapshot", "browser_fill_form", "browser_select_option", "request_secret", "browser_click", "finish"}
+        required_decisions = {"ask_user", "browser_snapshot", "request_secret", "browser_click", "finish"}
         if not required_decisions <= {decision.tool_name for decision in record.decisions}:
             raise VerificationFailure(FailureCategory.RUN_STATE)
         retained_evidence = json.dumps(
@@ -737,7 +755,7 @@ async def _worker_async(private_root: Path, sentinel: str) -> WorkerResult:
         )
         if contains_prohibited_marker(retained_evidence, record.prohibited_markers):
             raise VerificationFailure(FailureCategory.DISCLOSURE)
-        checks["SECRET_DISCLOSURE_SCAN"] = True
+        checks["DISCLOSURE_SCAN"] = True
     except VerificationFailure as exc:
         primary_category = exc.category
     except Exception:
@@ -783,6 +801,7 @@ def worker_main() -> int:
         sys.stdout.write(json.dumps(result.__dict__, separators=(",", ":")))
         return 2
     try:
+        bootstrap_repository_import_path()
         result = asyncio.run(_worker_async(Path(private_text), sentinel))
         code = 0 if result.ok else 1
     except KeyboardInterrupt:
@@ -863,6 +882,7 @@ def run_worker(command: Sequence[str], environment: Mapping[str, str], timeout: 
 
 def parent_main() -> int:
     try:
+        bootstrap_repository_import_path()
         environment = load_runtime_environment(os.environ)
         sentinel = "m11c-secret-" + secrets.token_hex(24)
         with tempfile.TemporaryDirectory(prefix="m11c-live-") as temporary:
@@ -880,10 +900,10 @@ def parent_main() -> int:
                 raise VerificationFailure(FailureCategory.DISCLOSURE)
             result = parse_worker_result(stdout, returncode)
             if result.ok:
-                if not result.checks.get("SECRET_DISCLOSURE_SCAN"):
+                if not result.checks.get("DISCLOSURE_SCAN"):
                     raise VerificationFailure(FailureCategory.WORKER)
                 finalized_checks = dict(result.checks)
-                finalized_checks["SECRET_DISCLOSURE_SCAN"] = True
+                finalized_checks["DISCLOSURE_SCAN"] = True
                 result = WorkerResult(
                     result.ok, result.category, result.cleanup_category,
                     finalized_checks, result.provider_calls, result.http_responses,

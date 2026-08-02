@@ -213,6 +213,20 @@ async def _cleanup_owned_resources(
     return first_error
 
 
+@dataclass(frozen=True)
+class _RunSessionStartup:
+    session: ResumableAgentSession
+    secret_applier: SecretFormApplier
+    download_store: RunDownloadStore
+    tracking_executor: DownloadTrackingExecutor
+
+
+@dataclass(frozen=True)
+class _RunSessionLifecycle:
+    owner_task: asyncio.Task[BaseException | None]
+    close_requested: asyncio.Event
+
+
 class PlaywrightMcpRunSessionHandle:
     """Own one live browser/MCP session; RunManager owns its download store."""
 
@@ -222,31 +236,20 @@ class PlaywrightMcpRunSessionHandle:
         secret_applier: SecretFormApplier,
         download_store: RunDownloadStore,
         tracking_executor: DownloadTrackingExecutor,
-        client_context: object,
-        stdio_context: object,
+        lifecycle: _RunSessionLifecycle,
     ) -> None:
         self.session = session
         self.secret_applier = secret_applier
         self.download_store = download_store
         self._tracking_executor = tracking_executor
-        self._client_context = client_context
-        self._stdio_context = stdio_context
-        self._close_task: asyncio.Task[BaseException | None] | None = None
+        self._lifecycle = lifecycle
 
     async def close(self) -> None:
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(
-                _cleanup_owned_resources(
-                    self._tracking_executor,
-                    self._client_context,
-                    self._stdio_context,
-                    None,
-                )
-            )
+        self._lifecycle.close_requested.set()
         try:
-            error = await asyncio.shield(self._close_task)
+            error = await asyncio.shield(self._lifecycle.owner_task)
         except asyncio.CancelledError:
-            await self._close_task
+            await asyncio.shield(self._lifecycle.owner_task)
             raise
         if error is not None:
             if isinstance(
@@ -288,10 +291,53 @@ class PlaywrightMcpRunSessionFactory:
                 "task must be a non-empty string"
             )
 
+        loop = asyncio.get_running_loop()
+        startup: asyncio.Future[_RunSessionStartup] = loop.create_future()
+        close_requested = asyncio.Event()
+        startup_abandoned = asyncio.Event()
+        owner_task = asyncio.create_task(
+            self._own_run_session(
+                start_url, startup, close_requested, startup_abandoned
+            )
+        )
+        try:
+            ready = await asyncio.shield(startup)
+        except asyncio.CancelledError:
+            startup_abandoned.set()
+            startup.cancel()
+            owner_task.cancel()
+            try:
+                await asyncio.shield(owner_task)
+            except asyncio.CancelledError:
+                pass
+            raise
+        except (KeyboardInterrupt, SystemExit):
+            await asyncio.shield(owner_task)
+            raise
+        except Exception:
+            await asyncio.shield(owner_task)
+            raise
+        lifecycle = _RunSessionLifecycle(owner_task, close_requested)
+        return PlaywrightMcpRunSessionHandle(
+            ready.session,
+            ready.secret_applier,
+            ready.download_store,
+            ready.tracking_executor,
+            lifecycle,
+        )
+
+    async def _own_run_session(
+        self,
+        start_url: str,
+        startup: asyncio.Future[_RunSessionStartup],
+        close_requested: asyncio.Event,
+        startup_abandoned: asyncio.Event,
+    ) -> BaseException | None:
         store: RunDownloadStore | None = None
         stdio_context: object | None = None
         client_context: object | None = None
         tracking: DownloadTrackingExecutor | None = None
+        startup_succeeded = False
         try:
             store = RunDownloadStore(self._config.download_base_directory)
             parameters = StdioServerParameters(
@@ -332,39 +378,44 @@ class PlaywrightMcpRunSessionFactory:
                 decision_source, router, self._config.max_steps
             )
             secret_applier = SecretFormApplier(tracking, definitions)
-            handle = PlaywrightMcpRunSessionHandle(
-                agent_session,
-                secret_applier,
-                store,
-                tracking,
-                client_context,
-                stdio_context,
+            startup.set_result(
+                _RunSessionStartup(
+                    agent_session, secret_applier, store, tracking
+                )
             )
-            store = None
-            client_context = None
-            stdio_context = None
-            return handle
-        except asyncio.CancelledError:
-            await _cleanup_owned_resources(
-                tracking, client_context, stdio_context, store
-            )
-            raise
-        except (KeyboardInterrupt, SystemExit):
-            await _cleanup_owned_resources(
-                tracking, client_context, stdio_context, store
-            )
-            raise
+            startup_succeeded = True
+            await close_requested.wait()
+        except asyncio.CancelledError as exc:
+            failure: BaseException | None = exc
+        except (KeyboardInterrupt, SystemExit) as exc:
+            failure = exc
         except Exception:
-            cleanup_error = await _cleanup_owned_resources(
-                tracking, client_context, stdio_context, store
-            )
-            if isinstance(
-                cleanup_error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
-            ):
-                raise cleanup_error
-            raise BrowserAgentApplicationConstructionError(
+            failure = BrowserAgentApplicationConstructionError(
                 "browser run construction failed safely"
-            ) from None
+            )
+        else:
+            failure = None
+
+        cleanup_error = await _cleanup_owned_resources(
+            tracking,
+            client_context,
+            stdio_context,
+            None if startup_succeeded and not startup_abandoned.is_set() else store,
+        )
+        if isinstance(
+            cleanup_error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+        ):
+            failure = cleanup_error
+        if not startup.done():
+            startup.set_exception(
+                failure
+                or BrowserAgentApplicationConstructionError(
+                    "browser run construction failed safely"
+                )
+            )
+        if failure is not None:
+            return failure
+        return cleanup_error
 
 
 def create_application(

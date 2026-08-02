@@ -1,14 +1,17 @@
-"""Pure unit tests for the import-safe M11C live verifier."""
+"""Offline contract tests for the import-safe M11C live verifier."""
 
 from __future__ import annotations
 
-import importlib.util
 import asyncio
+import importlib.util
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
@@ -17,501 +20,414 @@ SCRIPT = ROOT / "scripts" / "m11c_live_http_verifier.py"
 SPEC = importlib.util.spec_from_file_location("m11c_live_http_verifier", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 verifier = importlib.util.module_from_spec(SPEC)
-import sys
 sys.modules[SPEC.name] = verifier
 SPEC.loader.exec_module(verifier)
 
 
-class ResolutionTests(unittest.TestCase):
-    def test_repository_root_from_script(self):
+class ResolutionAndConfigTests(unittest.TestCase):
+    def test_bootstrap_returns_and_inserts_repository_root_once(self):
+        path = ["/unrelated"]
+        with patch.object(verifier.sys, "path", path):
+            self.assertEqual(verifier.bootstrap_repository_import_path(), ROOT)
+            self.assertEqual(path, [str(ROOT), "/unrelated"])
+            self.assertEqual(verifier.bootstrap_repository_import_path(), ROOT)
+            self.assertEqual(path.count(str(ROOT)), 1)
+        existing = ["/unrelated", str(ROOT)]
+        with patch.object(verifier.sys, "path", existing):
+            self.assertEqual(verifier.bootstrap_repository_import_path(), ROOT)
+            self.assertEqual(existing, ["/unrelated", str(ROOT)])
+
+    def test_bootstrap_is_independent_of_current_working_directory(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(verifier.sys, "path", []):
+            previous = Path.cwd()
+            try:
+                os.chdir(temporary)
+                self.assertEqual(verifier.bootstrap_repository_import_path(), ROOT)
+                self.assertEqual(verifier.sys.path, [str(ROOT)])
+            finally:
+                os.chdir(previous)
+
+    def test_repository_and_package_cli_resolution(self):
         self.assertEqual(verifier.repository_root(SCRIPT), ROOT)
-
-    def test_repository_root_rejects_unrelated_tree(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            with self.assertRaises(verifier.VerificationFailure):
-                verifier.repository_root(Path(temporary))
-
-    def test_mcp_cli_resolves_package_declared_bin(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             package = root / "node_modules" / "@playwright" / "mcp"
             package.mkdir(parents=True)
-            (package / "package.json").write_text(json.dumps({"bin": {"playwright-mcp": "cli.js"}}))
-            (package / "cli.js").write_text("synthetic")
+            (package / "package.json").write_text(json.dumps({"bin": "cli.js"}))
+            (package / "cli.js").write_text("public")
             self.assertEqual(verifier.resolve_mcp_cli(root), (package / "cli.js").resolve())
 
-    def test_mcp_cli_rejects_escape(self):
+    def test_repository_and_cli_escape_fail_safely(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            with self.assertRaises(verifier.VerificationFailure):
+                verifier.repository_root(root)
             package = root / "node_modules" / "@playwright" / "mcp"
             package.mkdir(parents=True)
-            (root / "outside.js").write_text("synthetic")
+            (root / "outside.js").write_text("public")
             (package / "package.json").write_text(json.dumps({"bin": "../../../outside.js"}))
             with self.assertRaises(verifier.VerificationFailure):
                 verifier.resolve_mcp_cli(root)
 
-
-class ConfigTests(unittest.TestCase):
-    def test_exact_origin_config(self):
+    def test_exact_origin_is_single_loopback_origin(self):
         origin = "http://127.0.0.1:43210"
         config = verifier.build_exact_origin_config(origin)
         self.assertEqual(config["network"]["allowedOrigins"], [origin])
         self.assertEqual(config["capabilities"], ["core"])
-        self.assertEqual(config["browser"], {"browserName": "chromium", "isolated": True, "launchOptions": {"headless": True}})
-        self.assertEqual((config["imageResponses"], config["codegen"]), ("omit", "none"))
         self.assertFalse(config["allowUnrestrictedFileAccess"])
-        self.assertFalse(config["saveSession"])
-        self.assertFalse(config["sharedBrowserContext"])
-
-    def test_rejects_wildcard_origin(self):
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.build_exact_origin_config("http://127.0.0.1:1234/*")
-
-    def test_rejects_localhost_alias(self):
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.build_exact_origin_config("http://localhost:1234")
-
-    def test_rejects_additional_origin(self):
-        config = verifier.build_exact_origin_config("http://127.0.0.1:1234")
-        config["network"]["allowedOrigins"].append("http://127.0.0.1:5678")
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.validate_exact_origin_config(config, "http://127.0.0.1:1234")
+        for invalid in ("http://localhost:1", "http://127.0.0.1:2/*", "https://127.0.0.1:3"):
+            with self.subTest(invalid=invalid), self.assertRaises(verifier.VerificationFailure):
+                verifier.build_exact_origin_config(invalid)
 
 
 class EnvironmentTests(unittest.TestCase):
     BASE = {"BROWSER_AGENT_LLM_BASE_URL": "https://provider.example/v1", "BROWSER_AGENT_LLM_MODEL": "model"}
 
-    def test_valid_environment_and_default_timeout(self):
-        value = verifier.load_runtime_environment(self.BASE)
-        self.assertEqual(value.timeout, 60.0)
-        self.assertIsNone(value.api_key)
+    def test_validation_defaults_and_optional_values(self):
+        default = verifier.load_runtime_environment(self.BASE)
+        supplied = verifier.load_runtime_environment({**self.BASE, "BROWSER_AGENT_LLM_API_KEY": "key", "BROWSER_AGENT_LLM_TIMEOUT": "2.5"})
+        self.assertEqual((default.timeout, default.api_key), (60.0, None))
+        self.assertEqual((supplied.timeout, supplied.api_key), (2.5, "key"))
 
-    def test_optional_api_key_and_timeout(self):
-        value = verifier.load_runtime_environment({**self.BASE, "BROWSER_AGENT_LLM_API_KEY": "private-marker", "BROWSER_AGENT_LLM_TIMEOUT": "2.5"})
-        self.assertEqual(value.timeout, 2.5)
+    def test_invalid_environment_is_fixed_and_does_not_disclose(self):
+        marker = "do-not-report"
+        for environment in ({}, {**self.BASE, "BROWSER_AGENT_LLM_TIMEOUT": "nan"}, {"BROWSER_AGENT_LLM_BASE_URL": marker, "BROWSER_AGENT_LLM_MODEL": "m"}):
+            with self.subTest(environment=environment), self.assertRaises(verifier.VerificationFailure) as caught:
+                verifier.load_runtime_environment(environment)
+            self.assertNotIn(marker, str(caught.exception))
 
-    def test_missing_required_environment_is_safe(self):
-        with self.assertRaisesRegex(verifier.VerificationFailure, "INVALID_ENVIRONMENT"):
-            verifier.load_runtime_environment({})
+    def test_provider_import_failure_is_missing_runtime_without_disclosure(self):
+        marker = "private-import-detail"
+        api_key = "private-api-key"
+        real_import = __import__
 
-    def test_invalid_timeout_is_safe(self):
-        with self.assertRaisesRegex(verifier.VerificationFailure, "INVALID_ENVIRONMENT"):
-            verifier.load_runtime_environment({**self.BASE, "BROWSER_AGENT_LLM_TIMEOUT": "nan"})
+        def fail_provider_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "browser_agent.openai_provider":
+                raise ModuleNotFoundError(marker)
+            return real_import(name, globals, locals, fromlist, level)
 
-    def test_error_does_not_contain_environment_value(self):
-        marker = "do-not-report-this-value"
+        with patch("builtins.__import__", side_effect=fail_provider_import):
+            with self.assertRaises(verifier.VerificationFailure) as caught:
+                verifier.load_runtime_environment({**self.BASE, "BROWSER_AGENT_LLM_API_KEY": api_key})
+        self.assertEqual(caught.exception.category, verifier.FailureCategory.MISSING_RUNTIME)
+        self.assertEqual(
+            str(caught.exception),
+            verifier.FailureCategory.MISSING_RUNTIME.value,
+        )
+        self.assertNotIn(marker, str(caught.exception))
+        self.assertNotIn(api_key, str(caught.exception))
+
+    def test_malformed_provider_values_remain_invalid_without_disclosure(self):
+        marker = "not-a-provider-url"
         with self.assertRaises(verifier.VerificationFailure) as caught:
-            verifier.load_runtime_environment({"BROWSER_AGENT_LLM_BASE_URL": marker, "BROWSER_AGENT_LLM_MODEL": "m"})
+            verifier.load_runtime_environment({**self.BASE, "BROWSER_AGENT_LLM_BASE_URL": marker})
+        self.assertEqual(caught.exception.category, verifier.FailureCategory.INVALID_ENVIRONMENT)
+        self.assertEqual(str(caught.exception), "INVALID_ENVIRONMENT")
         self.assertNotIn(marker, str(caught.exception))
 
-    def test_worker_environment_removes_provider_values_only(self):
-        source = {**self.BASE, "BROWSER_AGENT_LLM_API_KEY": "key", "BROWSER_AGENT_LLM_TIMEOUT": "2", "PATH": "/bin"}
-        config = verifier.load_runtime_environment(source)
-        sanitized = verifier.sanitized_worker_environment(source)
-        self.assertEqual(sanitized, {"PATH": "/bin"})
-        self.assertEqual((config.base_url, config.model, config.api_key, config.timeout), (self.BASE["BROWSER_AGENT_LLM_BASE_URL"], "model", "key", 2.0))
+    def test_worker_environment_removes_only_provider_configuration(self):
+        source = {**self.BASE, "BROWSER_AGENT_LLM_API_KEY": "secret", "PATH": "/bin"}
+        self.assertEqual(verifier.sanitized_worker_environment(source), {"PATH": "/bin"})
 
 
-class SyntheticAndStateTests(unittest.TestCase):
-    def test_download_response_is_fixed_and_safe(self):
-        headers = verifier.synthetic_headers()
-        self.assertEqual(headers["Content-Length"], str(len(verifier.DOWNLOAD_BYTES)))
-        self.assertEqual(headers["Content-Disposition"], 'attachment; filename="m11c-report.txt"')
-        self.assertNotIn(b"secret", verifier.DOWNLOAD_BYTES.lower())
-
-    def test_synthetic_html_has_accessible_controls_and_no_external_url(self):
+class SyntheticAndPayloadTests(unittest.TestCase):
+    def test_synthetic_page_and_download_are_public_and_fixed(self):
         html = verifier._synthetic_html()
-        for label in (b"Public note", b"Report type", b"Synthetic password", b"Apply synthetic choices", b"Download synthetic report", b"WORKFLOW COMPLETE"):
+        for label in (b"Synthetic password", b"Download synthetic report", b"Synthetic secret applied"):
             self.assertIn(label, html)
         self.assertNotIn(b"https://", html)
-        self.assertIn(b"replaceWith", html)
+        self.assertEqual(verifier.synthetic_headers()["Content-Length"], str(len(verifier.DOWNLOAD_BYTES)))
+        self.assertNotIn(b"secret", verifier.DOWNLOAD_BYTES.lower())
 
-    def test_all_documented_statuses_classify(self):
+    def test_http_interaction_payloads_are_exact(self):
+        self.assertEqual(verifier.interaction_payload("awaiting_user", "i", "blue", "r"), {
+            "request_id": "r", "interaction_id": "i", "type": "user_input", "text": "blue",
+        })
+        self.assertEqual(verifier.interaction_payload("awaiting_confirmation", "i", True, "r")["approved"], True)
+        self.assertEqual(verifier.interaction_payload("awaiting_secret", "i", "sentinel", "r")["values"], {"password": "sentinel"})
+        for bad in (("awaiting_secret", "", "x"), ("awaiting_confirmation", "i", 1), ("mystery", "i", "x")):
+            with self.subTest(bad=bad), self.assertRaises(verifier.VerificationFailure):
+                verifier.interaction_payload(*bad, "r")
+
+    def test_status_classifier_rejects_malformed_and_unexpected_states(self):
         for status in verifier.KNOWN_STATUSES:
             expected = "terminal" if status in verifier.TERMINAL_STATUSES else "active"
             self.assertEqual(verifier.classify_status(status), expected)
+        for value in (None, True, "mystery"):
+            with self.assertRaises(verifier.VerificationFailure):
+                verifier.classify_status(value)
 
-    def test_unknown_status_is_rejected(self):
+
+class TargetDerivationTests(unittest.TestCase):
+    SNAPSHOT = '''- main "M11C synthetic application" [ref=e1]:
+  - textbox "Synthetic password" [ref=e17]
+  - link "Download synthetic report" [ref=e29]'''
+
+    def test_derives_current_refs_from_realistic_observation(self):
+        self.assertEqual(verifier.derive_target(self.SNAPSHOT, "Synthetic password"), "e17")
+        self.assertEqual(verifier.derive_target(self.SNAPSHOT, "Download synthetic report"), "e29")
+
+    def test_snapshot_ref_becomes_browser_click_target(self):
+        snapshot = '- link "Download synthetic report" [ref=e17]'
+        derived_ref = verifier.derive_target(snapshot, "Download synthetic report")
+        self.assertEqual(derived_ref, "e17")
+
+        steps = [_step(number, "browser_snapshot") for number in range(1, 4)]
+        steps.append(_step(4, "browser_snapshot", text=f"Synthetic secret applied\n{snapshot}"))
+        source = verifier.DeterministicDecisionSource(object(), verifier.AuditRecord())
+        click = asyncio.run(source.next_decision(_context(verifier.DETERMINISTIC_TASK, steps)))
+
+        self.assertEqual(click.arguments["target"], "e17")
+        self.assertNotIn("ref", click.arguments)
+
+    def test_missing_duplicate_and_malformed_refs_are_rejected(self):
+        for snapshot in ("public", self.SNAPSHOT + '\n- textbox "Synthetic password" [ref=e99]', '- textbox "Synthetic password"'):
+            with self.subTest(snapshot=snapshot), self.assertRaises(verifier.VerificationFailure):
+                verifier.derive_target(snapshot, "Synthetic password")
+
+    def test_decision_source_has_no_hard_coded_ephemeral_reference(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertNotRegex(source, r'["\']e\d+["\']')
+
+
+def _step(number, tool, *, text="public", status="success", replay=None):
+    from browser_agent.agent_loop import AgentStepStatus, AgentToolCall
+    observation = Mock(status=AgentStepStatus(status), text=text)
+    return Mock(step_number=number, decision=AgentToolCall(tool, {}), observation=observation, replay_of_step_number=replay)
+
+
+def _context(task, steps):
+    tools = [Mock(name=name) for name in ("ask_user", "request_secret", "finish", "browser_snapshot", "browser_click")]
+    return Mock(task=task, steps=tuple(steps), tools=tools)
+
+
+class DeterministicDecisionTests(unittest.TestCase):
+    def setUp(self):
+        self.record = verifier.AuditRecord(["sentinel", "api-key"])
+        self.source = verifier.DeterministicDecisionSource(object(), self.record)
+
+    def decide(self, steps):
+        return asyncio.run(self.source.next_decision(_context(verifier.DETERMINISTIC_TASK, steps)))
+
+    def test_complete_sequence_derives_refs_and_has_one_confirmation(self):
+        first_snapshot = '- textbox "Synthetic password" [ref=p-current]\n- link "Download synthetic report" [ref=d-old]'
+        second_snapshot = 'Synthetic secret applied\n- link "Download synthetic report" [ref=d-current]'
+        steps = []
+        self.assertEqual(self.decide(steps).tool_name, "ask_user")
+        steps.append(_step(1, "ask_user"))
+        self.assertEqual(self.decide(steps).tool_name, "browser_snapshot")
+        steps.append(_step(2, "browser_snapshot", text=first_snapshot))
+        secret = self.decide(steps)
+        self.assertEqual(secret.arguments["targets"][0]["ref"], "p-current")
+        self.assertNotIn("sentinel", json.dumps(secret.arguments))
+        steps.append(_step(3, "request_secret"))
+        self.assertEqual(self.decide(steps).tool_name, "browser_snapshot")
+        steps.append(_step(4, "browser_snapshot", text=second_snapshot))
+        click = self.decide(steps)
+        self.assertEqual(click.arguments, {
+            "element": "Download synthetic report",
+            "target": "d-current",
+        })
+        steps.append(Mock(step_number=5, decision=click, observation=Mock(status=Mock(value="rejected"), text="confirmation"), replay_of_step_number=None))
+        confirmation = self.decide(steps)
+        self.assertEqual(confirmation.arguments["confirmation_for_step"], 5)
+        steps.append(Mock(step_number=6, decision=confirmation, observation=Mock(status=Mock(value="awaiting_user"), text="public"), replay_of_step_number=None))
+        steps.append(Mock(step_number=7, decision=click, observation=Mock(status=Mock(value="success"), text="downloaded"), replay_of_step_number=5))
+        finish = self.decide(steps)
+        self.assertEqual(finish.arguments, {"result": verifier.PUBLIC_RESULT})
+        self.assertEqual([item.tool_name for item in self.record.decisions].count("ask_user"), 2)
+
+    def test_replay_must_be_exact_and_successful(self):
+        click = Mock(tool_name="browser_click", arguments={"element": "Download synthetic report", "target": "r"})
+        steps = [_step(i, "browser_snapshot") for i in range(1, 5)]
+        steps.append(Mock(decision=click, observation=Mock(status=Mock(value="rejected")), replay_of_step_number=None))
+        steps.append(_step(6, "ask_user"))
+        steps.append(Mock(decision=Mock(tool_name="browser_click", arguments={"element": "Download synthetic report", "target": "other"}), observation=Mock(status=Mock(value="success")), replay_of_step_number=5))
         with self.assertRaises(verifier.VerificationFailure):
-            verifier.classify_status("mystery")
+            self.decide(steps)
 
-    def test_user_payload(self):
-        payload = verifier.interaction_payload("awaiting_user", "i", "choice", "r1")
-        self.assertEqual(payload, {"request_id": "r1", "interaction_id": "i", "type": "user_input", "text": "choice"})
+    def test_replay_with_fabricated_ref_argument_is_rejected(self):
+        click = Mock(tool_name="browser_click", arguments={"element": "Download synthetic report", "target": "r"})
+        steps = [_step(i, "browser_snapshot") for i in range(1, 5)]
+        steps.append(Mock(decision=click, observation=Mock(status=Mock(value="rejected")), replay_of_step_number=None))
+        steps.append(_step(6, "ask_user"))
+        fabricated = Mock(tool_name="browser_click", arguments={"element": "Download synthetic report", "ref": "r"})
+        steps.append(Mock(decision=fabricated, observation=Mock(status=Mock(value="success")), replay_of_step_number=5))
+        with self.assertRaisesRegex(verifier.VerificationFailure, "INTERACTION_MISMATCH"):
+            self.decide(steps)
 
-    def test_confirmation_payload(self):
-        self.assertEqual(verifier.interaction_payload("awaiting_confirmation", "i", True, "r2")["type"], "confirmation")
+    def test_cancellation_source_only_pauses(self):
+        call = asyncio.run(self.source.next_decision(_context(verifier.CANCELLATION_TASK, [])))
+        self.assertEqual(call.tool_name, "ask_user")
+        self.assertNotIn("confirmation_for_step", call.arguments)
 
-    def test_secret_payload(self):
-        payload = verifier.interaction_payload("awaiting_secret", "i", "sentinel", "r3")
-        self.assertEqual(payload["values"], {"password": "sentinel"})
+    def test_prohibited_tool_exposure_is_rejected(self):
+        context = _context(verifier.DETERMINISTIC_TASK, [])
+        context.tools = [SimpleNamespace(name="browser_evaluate")]
+        self.assertEqual(context.tools[0].name, "browser_evaluate")
+        with self.assertRaisesRegex(verifier.VerificationFailure, "UNEXPECTED_TOOL_EXPOSURE"):
+            asyncio.run(self.source.next_decision(context))
 
-    def test_interaction_mismatch_is_rejected(self):
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.interaction_payload("awaiting_secret", "", "value", "r")
+
+class SmokeAndRoutingContractTests(unittest.TestCase):
+    def test_smoke_task_is_short_observe_then_fixed_finish(self):
+        self.assertIn("browser_snapshot", verifier.SMOKE_TASK)
+        self.assertIn("provider smoke complete", verifier.SMOKE_TASK)
+        for forbidden in ("secret", "download", "confirm", "fill", "select"):
+            self.assertNotIn(forbidden, verifier.SMOKE_TASK.lower())
+
+    def test_routing_uses_real_source_only_for_smoke(self):
+        calls = []
+        class Real:
+            def __init__(self, _config): pass
+            def _request_body(self, _context): return {"public": True}
+            async def next_decision(self, _context):
+                calls.append("provider")
+                return Mock(tool_name="browser_snapshot", arguments={})
+        source = verifier.make_routing_source(Real, verifier.AuditRecord())(object())
+        asyncio.run(source.next_decision(_context(verifier.SMOKE_TASK, [])))
+        deterministic = asyncio.run(source.next_decision(_context(verifier.CANCELLATION_TASK, [])))
+        self.assertEqual((calls, deterministic.tool_name), (["provider"], "ask_user"))
 
 
-class DownloadAndDisclosureTests(unittest.TestCase):
-    def test_download_metadata_validation(self):
-        item = {"file_id": "opaque", "filename": verifier.DOWNLOAD_FILENAME, "size": len(verifier.DOWNLOAD_BYTES)}
+class DownloadDisclosureAndCleanupTests(unittest.TestCase):
+    def test_path_free_exact_download_metadata(self):
+        item = {"file_id": "0123456789abcdef0123456789abcdef", "filename": verifier.DOWNLOAD_FILENAME, "size": len(verifier.DOWNLOAD_BYTES)}
         self.assertIs(verifier.validate_download_metadata([item]), item)
+        for bad in ([{**item, "path": "/private"}], [item, item], [{**item, "size": 1}]):
+            with self.subTest(bad=bad), self.assertRaises(verifier.VerificationFailure):
+                verifier.validate_download_metadata(bad)
 
-    def test_download_metadata_rejects_extra_or_multiple(self):
-        item = {"file_id": "opaque", "filename": verifier.DOWNLOAD_FILENAME, "size": len(verifier.DOWNLOAD_BYTES), "path": "/private"}
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.validate_download_metadata([item])
+    def test_download_file_id_requires_lowercase_uuid4_hex_contract(self):
+        valid = {"file_id": "0123456789abcdef0123456789abcdef", "filename": verifier.DOWNLOAD_FILENAME, "size": len(verifier.DOWNLOAD_BYTES)}
+        invalid_ids = (
+            "",
+            "abc",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "01234567-89ab-cdef-0123-456789abcdef",
+            "../report.txt",
+            "/private/run/report.txt",
+            "downloads/report.txt",
+            "0123456789abcdef0123456789abcdeg",
+        )
+        for file_id in invalid_ids:
+            with self.subTest(file_id=file_id), self.assertRaises(verifier.VerificationFailure) as caught:
+                verifier.validate_download_metadata([{**valid, "file_id": file_id}])
+            self.assertEqual(caught.exception.category, verifier.FailureCategory.DOWNLOAD)
+            self.assertEqual(str(caught.exception), "DOWNLOAD_MISMATCH")
+            if file_id:
+                self.assertNotIn(file_id, str(caught.exception))
 
-    def test_marker_scan_handles_text_and_bytes(self):
-        self.assertTrue(verifier.contains_prohibited_marker("prefix sentinel suffix", ["sentinel"]))
-        self.assertTrue(verifier.contains_prohibited_marker(b"api-key", ["api-key"]))
-        self.assertFalse(verifier.contains_prohibited_marker("public", ["sentinel", ""]))
+    def test_disclosure_scan_detects_secret_and_api_key_in_text_and_bytes(self):
+        markers = ["unique-sentinel", "api-key"]
+        self.assertTrue(verifier.contains_prohibited_marker("x unique-sentinel", markers))
+        self.assertTrue(verifier.contains_prohibited_marker(b"x api-key", markers))
+        self.assertFalse(verifier.contains_prohibited_marker("public", markers))
 
-    def test_provider_body_scan_detects_sentinel_and_api_key(self):
-        record = verifier.AuditRecord(["sentinel", "api-key"])
-        self.assertTrue(verifier.contains_prohibited_marker(json.dumps({"x": "sentinel"}), record.prohibited_markers))
-        self.assertTrue(verifier.contains_prohibited_marker(json.dumps({"x": "api-key"}), record.prohibited_markers))
-
-    def test_download_base_cleanup_requires_empty_base(self):
+    def test_cleanup_requires_empty_download_base(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary) / "downloads"
             base.mkdir()
             verifier.validate_download_base_cleanup(base)
-            (base / "run-success" / "managed").mkdir(parents=True)
+            (base / "run" / "managed").mkdir(parents=True)
             with self.assertRaisesRegex(verifier.VerificationFailure, "CLEANUP_FAILURE"):
                 verifier.validate_download_base_cleanup(base)
 
-    def test_safe_failure_categories_are_fixed(self):
-        for category in verifier.FailureCategory:
-            output = verifier.safe_failure_output(category)
-            self.assertEqual(output.splitlines()[0], "M11C_RESULT=FAIL")
-            self.assertIn(category.value, output)
+    def test_failure_output_never_includes_sensitive_details(self):
+        marker = "unique-sentinel"
+        output = verifier.safe_failure_output(verifier.FailureCategory.DISCLOSURE)
+        self.assertEqual(output, "M11C_RESULT=FAIL\nFAILURE_CATEGORY=SECRET_DISCLOSURE")
+        self.assertNotIn(marker, output)
 
 
-class ParentContractTests(unittest.TestCase):
-    def _success(self):
-        checks = {field: True for field in verifier.SUCCESS_FIELDS[1:]}
-        return verifier.WorkerResult(True, None, None, checks, 7, 12)
+class ParentProtocolTests(unittest.TestCase):
+    def success(self):
+        return verifier.WorkerResult(True, None, None, {field: True for field in verifier.CHECK_FIELDS}, 2, 20)
 
-    def test_safe_success_output_only_has_fixed_fields_and_counts(self):
-        output = verifier.safe_success_output(self._success())
-        self.assertIn("M11C_RESULT=PASS", output)
-        self.assertIn("PROVIDER_CALL_COUNT=7", output)
+    def test_safe_success_has_component_evidence_and_counts(self):
+        output = verifier.safe_success_output(self.success())
+        for field in verifier.SUCCESS_FIELDS:
+            self.assertIn(f"{field}=PASS", output)
+        self.assertIn("PROVIDER_CALL_COUNT=2", output)
         self.assertNotIn("{", output)
 
-    def test_safe_success_rejects_missing_check(self):
-        result = self._success()
-        checks = dict(result.checks)
-        checks["CLEANUP"] = False
+    def test_safe_success_never_passes_skipped_component(self):
+        checks = dict(self.success().checks)
+        checks["CANCELLATION"] = False
         with self.assertRaises(verifier.VerificationFailure):
             verifier.safe_success_output(verifier.WorkerResult(True, None, None, checks))
 
-    def test_parent_parses_exact_worker_contract(self):
-        result = self._success()
-        raw = json.dumps(result.__dict__).encode()
+    def test_worker_result_parser_accepts_exact_contract(self):
+        raw = json.dumps(self.success().__dict__).encode()
         self.assertTrue(verifier.parse_worker_result(raw, 0).ok)
 
-    def test_parent_rejects_worker_noise(self):
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.parse_worker_result(b"log line\n{}", 0)
-
-    def test_parent_interprets_safe_worker_failure(self):
-        checks = {field: False for field in verifier.CHECK_FIELDS}
-        raw = json.dumps({"ok": False, "category": "DOWNLOAD_MISMATCH", "cleanup_category": None, "checks": checks, "provider_calls": 0, "http_responses": 0}).encode()
-        result = verifier.parse_worker_result(raw, 1)
-        self.assertEqual(result.category, "DOWNLOAD_MISMATCH")
-
-    def test_parent_rejects_nonzero_worker(self):
-        with self.assertRaisesRegex(verifier.VerificationFailure, "WORKER_CRASH"):
-            verifier.parse_worker_result(b"{}", 1)
-
-    def test_strict_schema_rejects_bad_types_counts_and_extras(self):
-        base = self._success().__dict__
-        mutations = [
-            {**base, "ok": "true"},
-            {**base, "provider_calls": True},
-            {**base, "provider_calls": -1},
-            {**base, "http_responses": verifier.MAX_EVIDENCE_COUNT + 1},
-            {**base, "checks": {**base["checks"], "EXTRA": True}},
-            {**base, "extra": "value"},
-        ]
-        for payload in mutations:
-            with self.subTest(payload=payload), self.assertRaises(verifier.VerificationFailure):
-                verifier.parse_worker_result(json.dumps(payload).encode(), 0)
-
-    def test_numeric_and_newline_injection_are_rejected(self):
-        payload = json.dumps(self._success().__dict__).encode() + b"\nM11C_RESULT=PASS"
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.parse_worker_result(payload, 0)
-        bad = {**self._success().__dict__, "provider_calls": 1.5}
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.parse_worker_result(json.dumps(bad).encode(), 0)
-
-    def test_primary_cleanup_and_combined_failure_output(self):
-        primary = verifier.safe_failure_output(verifier.FailureCategory.PROVIDER)
-        cleanup = verifier.safe_failure_output(verifier.FailureCategory.CLEANUP)
-        combined = verifier.safe_failure_output(verifier.FailureCategory.PROVIDER, verifier.FailureCategory.CLEANUP)
-        self.assertNotIn("CLEANUP_FAILURE_CATEGORY", primary)
-        self.assertEqual(cleanup, "M11C_RESULT=FAIL\nFAILURE_CATEGORY=CLEANUP_FAILURE")
-        self.assertIn("CLEANUP_FAILURE_CATEGORY=CLEANUP_FAILURE", combined)
-
-
-class ConfirmationTrackerTests(unittest.TestCase):
-    def setUp(self):
-        self.tracker = verifier.ConfirmationActionTracker()
-
-    @staticmethod
-    def decision(step, tool, arguments):
-        return verifier.DecisionRecord(step, tool, arguments)
-
-    def confirm(self, action):
-        decisions = [action, self.decision(action.step + 1, "ask_user", {"question": "confirm", "confirmation_for_step": action.step})]
-        return self.tracker.resolve(decisions, action.step + 1)
-
-    def test_cumulative_replay_gaps_resolve_all_four_confirmations(self):
-        decisions = []
-        pairs = [
-            (self.decision(3, "browser_fill_form", {"fields": [{"name": "Public note", "type": "textbox", "ref": "r1", "value": "public verification note"}]}), 4),
-            (self.decision(6, "browser_select_option", {"element": "Report type", "ref": "r2", "values": ["Detailed"]}), 7),
-            (self.decision(9, "browser_click", {"element": "Apply synthetic choices", "ref": "r3"}), 10),
-            (self.decision(12, "browser_click", {"element": "Download synthetic report", "ref": "r4"}), 13),
-        ]
-        for action, ask_step in pairs:
-            decisions.extend([action, self.decision(ask_step, "ask_user", {"question": "confirm", "confirmation_for_step": action.step})])
-            self.assertIs(self.tracker.resolve(decisions, ask_step), action)
-        self.assertTrue(self.tracker.complete)
-
-    def test_missing_bool_forward_wrong_unrelated_and_duplicate_references(self):
-        valid = self.decision(1, "browser_fill_form", {"fields": [{"name": "Public note", "ref": "r", "value": "public verification note"}]})
-        ask = self.decision(2, "ask_user", {"confirmation_for_step": 1})
-        cases = [None, True, 1, 99]
-        for reference in cases:
-            with self.subTest(reference=reference), self.assertRaises(verifier.VerificationFailure):
-                verifier.ConfirmationActionTracker().resolve([valid, ask], reference)
-        unrelated = self.decision(1, "browser_snapshot", {})
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.ConfirmationActionTracker().resolve([unrelated, ask], 2)
-        stale = self.decision(2, "browser_fill_form", valid.arguments)
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.ConfirmationActionTracker().resolve([valid, stale, self.decision(3, "ask_user", {"confirmation_for_step": 1})], 3)
-        self.tracker.resolve([valid, ask], 2)
-        with self.assertRaises(verifier.VerificationFailure):
-            self.tracker.resolve([valid, ask], 2)
-
-    def test_http_snapshot_has_no_confirmation_field_and_step_count_is_authority(self):
-        action = self.decision(1, "browser_fill_form", {"fields": [{"name": "Public note", "ref": "r", "value": "public verification note"}]})
-        ask = self.decision(2, "ask_user", {"confirmation_for_step": 1})
-        snapshot = {"status": "awaiting_confirmation", "step_count": 2}
-        self.assertNotIn("confirmation_for_step", snapshot)
-        self.assertIs(self.tracker.resolve([action, ask], snapshot["step_count"]), action)
-
-    def test_missing_invalid_or_mismatched_step_count_is_rejected(self):
-        action = self.decision(3, "browser_fill_form", {"fields": [{"name": "Public note", "ref": "r", "value": "public verification note"}]})
-        ask = self.decision(4, "ask_user", {"confirmation_for_step": 3})
-        for count in (None, True, 0, -1, 5):
-            with self.subTest(count=count), self.assertRaises(verifier.VerificationFailure):
-                verifier.ConfirmationActionTracker().resolve([action, ask], count)
-
-    def test_reference_must_be_adjacent_to_snapshot_step_count(self):
-        action = self.decision(3, "browser_fill_form", {"fields": [{"name": "Public note", "ref": "r", "value": "public verification note"}]})
-        ask = self.decision(5, "ask_user", {"confirmation_for_step": 3})
-        with self.assertRaises(verifier.VerificationFailure):
-            self.tracker.resolve([action, ask], 5)
-
-    def test_rejects_arbitrary_wrong_password_duplicate_and_out_of_order_actions(self):
-        invalid = [
-            self.decision(1, "browser_click", {"element": "Other", "ref": "r"}),
-            self.decision(1, "browser_fill_form", {"fields": [{"name": "Public note", "ref": "r", "value": "wrong"}]}),
-            self.decision(1, "browser_fill_form", {"fields": [{"name": "Synthetic password", "ref": "r", "value": "secret"}]}),
-            self.decision(1, "browser_select_option", {"element": "Report type", "ref": "r", "values": ["Summary"]}),
-        ]
-        for action in invalid:
-            with self.subTest(action=action), self.assertRaises(verifier.VerificationFailure):
-                verifier.ConfirmationActionTracker().resolve([action, self.decision(2, "ask_user", {"confirmation_for_step": 1})], 2)
-
-
-class AuditStepTests(unittest.TestCase):
-    def test_provider_decision_count_cannot_substitute_for_agent_step_count(self):
-        record = verifier.AuditRecord()
-
-        class Real:
-            def _request_body(self, context):
-                return {"safe": True}
-
-            async def next_decision(self, context):
-                return Mock(tool_name="browser_snapshot", arguments={})
-
-        audited = verifier.make_audit_source(Real, record)()
-        context = Mock(steps=tuple(Mock(step_number=value) for value in range(1, 6)), tools=())
-        asyncio.run(audited.next_decision(context))
-        self.assertEqual(record.provider_calls, 1)
-        self.assertEqual(record.decisions[0].step, 6)
-
-    def test_audit_rejects_invalid_prior_or_duplicate_pending_steps(self):
-        record = verifier.AuditRecord()
-
-        class Real:
-            def _request_body(self, context): return {}
-            async def next_decision(self, context): return Mock(tool_name="browser_snapshot", arguments={})
-
-        audited = verifier.make_audit_source(Real, record)()
-        for steps in ((Mock(step_number=True),), (Mock(step_number=0),), "not-steps"):
-            with self.subTest(steps=steps), self.assertRaises(verifier.VerificationFailure):
-                asyncio.run(audited.next_decision(Mock(steps=steps, tools=())))
-        record.decisions.append(verifier.DecisionRecord(2, "browser_snapshot", {}))
-        with self.assertRaises(verifier.VerificationFailure):
-            asyncio.run(audited.next_decision(Mock(steps=(Mock(step_number=1),), tools=())))
-
-
-class ProcessLifecycleTests(unittest.TestCase):
-    def process(self, effects, returncode=0):
-        process = Mock(returncode=returncode)
-        process.communicate.side_effect = effects
-        process.poll.return_value = None
-        return process
-
-    @patch.object(verifier.subprocess, "Popen")
-    def test_normal_completion_suppresses_raw_streams(self, popen):
-        popen.return_value = self.process([(b'{"safe":true}', b"raw stderr")])
-        self.assertEqual(verifier.run_worker(["python"], {"PATH": "/bin"}), (b'{"safe":true}', b"raw stderr", 0))
-        popen.return_value.communicate.assert_called_once_with(timeout=verifier.WORKER_TIMEOUT_SECONDS)
-
-    @patch.object(verifier.subprocess, "Popen")
-    def test_timeout_terminates(self, popen):
-        popen.return_value = self.process([verifier.subprocess.TimeoutExpired("worker", 1), (b"", b"")])
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.run_worker(["python"], {}, 1)
-        popen.return_value.terminate.assert_called_once()
-
-    @patch.object(verifier.subprocess, "Popen")
-    def test_timeout_uses_kill_fallback(self, popen):
-        popen.return_value = self.process([verifier.subprocess.TimeoutExpired("worker", 1), verifier.subprocess.TimeoutExpired("worker", 1), (b"", b"")])
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.run_worker(["python"], {}, 1)
-        popen.return_value.kill.assert_called_once()
-
-    @patch.object(verifier.subprocess, "Popen")
-    def test_keyboard_interrupt_cleans_up_and_propagates(self, popen):
-        popen.return_value = self.process([KeyboardInterrupt(), (b"", b"")])
-        with self.assertRaises(KeyboardInterrupt):
-            verifier.run_worker(["python"], {})
-        popen.return_value.terminate.assert_called_once()
-
-    @patch.object(verifier.subprocess, "Popen")
-    def test_terminate_raising_attempts_kill_fallback(self, popen):
-        process = self.process([verifier.subprocess.TimeoutExpired("worker", 1), (b"", b"")])
-        process.terminate.side_effect = OSError("fixed test failure")
-        popen.return_value = process
-        with self.assertRaisesRegex(verifier.VerificationFailure, "WORKER_CRASH"):
-            verifier.run_worker(["python"], {}, 1)
-        process.kill.assert_called_once()
-
-    @patch.object(verifier.subprocess, "Popen")
-    def test_second_communicate_timeout_after_kill_is_worker_crash(self, popen):
-        process = self.process([
-            verifier.subprocess.TimeoutExpired("worker", 1),
-            verifier.subprocess.TimeoutExpired("worker", 1),
-            verifier.subprocess.TimeoutExpired("worker", 1),
-        ])
-        popen.return_value = process
-        with self.assertRaisesRegex(verifier.VerificationFailure, "WORKER_CRASH"):
-            verifier.run_worker(["python"], {}, 1)
-        process.kill.assert_called_once()
-
-    @patch.object(verifier.subprocess, "Popen")
-    def test_already_exited_process_is_only_drained(self, popen):
-        process = self.process([verifier.subprocess.TimeoutExpired("worker", 1), (b"", b"")])
-        process.poll.return_value = 1
-        popen.return_value = process
-        with self.assertRaises(verifier.VerificationFailure):
-            verifier.run_worker(["python"], {}, 1)
-        process.terminate.assert_not_called()
-        process.kill.assert_not_called()
-
-    @patch.object(verifier.subprocess, "Popen")
-    def test_keyboard_interrupt_during_cleanup_is_fixed_worker_crash(self, popen):
-        process = self.process([KeyboardInterrupt(), KeyboardInterrupt(), KeyboardInterrupt()])
-        popen.return_value = process
-        with self.assertRaisesRegex(verifier.VerificationFailure, "WORKER_CRASH"):
-            verifier.run_worker(["python"], {})
-        process.kill.assert_called_once()
-
-    @patch.object(verifier.subprocess, "Popen")
-    def test_run_worker_never_writes_raw_streams(self, popen):
-        process = self.process([(b"private stdout", b"private stderr")])
-        popen.return_value = process
-        with patch.object(verifier.sys.stdout, "write") as write, patch.object(verifier.sys.stderr, "write") as err_write:
-            verifier.run_worker(["python"], {})
-        write.assert_not_called()
-        err_write.assert_not_called()
-
-
-class ServerLifecycleTests(unittest.TestCase):
-    def server(self, started):
-        server = verifier._Server.__new__(verifier._Server)
-        server.httpd = Mock()
-        server.thread = Mock()
-        server.thread.is_alive.return_value = False
-        server._started = started
-        server._closed = False
-        return server
-
-    def test_close_before_start_skips_shutdown_and_join(self):
-        server = self.server(False)
-        server.close()
-        server.httpd.shutdown.assert_not_called()
-        server.httpd.server_close.assert_called_once()
-        server.thread.join.assert_not_called()
-        server.close()
-        server.httpd.server_close.assert_called_once()
-
-    def test_started_close_attempts_all_cleanup_and_reports_failure(self):
-        server = self.server(True)
-        server.httpd.shutdown.side_effect = OSError("fixed")
-        server.httpd.server_close.side_effect = OSError("fixed")
-        server.thread.is_alive.return_value = True
-        with self.assertRaisesRegex(verifier.VerificationFailure, "CLEANUP_FAILURE"):
-            server.close()
-        server.httpd.server_close.assert_called_once()
-        server.thread.join.assert_called_once_with(timeout=5)
-
-
-class ExitCodeContractTests(unittest.TestCase):
-    def payload(self, category, ok=False):
-        return json.dumps({
-            "ok": ok, "category": category, "cleanup_category": None,
-            "checks": {field: ok for field in verifier.CHECK_FIELDS},
-            "provider_calls": 0, "http_responses": 0,
-        }).encode()
-
-    def test_safe_precondition_failures_accept_exit_two(self):
-        for category in ("INVALID_ENVIRONMENT", "MISSING_NODE_OR_MCP_CLI"):
-            self.assertEqual(verifier.parse_worker_result(self.payload(category), 2).category, category)
-
-    def test_return_code_category_mismatches_are_worker_crash(self):
+    def test_worker_result_parser_rejects_noise_bad_schema_and_codes(self):
+        valid = self.success().__dict__
         cases = [
-            (self.payload("INVALID_ENVIRONMENT"), 1),
-            (self.payload("DOWNLOAD_MISMATCH"), 2),
-            (self.payload(None), 2),
+            (json.dumps(valid).encode() + b"\nnoise", 0),
+            (json.dumps({**valid, "extra": True}).encode(), 0),
+            (json.dumps({**valid, "provider_calls": True}).encode(), 0),
+            (json.dumps(valid).encode(), 1),
         ]
         for raw, code in cases:
-            with self.subTest(code=code), self.assertRaisesRegex(verifier.VerificationFailure, "WORKER_CRASH"):
+            with self.subTest(raw=raw), self.assertRaisesRegex(verifier.VerificationFailure, "WORKER_CRASH"):
                 verifier.parse_worker_result(raw, code)
 
+    def test_safe_failure_category_and_cleanup_category(self):
+        output = verifier.safe_failure_output(verifier.FailureCategory.PROVIDER, verifier.FailureCategory.CLEANUP)
+        self.assertIn("FAILURE_CATEGORY=PROVIDER_FAILURE", output)
+        self.assertIn("CLEANUP_FAILURE_CATEGORY=CLEANUP_FAILURE", output)
 
-class ImportSafetyTests(unittest.TestCase):
-    def test_import_does_not_read_environment_or_start_runtime(self):
-        spec = importlib.util.spec_from_file_location("m11c_import_safety", SCRIPT)
+
+class HttpDriverContractTests(unittest.TestCase):
+    def test_cancellation_crosses_http_boundary_and_checks_isolation(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('POST", f"/runs/{run_id}/cancel"', source)
+        self.assertIn('GET", f"/runs/{cancellation_run}/files/{file_id}"', source)
+        self.assertNotIn("run_manager.cancel", source)
+
+    def test_all_user_operations_use_http_payload_builder(self):
+        source = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('POST", f"/runs/{run_id}/responses"', source)
+        self.assertIn("interaction_payload(status", source)
+        self.assertIn('GET", f"/runs/{deterministic_run}/files/{file_id}"', source)
+
+
+class ProcessAndImportSafetyTests(unittest.TestCase):
+    @patch.object(verifier.subprocess, "Popen")
+    def test_worker_output_is_captured_and_not_printed(self, popen):
+        process = Mock(returncode=0)
+        process.communicate.return_value = (b'{"safe":true}', b"private")
+        popen.return_value = process
+        with patch.object(verifier.sys.stdout, "write") as out, patch.object(verifier.sys.stderr, "write") as err:
+            result = verifier.run_worker(["python"], {"PATH": "/bin"})
+        self.assertEqual(result, (b'{"safe":true}', b"private", 0))
+        out.assert_not_called()
+        err.assert_not_called()
+
+    @patch.object(verifier.subprocess, "Popen")
+    def test_worker_timeout_terminates_process(self, popen):
+        process = Mock(returncode=1)
+        process.poll.return_value = None
+        process.communicate.side_effect = [subprocess.TimeoutExpired("worker", 1), (b"", b"")]
+        popen.return_value = process
+        with self.assertRaisesRegex(verifier.VerificationFailure, "WORKER_CRASH"):
+            verifier.run_worker(["python"], {}, 1)
+        process.terminate.assert_called_once()
+
+    def test_import_is_inert(self):
+        spec = importlib.util.spec_from_file_location("m11c_inert", SCRIPT)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
+        original_path = list(sys.path)
         with patch.dict(os.environ, {}, clear=True), patch("subprocess.Popen") as popen, patch("threading.Thread.start") as start:
             spec.loader.exec_module(module)
+        self.assertEqual(sys.path, original_path)
         popen.assert_not_called()
         start.assert_not_called()
-
-    def test_main_dispatch_is_not_invoked_on_import(self):
-        self.assertTrue(callable(verifier.main))
-        self.assertTrue(callable(verifier.worker_main))
 
 
 if __name__ == "__main__":

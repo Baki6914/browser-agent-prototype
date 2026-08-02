@@ -83,47 +83,77 @@ class FakeMcpSession:
 
 
 class FakeContext(AbstractAsyncContextManager):
-    def __init__(self, value, events, enter_name, exit_name, *, exit_error=None):
+    def __init__(
+        self, value, events, enter_name, exit_name, *, enter_error=None,
+        exit_error=None, task_affine=False,
+    ):
         self.value = value
         self.events = events
         self.enter_name = enter_name
         self.exit_name = exit_name
+        self.enter_error = enter_error
         self.exit_error = exit_error
+        self.task_affine = task_affine
+        self.enter_task = None
+        self.exit_task = None
+        self.enter_count = 0
+        self.exit_count = 0
 
     async def __aenter__(self):
+        self.enter_count += 1
+        self.enter_task = asyncio.current_task()
         self.events.append(self.enter_name)
+        if self.enter_error:
+            raise self.enter_error
         return self.value
 
     async def __aexit__(self, exc_type, exc, tb):
+        self.exit_count += 1
+        self.exit_task = asyncio.current_task()
         self.events.append(self.exit_name)
+        if self.task_affine and self.exit_task is not self.enter_task:
+            raise RuntimeError("async context exited by a different task")
         if self.exit_error:
             raise self.exit_error
 
 
 class Harness:
-    def __init__(self, *, navigation_status="success", client_exit_error=None):
+    def __init__(
+        self, *, navigation_status="success", stdio_enter_error=None,
+        client_enter_error=None, client_exit_error=None, task_affine=False,
+    ):
         self.events: list[str] = []
         self.parameters = []
         self.session = FakeMcpSession(
             self.events, navigation_status=navigation_status
         )
         self.client_exit_error = client_exit_error
+        self.stdio_enter_error = stdio_enter_error
+        self.client_enter_error = client_enter_error
+        self.task_affine = task_affine
+        self.stdio_context = None
+        self.client_context = None
 
     def stdio(self, parameters):
         self.parameters.append(parameters)
-        return FakeContext(
-            (object(), object()), self.events, "stdio_enter", "stdio_exit"
+        self.stdio_context = FakeContext(
+            (object(), object()), self.events, "stdio_enter", "stdio_exit",
+            enter_error=self.stdio_enter_error, task_affine=self.task_affine,
         )
+        return self.stdio_context
 
     def client(self, *streams):
         self.events.append("client_construct")
-        return FakeContext(
+        self.client_context = FakeContext(
             self.session,
             self.events,
             "client_enter",
             "client_exit",
+            enter_error=self.client_enter_error,
             exit_error=self.client_exit_error,
+            task_affine=self.task_affine,
         )
+        return self.client_context
 
 
 class ApplicationTestCase(unittest.TestCase):
@@ -376,6 +406,108 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.events.count("call:browser_close"), 1)
         self.assertTrue(handle.download_store.output_directory.exists())
         handle.download_store.close()
+
+    async def test_task_affine_contexts_are_owned_and_closed_by_one_task(self):
+        handle, harness = await self.make_handle(Harness(task_affine=True))
+        caller_task = asyncio.current_task()
+        close_task = asyncio.create_task(handle.close())
+        await close_task
+        self.assertIsNot(harness.stdio_context.enter_task, caller_task)
+        self.assertIs(harness.stdio_context.enter_task, harness.stdio_context.exit_task)
+        self.assertIs(harness.client_context.enter_task, harness.client_context.exit_task)
+        self.assertIs(
+            harness.stdio_context.enter_task, harness.client_context.enter_task
+        )
+        self.assertEqual(harness.events[-3:], [
+            "call:browser_close", "client_exit", "stdio_exit"
+        ])
+        handle.download_store.close()
+
+    async def test_concurrent_close_callers_share_one_lifecycle(self):
+        handle, harness = await self.make_handle(Harness(task_affine=True))
+        owner_task = handle._lifecycle.owner_task
+        await asyncio.gather(handle.close(), handle.close(), handle.close())
+        self.assertIs(handle._lifecycle.owner_task, owner_task)
+        self.assertEqual(harness.events.count("call:browser_close"), 1)
+        self.assertEqual(harness.client_context.exit_count, 1)
+        self.assertEqual(harness.stdio_context.exit_count, 1)
+        await handle.close()
+        self.assertEqual(harness.events.count("call:browser_close"), 1)
+        handle.download_store.close()
+
+    async def test_partial_context_entry_failures_only_exit_entered_resources(self):
+        cases = (
+            (Harness(stdio_enter_error=RuntimeError(PRIVATE_MARKER)), 0, 0),
+            (Harness(
+                client_enter_error=RuntimeError(PRIVATE_MARKER), task_affine=True
+            ), 1, 0),
+        )
+        for harness, stdio_exits, client_exits in cases:
+            with self.subTest(stdio_exits=stdio_exits):
+                factory = PlaywrightMcpRunSessionFactory(
+                    self.config(), stdio_factory=harness.stdio,
+                    client_session_factory=harness.client,
+                )
+                with self.assertRaises(
+                    BrowserAgentApplicationConstructionError
+                ) as cm:
+                    await factory.create("https://example.test", "inspect")
+                self.assertEqual(harness.stdio_context.exit_count, stdio_exits)
+                actual_client_exits = (
+                    harness.client_context.exit_count
+                    if harness.client_context is not None else 0
+                )
+                self.assertEqual(actual_client_exits, client_exits)
+                self.assertNotIn(PRIVATE_MARKER, str(cm.exception))
+                self.assertEqual(list(self.downloads.iterdir()), [])
+
+    async def test_startup_failure_cleanup_preserves_task_affinity(self):
+        harness = Harness(task_affine=True)
+
+        async def failing_initialize():
+            harness.events.append("initialize_failed")
+            raise RuntimeError(PRIVATE_MARKER)
+
+        harness.session.initialize = failing_initialize
+        factory = PlaywrightMcpRunSessionFactory(
+            self.config(), stdio_factory=harness.stdio,
+            client_session_factory=harness.client,
+        )
+        with self.assertRaises(BrowserAgentApplicationConstructionError) as cm:
+            await factory.create("https://example.test", "inspect")
+        self.assertIs(harness.client_context.enter_task, harness.client_context.exit_task)
+        self.assertIs(harness.stdio_context.enter_task, harness.stdio_context.exit_task)
+        self.assertEqual(harness.events[-3:], [
+            "initialize_failed", "client_exit", "stdio_exit"
+        ])
+        self.assertNotIn(PRIVATE_MARKER, str(cm.exception))
+        self.assertEqual(list(self.downloads.iterdir()), [])
+
+    async def test_caller_cancellation_during_startup_cleans_owner_task(self):
+        harness = Harness(task_affine=True)
+        initialize_started = asyncio.Event()
+        allow_initialize = asyncio.Event()
+
+        async def blocked_initialize():
+            initialize_started.set()
+            await allow_initialize.wait()
+
+        harness.session.initialize = blocked_initialize
+        factory = PlaywrightMcpRunSessionFactory(
+            self.config(), stdio_factory=harness.stdio,
+            client_session_factory=harness.client,
+        )
+        create_task = asyncio.create_task(
+            factory.create("https://example.test", "inspect")
+        )
+        await initialize_started.wait()
+        create_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await create_task
+        self.assertIs(harness.client_context.enter_task, harness.client_context.exit_task)
+        self.assertIs(harness.stdio_context.enter_task, harness.stdio_context.exit_task)
+        self.assertEqual(harness.events[-2:], ["client_exit", "stdio_exit"])
+        self.assertEqual(list(self.downloads.iterdir()), [])
 
     async def test_cleanup_is_exhaustive_when_browser_or_client_exit_fails(self):
         handle, harness = await self.make_handle(
