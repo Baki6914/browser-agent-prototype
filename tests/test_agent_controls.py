@@ -71,7 +71,7 @@ class AgentControlDefinitionsTests(unittest.TestCase):
                 "properties": {
                     "result": {
                         "type": "string",
-                        "description": "Final result to return to the user.",
+                        "description": "Non-empty proposed final result for user review.",
                     }
                 },
                 "required": ["result"],
@@ -112,15 +112,16 @@ class AgentControlExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.executor = AgentControlExecutor()
 
-    def test_finish_returns_finished_and_exact_result(self) -> None:
+    def test_finish_returns_completion_proposed_and_exact_text(self) -> None:
         supplied = "  Work completed.\n"
 
         result = self.executor.execute("finish", {"result": supplied})
 
         self.assertEqual(result.tool_name, "finish")
-        self.assertIs(result.status, AgentControlStatus.FINISHED)
+        self.assertIs(result.status, AgentControlStatus.COMPLETION_PROPOSED)
         self.assertEqual(result.text, supplied)
-        self.assertEqual(result.final_result, supplied)
+        self.assertIsNone(result.final_result)
+        self.assertEqual(result.text, supplied)
         self.assertIsNone(result.question)
 
     def test_ask_user_returns_awaiting_user_and_exact_question(self) -> None:
@@ -138,7 +139,7 @@ class AgentControlExecutionTests(unittest.TestCase):
         executor = AgentControlExecutor()
 
         self.assertEqual(
-            executor.execute("finish", {"result": "done"}).final_result,
+            executor.execute("finish", {"result": "done"}).text,
             "done",
         )
 

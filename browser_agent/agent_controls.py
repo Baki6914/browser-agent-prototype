@@ -15,7 +15,7 @@ from .secret_application import SecretFieldTarget
 class AgentControlStatus(str, Enum):
     """Terminal orchestration states produced by agent-control tools."""
 
-    FINISHED = "finished"
+    COMPLETION_PROPOSED = "completion_proposed"
     AWAITING_USER = "awaiting_user"
     AWAITING_SECRET = "awaiting_secret"
 
@@ -76,11 +76,12 @@ _CONTROL_SPECS: Mapping[str, _ControlSpec] = MappingProxyType(
         ),
         "finish": _ControlSpec(
             description=(
-                "End the agent task and return the final result to the user."
+                "Propose that the task is complete. The application asks the user "
+                "whether to finish the run before it closes."
             ),
             field_name="result",
-            field_description="Final result to return to the user.",
-            status=AgentControlStatus.FINISHED,
+            field_description="Non-empty proposed final result for user review.",
+            status=AgentControlStatus.COMPLETION_PROPOSED,
         ),
     }
 )
@@ -234,7 +235,7 @@ class AgentControlExecutor:
                 tool_name=tool_name,
                 status=spec.status,
                 text=value,
-                final_result=value,
+                final_result=None,
                 question=None,
             )
 

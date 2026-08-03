@@ -78,6 +78,7 @@ class RecordingPolicyExecutor:
 async def _run_loop(executor: object, definitions: tuple[object, ...]) -> None:
     from browser_agent.agent_controls import AgentControlExecutor
     from browser_agent.agent_loop import (
+        AgentPauseKind,
         AgentRunStatus,
         AgentStepStatus,
         AgentToolCall,
@@ -144,19 +145,27 @@ async def _run_loop(executor: object, definitions: tuple[object, ...]) -> None:
                 f"{step.observation.status.value}, expected success"
                 f"{error_detail}"
             )
-    if result.status is not AgentRunStatus.FINISHED:
+    if result.status is not AgentRunStatus.AWAITING_USER:
         raise AgentLoopSmokeError(
-            f"loop status was {result.status.value}, expected finished"
+            f"loop status was {result.status.value}, expected awaiting_user"
         )
-    if result.final_result != "Example Domain inspected successfully.":
+    if result.pause_kind is not AgentPauseKind.COMPLETION:
         raise AgentLoopSmokeError(
-            f"unexpected final result: {result.final_result!r}"
+            f"pause kind was {result.pause_kind!r}, expected completion"
+        )
+    if result.final_result is not None:
+        raise AgentLoopSmokeError(
+            f"final result was set before approval: {result.final_result!r}"
+        )
+    if result.completion_proposal != "Example Domain inspected successfully.":
+        raise AgentLoopSmokeError(
+            f"unexpected completion proposal: {result.completion_proposal!r}"
         )
     final_observation = result.steps[-1].observation
     if final_observation.source is not AgentToolSource.AGENT_CONTROL:
         raise AgentLoopSmokeError("finish was not recorded as an agent control")
-    if final_observation.status is not AgentStepStatus.FINISHED:
-        raise AgentLoopSmokeError("final loop step was not finished")
+    if final_observation.status is not AgentStepStatus.COMPLETION_PROPOSED:
+        raise AgentLoopSmokeError("final loop step did not propose completion")
 
 
 async def run_smoke() -> None:

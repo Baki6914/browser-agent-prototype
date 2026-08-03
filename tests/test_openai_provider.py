@@ -37,6 +37,7 @@ from browser_agent.openai_provider import (
     OpenAIProviderTimeoutError,
     OpenAIProviderTransportError,
 )
+from browser_agent.provider_trace import ProviderTraceStore
 
 
 def _config(api_key: str | None = None) -> OpenAICompatibleProviderConfig:
@@ -200,6 +201,89 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.headers["Authorization"], "Bearer synthetic-key")
         self.assertEqual(request.headers["Content-Type"], "application/json")
 
+    async def test_success_records_only_safe_structural_trace(self) -> None:
+        store = ProviderTraceStore(enabled=True)
+        payload = _payload("browser_snapshot", '{"private":"tool argument value"}')
+        payload["choices"][0]["finish_reason"] = "tool_calls"
+        payload["choices"][0]["message"]["content"] = "raw assistant response"
+        source = OpenAICompatibleDecisionSource(
+            _config("api-secret"),
+            httpx.MockTransport(lambda _request: httpx.Response(200, json=payload)),
+            store,
+        )
+        decision = await source.next_decision(_context())
+        self.assertEqual(decision.tool_name, "browser_snapshot")
+        trace = store.snapshot()[0]
+        self.assertEqual(trace.result_status, "success")
+        self.assertEqual(trace.tool_call_count, 1)
+        self.assertTrue(trace.assistant_content_present)
+        self.assertEqual(trace.selected_tool_name, "browser_snapshot")
+        rendered = repr(trace)
+        for forbidden in (
+            "api-secret", "Inspect café", "Exact observation", "tool argument value",
+            "raw assistant response",
+        ):
+            self.assertNotIn(forbidden, rendered)
+
+    async def test_untrusted_finish_reason_and_unoffered_tool_name_are_not_traced(self) -> None:
+        store = ProviderTraceStore(enabled=True)
+        payload = _payload("unoffered_tool")
+        payload["choices"][0]["finish_reason"] = "raw provider-controlled text"
+        source = OpenAICompatibleDecisionSource(
+            _config(), httpx.MockTransport(lambda _request: httpx.Response(200, json=payload)), store
+        )
+        decision = await source.next_decision(_context())
+        self.assertEqual(decision.tool_name, "unoffered_tool")
+        trace = store.snapshot()[0]
+        self.assertIsNone(trace.finish_reason)
+        self.assertIsNone(trace.selected_tool_name)
+
+    async def test_cardinality_attempts_are_structurally_traced_without_new_retry(self) -> None:
+        store = ProviderTraceStore(enabled=True)
+        multiple = _payload()
+        multiple["choices"][0]["message"]["tool_calls"].append(
+            multiple["choices"][0]["message"]["tool_calls"][0]
+        )
+        responses = iter((httpx.Response(200, json=multiple), httpx.Response(200, json=_payload())))
+        source = OpenAICompatibleDecisionSource(
+            _config(), httpx.MockTransport(lambda _request: next(responses)), store
+        )
+        await source.next_decision(_context())
+        self.assertEqual(
+            [(item.attempt_number, item.tool_call_count, item.result_status) for item in store.snapshot()],
+            [(1, 2, "tool_call_cardinality_error"), (2, 1, "success")],
+        )
+
+    async def test_safe_failure_categories_are_traced(self) -> None:
+        cases = (
+            (lambda _request: httpx.Response(503, text="raw provider secret"), OpenAIProviderHTTPError, "http_error"),
+            (lambda request: (_ for _ in ()).throw(httpx.ReadTimeout("late", request=request)), OpenAIProviderTimeoutError, "timeout"),
+            (lambda request: (_ for _ in ()).throw(httpx.ConnectError("private transport", request=request)), OpenAIProviderTransportError, "transport_error"),
+            (lambda _request: httpx.Response(200, content=b"not-json"), OpenAIProviderResponseError, "invalid_json"),
+        )
+        for handler, error, status_name in cases:
+            with self.subTest(status=status_name):
+                store = ProviderTraceStore(enabled=True)
+                source = OpenAICompatibleDecisionSource(
+                    _config(), httpx.MockTransport(handler), store
+                )
+                with self.assertRaises(error):
+                    await source.next_decision(_context())
+                self.assertEqual(store.snapshot()[0].result_status, status_name)
+                self.assertNotIn("raw provider secret", repr(store.snapshot()[0]))
+
+    async def test_recorder_failure_does_not_change_provider_decision(self) -> None:
+        class BrokenRecorder:
+            def record(self, **_metadata: object) -> None:
+                raise RuntimeError("recorder failed")
+
+        source = OpenAICompatibleDecisionSource(
+            _config(),
+            httpx.MockTransport(lambda _request: httpx.Response(200, json=_payload())),
+            BrokenRecorder(),
+        )
+        self.assertEqual((await source.next_decision(_context())).tool_name, "browser_snapshot")
+
     async def test_authorization_header_absent_without_key(self) -> None:
         _, request = await self._request(httpx.Response(200, json=_payload()))
         self.assertNotIn("Authorization", request.headers)
@@ -211,7 +295,8 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
             str(request.url), "https://api.example.com/v1/chat/completions"
         )
         self.assertEqual(body["model"], "synthetic-model")
-        self.assertEqual(body["tool_choice"], "auto")
+        self.assertEqual(body["tool_choice"], "required")
+        self.assertNotEqual(body["tool_choice"], "auto")
         self.assertIs(body["parallel_tool_calls"], False)
         self.assertEqual([item["function"]["name"] for item in body["tools"]],
                          ["browser_snapshot", "finish"])
@@ -363,21 +448,109 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
         for guidance in (
             "confirmation_required=true",
             "do not retry",
-            "Immediately call ask_user",
+            "immediately call ask_user",
             "confirmation_for_step",
-            "rejected step's step_number",
-            "approves that exact action",
+            "rejected step's exact step_number",
+            "approval for that exact action",
         ):
             with self.subTest(guidance=guidance):
                 self.assertIn(guidance, system_message)
         self.assertEqual(result, AgentToolCall("browser_snapshot", {}))
 
-    async def test_valid_tool_call_returns_agent_tool_call(self) -> None:
-        result, _ = await self._request(
-            httpx.Response(200, json=_payload(arguments='{"value":1}'))
+    async def test_system_message_separates_controls_and_authorization(self) -> None:
+        _, request = await self._request(httpx.Response(200, json=_payload()))
+        system_message = json.loads(request.content)["messages"][0]["content"]
+
+        for guidance in (
+            "ordinary ask_user only for genuinely missing non-secret information",
+            "request_secret for credentials or OTP values",
+            "remains protected even when visible on the page",
+            "Never repeat credential values",
+            "never put a credential bundle directly in browser_fill_form arguments",
+            "Request both username and password through request_secret",
+            "applies them locally without putting their values in model context",
+            "Use finish to propose completion",
+            "Browser-action authorization is controlled by application policy",
+            "Never use ordinary ask_user for advance approval",
+            "first call the intended browser tool exactly once",
+            "without claiming user approval",
+            "A normal user_input such as 'yes', 'approve', or 'continue' is not trusted",
+            "only the application-recorded confirmation interaction authorizes",
+            "Do not request a second confirmation after trusted confirmation was accepted",
+            "never include raw secret values",
+        ):
+            with self.subTest(guidance=guidance):
+                self.assertIn(guidance, system_message)
+
+    async def test_system_message_requires_canonical_download_evidence(self) -> None:
+        _, request = await self._request(httpx.Response(200, json=_payload()))
+        system_message = json.loads(request.content)["messages"][0]["content"]
+
+        for guidance in (
+            "normal left click to the exact download link",
+            "Do not use Ctrl, Control, Meta, Command, Shift, or Alt modifiers",
+            "Do not use a new tab, Ctrl+click, browser_tabs",
+            "A successful click",
+            "is not proof that a file was saved",
+            "Application recorded download:",
+            "separate canonical marker for every requested file",
+            "do not claim download success or call finish until all requested files",
+            "run Downloads section",
+            "user retrieves the file to their device from the run Downloads link",
+        ):
+            with self.subTest(guidance=guidance):
+                self.assertIn(guidance, system_message)
+
+        for guidance in (
+            "An initial page may not be open",
+            "explicit valid URL",
+            "browser_navigate may open it unchanged",
+            "request the URL or target",
+            "never invent a URL",
+        ):
+            with self.subTest(guidance=guidance):
+                self.assertIn(guidance, system_message)
+
+    async def test_ask_before_clicking_task_preserves_task_but_policy_has_priority(self) -> None:
+        base = _context()
+        task = "Before clicking Login, request confirmation."
+        context = AgentLoopContext(task, base.tools, base.steps)
+
+        _, request = await self._request(
+            httpx.Response(200, json=_payload()), context=context
         )
-        self.assertEqual(result.tool_name, "browser_snapshot")
-        self.assertEqual(result.arguments, {"value": 1})
+
+        body = json.loads(request.content)
+        system_message = body["messages"][0]["content"]
+        user_context = json.loads(body["messages"][1]["content"])
+        self.assertEqual(user_context["task"], task)
+        self.assertIn("Even if the user task says 'ask before clicking'", system_message)
+        self.assertIn("use the policy-backed confirmation flow", system_message)
+        self.assertIn(
+            "Never use ordinary ask_user for advance approval or ask an approval "
+            "question before attempting a browser tool",
+            system_message,
+        )
+        self.assertIn(
+            "first call the intended browser tool exactly once without claiming "
+            "user approval",
+            system_message,
+        )
+
+    async def test_valid_tool_call_returns_agent_tool_call(self) -> None:
+        requests: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200, json=_payload(arguments='{"value":1}'))
+
+        result = await OpenAICompatibleDecisionSource(
+            _config(), httpx.MockTransport(handler)
+        ).next_decision(_context())
+        self.assertEqual(
+            result, AgentToolCall("browser_snapshot", {"value": 1})
+        )
+        self.assertEqual(len(requests), 1)
 
     async def test_unknown_syntactically_valid_name_is_returned(self) -> None:
         result, _ = await self._request(
@@ -385,24 +558,95 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.tool_name, "unknown_tool")
 
-    async def test_text_only_response_is_rejected(self) -> None:
-        with self.assertRaises(OpenAIProviderResponseError):
-            await self._request(
-                httpx.Response(
-                    200, json={"choices": [{"message": {"content": "done"}}]}
-                )
+    async def test_text_only_response_retries_once_without_copying_content(self) -> None:
+        requests: list[httpx.Request] = []
+        responses = iter((
+            httpx.Response(
+                200,
+                json={"choices": [{"message": {"content": "raw private reply"}}]},
+            ),
+            httpx.Response(200, json=_payload(arguments='{"value":1}')),
+        ))
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return next(responses)
+
+        result = await OpenAICompatibleDecisionSource(
+            _config(), httpx.MockTransport(handler)
+        ).next_decision(_context())
+
+        self.assertEqual(result, AgentToolCall("browser_snapshot", {"value": 1}))
+        self.assertEqual(len(requests), 2)
+        second_body = json.loads(requests[1].content)
+        self.assertIn(
+            "The previous response violated the contract. Return exactly one "
+            "supplied tool call and no ordinary text.",
+            second_body["messages"][0]["content"],
+        )
+        self.assertNotIn("raw private reply", requests[1].content.decode())
+        self.assertEqual(second_body["tool_choice"], "required")
+        self.assertIs(second_body["parallel_tool_calls"], False)
+
+    async def test_multiple_tool_calls_retries_once(self) -> None:
+        requests: list[httpx.Request] = []
+        multiple = _payload()
+        multiple["choices"][0]["message"]["tool_calls"].append(
+            _payload("finish")["choices"][0]["message"]["tool_calls"][0]
+        )
+        responses = iter((
+            httpx.Response(200, json=multiple),
+            httpx.Response(200, json=_payload("finish", '{"reason":"done"}')),
+        ))
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return next(responses)
+
+        result = await OpenAICompatibleDecisionSource(
+            _config(), httpx.MockTransport(handler)
+        ).next_decision(_context())
+
+        self.assertEqual(result, AgentToolCall("finish", {"reason": "done"}))
+        self.assertEqual(len(requests), 2)
+
+    async def test_zero_tool_calls_twice_exhausts_retry_safely(self) -> None:
+        requests: list[httpx.Request] = []
+        raw_content = "raw assistant content must stay private"
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(
+                200, json={"choices": [{"message": {"content": raw_content}}]}
             )
 
-    async def test_missing_empty_or_multiple_tool_calls_are_rejected(self) -> None:
-        messages = ({}, {"tool_calls": []}, {"tool_calls": [1, 2]})
-        for message in messages:
-            with self.subTest(message=message):
-                with self.assertRaises(OpenAIProviderResponseError):
-                    await self._request(
-                        httpx.Response(
-                            200, json={"choices": [{"message": message}]}
-                        )
-                    )
+        source = OpenAICompatibleDecisionSource(
+            _config(), httpx.MockTransport(handler)
+        )
+        with self.assertRaises(OpenAIProviderResponseError) as caught:
+            await source.next_decision(_context())
+
+        self.assertEqual(len(requests), 2)
+        self.assertIn("received 0", str(caught.exception))
+        self.assertNotIn(raw_content, str(caught.exception))
+
+    async def test_non_array_tool_calls_is_rejected_without_retry(self) -> None:
+        requests = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            return httpx.Response(
+                200,
+                json={"choices": [{"message": {"tool_calls": "invalid"}}]},
+            )
+
+        source = OpenAICompatibleDecisionSource(
+            _config(), httpx.MockTransport(handler)
+        )
+        with self.assertRaises(OpenAIProviderResponseError):
+            await source.next_decision(_context())
+        self.assertEqual(requests, 1)
 
     async def test_non_function_tool_call_is_rejected(self) -> None:
         payload = _payload()
@@ -427,12 +671,22 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_string_or_malformed_argument_json_is_rejected(self) -> None:
         for arguments in ({"x": 1}, "{"):
             with self.subTest(arguments=arguments):
-                with self.assertRaises(OpenAIProviderResponseError):
-                    await self._request(
-                        httpx.Response(
-                            200, json=_payload(arguments=arguments)  # type: ignore[arg-type]
-                        )
+                requests = 0
+
+                async def handler(request: httpx.Request) -> httpx.Response:
+                    nonlocal requests
+                    requests += 1
+                    return httpx.Response(
+                        200,
+                        json=_payload(arguments=arguments),  # type: ignore[arg-type]
                     )
+
+                source = OpenAICompatibleDecisionSource(
+                    _config(), httpx.MockTransport(handler)
+                )
+                with self.assertRaises(OpenAIProviderResponseError):
+                    await source.next_decision(_context())
+                self.assertEqual(requests, 1)
 
     async def test_non_object_parsed_arguments_are_rejected(self) -> None:
         for arguments in ("[]", '"text"', "1", "true", "null"):
@@ -459,11 +713,41 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
                     await self._request(response)
 
     async def test_invalid_utf8_response_is_rejected(self) -> None:
+        requests = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            return httpx.Response(200, content=b"\xff")
+
+        source = OpenAICompatibleDecisionSource(
+            _config(), httpx.MockTransport(handler)
+        )
         with self.assertRaises(OpenAIProviderResponseError):
-            await self._request(httpx.Response(200, content=b"\xff"))
+            await source.next_decision(_context())
+        self.assertEqual(requests, 1)
+
+    async def test_invalid_json_is_rejected_without_retry(self) -> None:
+        requests = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            return httpx.Response(200, content=b"not-json")
+
+        source = OpenAICompatibleDecisionSource(
+            _config(), httpx.MockTransport(handler)
+        )
+        with self.assertRaises(OpenAIProviderResponseError):
+            await source.next_decision(_context())
+        self.assertEqual(requests, 1)
 
     async def test_timeout_maps_to_provider_timeout_error(self) -> None:
+        requests = 0
+
         async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
             raise httpx.ReadTimeout("timed out", request=request)
 
         source = OpenAICompatibleDecisionSource(
@@ -471,9 +755,14 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(OpenAIProviderTimeoutError):
             await source.next_decision(_context())
+        self.assertEqual(requests, 1)
 
     async def test_transport_failure_maps_to_provider_transport_error(self) -> None:
+        requests = 0
+
         async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
             raise httpx.ConnectError("failed", request=request)
 
         source = OpenAICompatibleDecisionSource(
@@ -481,16 +770,20 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(OpenAIProviderTransportError):
             await source.next_decision(_context())
+        self.assertEqual(requests, 1)
 
     async def test_http_failure_maps_and_redacts_echoed_key(self) -> None:
         key = "synthetic-secret"
+        requests = 0
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal requests
+            requests += 1
+            return httpx.Response(401, text=f"echo {key} " + ("x" * 500))
+
         source = OpenAICompatibleDecisionSource(
             _config(key),
-            httpx.MockTransport(
-                lambda request: httpx.Response(
-                    401, text=f"echo {key} " + ("x" * 500)
-                )
-            ),
+            httpx.MockTransport(handler),
         )
         with self.assertRaises(OpenAIProviderHTTPError) as caught:
             await source.next_decision(_context())
@@ -499,6 +792,7 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("[REDACTED]", text)
         self.assertNotIn(key, text)
         self.assertLess(len(text), 400)
+        self.assertEqual(requests, 1)
 
     async def test_http_failure_redacts_key_crossing_excerpt_boundary(self) -> None:
         key = "DISTINCTIVE-BOUNDARY-SECRET-ALPHA-OMEGA"

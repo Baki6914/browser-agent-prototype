@@ -31,6 +31,7 @@ from browser_agent import (
     RunAuditEvent,
     RunAuditKind,
     RunAuditStatus,
+    ProviderTraceSnapshot,
     SecretField,
     SecretTargetSummary,
     create_http_app,
@@ -108,12 +109,13 @@ def snapshot(
     secret_targets: tuple[SecretTargetSummary, ...] | None = None,
     files: tuple[DownloadMetadata, ...] = (),
     audit_events: tuple[RunAuditEvent, ...] = (),
+    start_url: str | None = " https://example.com ",
 ) -> RunSnapshot:
     return RunSnapshot(
         run_id="run-1",
         status=status,
         version=1,
-        start_url=" https://example.com ",
+        start_url=start_url,
         task=" Find the report ",
         step_count=2,
         question=question,
@@ -145,11 +147,17 @@ class FakeRunManager:
             raise self.error
         return self.result
 
-    async def create_run(self, start_url: str, task: str) -> RunSnapshot:
+    async def create_run(self, start_url: str | None, task: str) -> RunSnapshot:
         return self._return_or_raise(("create_run", start_url, task))
 
     async def get_run(self, run_id: str) -> RunSnapshot:
         return self._return_or_raise(("get_run", run_id))
+
+    async def get_provider_traces(self, run_id: str) -> ProviderTraceSnapshot:
+        self.calls.append(("get_provider_traces", run_id))
+        if self.error is not None:
+            raise self.error
+        return ProviderTraceSnapshot(False, ())
 
     async def get_download(self, run_id: str, file_id: str) -> DownloadFile:
         self.calls.append(("get_download", run_id, file_id))
@@ -173,6 +181,14 @@ class FakeRunManager:
     ) -> RunSnapshot:
         return self._return_or_raise(
             ("confirm", run_id, interaction_id, request_id, approved)
+        )
+
+    async def resolve_completion(
+        self, run_id: str, interaction_id: str, request_id: str,
+        approved: bool, feedback: str | None = None,
+    ) -> RunSnapshot:
+        return self._return_or_raise(
+            ("completion", run_id, interaction_id, request_id, approved, feedback)
         )
 
     async def submit_secret(
@@ -227,6 +243,14 @@ class EndpointTests(unittest.TestCase):
         self.client.__enter__()
         self.addCleanup(self.client.__exit__, None, None, None)
 
+    def test_provider_trace_endpoint_is_read_only_no_store(self) -> None:
+        with TestClient(self.app) as client:
+            response = client.get("/runs/run-a/provider-traces")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"enabled": False, "traces": []})
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        self.assertEqual(self.manager.calls, [("get_provider_traces", "run-a")])
+
     def test_create_returns_queued_snapshot_and_preserves_strings(self) -> None:
         response = self.client.post(
             "/runs",
@@ -248,6 +272,16 @@ class EndpointTests(unittest.TestCase):
         )
         self.assertEqual(response.json()["status"], "queued")
         self.assertEqual(response.json()["error"], None)
+
+    def test_create_accepts_omitted_and_null_start_url(self) -> None:
+        self.manager.result = snapshot(start_url=None)
+        for payload in ({"task": "Talk first"}, {"start_url": None, "task": "Talk first"}):
+            with self.subTest(payload=payload):
+                self.manager.calls.clear()
+                response = self.client.post("/runs", json=payload)
+                self.assertEqual(response.status_code, 202)
+                self.assertEqual(self.manager.calls, [("create_run", None, "Talk first")])
+                self.assertIsNone(response.json()["start_url"])
 
     def test_get_returns_snapshot(self) -> None:
         response = self.client.get("/runs/run-1")
@@ -323,6 +357,22 @@ class EndpointTests(unittest.TestCase):
         )
         self.assertIs(type(self.manager.calls[0][-1]), bool)
 
+    def test_completion_delegates_approval_and_feedback(self) -> None:
+        approved = self.client.post("/runs/run-1/responses", json={
+            "request_id": "request-c1", "interaction_id": "interaction-c1",
+            "type": "completion", "approved": True,
+        })
+        self.assertEqual(approved.status_code, 202)
+        declined = self.client.post("/runs/run-1/responses", json={
+            "request_id": "request-c2", "interaction_id": "interaction-c2",
+            "type": "completion", "approved": False, "feedback": "Keep working",
+        })
+        self.assertEqual(declined.status_code, 202)
+        self.assertEqual(self.manager.calls, [
+            ("completion", "run-1", "interaction-c1", "request-c1", True, None),
+            ("completion", "run-1", "interaction-c2", "request-c2", False, "Keep working"),
+        ])
+
     def test_cancel_delegates_and_returns_200(self) -> None:
         response = self.client.post(
             "/runs/run-1/cancel", json={"request_id": "request-3"}
@@ -395,6 +445,20 @@ class ValidationTests(unittest.TestCase):
                     }
                 )
 
+    def test_completion_cross_field_and_strict_contract(self) -> None:
+        base = {"request_id": "request", "interaction_id": "interaction", "type": "completion"}
+        cases = (
+            {**base, "approved": True, "feedback": "not allowed"},
+            {**base, "approved": False},
+            {**base, "approved": False, "feedback": "   "},
+            {**base, "approved": False, "feedback": 7},
+            {**base, "approved": 1},
+            {**base, "approved": True, "extra": "x"},
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                self.assert_invalid(payload)
+
     def test_non_string_ids_are_not_coerced(self) -> None:
         for field in ("request_id", "interaction_id"):
             payload: dict[str, object] = {
@@ -411,7 +475,6 @@ class ValidationTests(unittest.TestCase):
         create_cases = (
             {"start_url": "", "task": "task"},
             {"start_url": "url", "task": "  "},
-            {"start_url": None, "task": "task"},
             {"start_url": "url", "task": None},
             {"start_url": "url", "task": "task", "unknown": "secret-value"},
         )
@@ -657,6 +720,7 @@ class SnapshotTests(unittest.TestCase):
                 "question",
                 "interaction_id",
                 "final_result",
+                "completion_proposal",
                 "error",
                 "secret_fields",
                 "secret_targets",
@@ -703,6 +767,7 @@ class OpenApiTests(unittest.TestCase):
                 "/runs/{run_id}/responses",
                 "/runs/{run_id}/cancel",
                 "/runs/{run_id}/files/{file_id}",
+                "/runs/{run_id}/provider-traces",
             },
         )
         forbidden = (

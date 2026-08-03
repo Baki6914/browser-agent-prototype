@@ -138,12 +138,13 @@ class Harness:
         harness = self
 
         class DecisionSource:
-            def __init__(self, _config):
+            def __init__(self, _config, *, trace_recorder=None):
                 index = len([r for r in harness.records if hasattr(r, "decision_source")])
                 self.record = harness.records[index]
                 self.record.decision_source = self
                 self.decisions = list(harness.scripts[index]["decisions"])
                 self.index = 0
+                self.trace_recorder = trace_recorder
 
             async def next_decision(self, context):
                 self.record.contexts.append(context)
@@ -234,10 +235,27 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.fail(f"status {status!r} not reached; last response={last!r} body={last.text if last else None}")
 
     async def respond(self, run_id, paused, payload):
-        body = {"request_id": f"request-{run_id}", "interaction_id": paused.json()["interaction_id"], **payload}
+        interaction_id = paused.json()["interaction_id"]
+        body = {"request_id": f"request-{interaction_id}", "interaction_id": interaction_id, **payload}
         response = await self.client.post(f"/runs/{run_id}/responses", json=body)
         self.assertEqual(response.status_code, 202)
         return response
+
+    async def approve_completion(self, run_id, proposal):
+        paused = await self.poll(run_id, "awaiting_completion")
+        body = paused.json()
+        self.assertEqual(body["status"], "awaiting_completion")
+        self.assertIsNone(body["final_result"])
+        self.assertEqual(body["completion_proposal"], proposal)
+        self.assertIsInstance(body["interaction_id"], str)
+        self.assertTrue(body["interaction_id"])
+        await self.respond(
+            run_id, paused, {"type": "completion", "approved": True}
+        )
+        finished = await self.poll(run_id, "finished")
+        self.assertEqual(finished.json()["final_result"], proposal)
+        self.assertIsNone(finished.json()["completion_proposal"])
+        return paused, finished
 
     async def wait_for_cleanup(self, record, limit=80):
         for _ in range(limit):
@@ -249,7 +267,7 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
     async def test_finished_http_run_and_composition_security_wiring(self):
         self.harness.queue([AgentToolCall("browser_snapshot", {}), AgentToolCall("finish", {"result": "done"})])
         run_id, created = await self.create()
-        finished = await self.poll(run_id, "finished")
+        _, finished = await self.approve_completion(run_id, "done")
         record = self.harness.records[0]
         await self.wait_for_cleanup(record)
         self.assertEqual(record.calls[0], ("browser_navigate", {"url": START_URL}))
@@ -261,14 +279,19 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.events, ["stdio_enter", "client_enter", "initialize", "discover", "client_exit", "stdio_exit"])
         self.assertTrue(record.runtime_config.exists())
         self.assertEqual(finished.json()["final_result"], "done")
-        self.assertEqual(set(created.json()), {"run_id", "status", "version", "start_url", "task", "step_count", "question", "interaction_id", "final_result", "error", "secret_fields", "secret_targets", "files", "audit_events"})
+        self.assertEqual(set(created.json()), {"run_id", "status", "version", "start_url", "task", "step_count", "question", "interaction_id", "final_result", "completion_proposal", "error", "secret_fields", "secret_targets", "files", "audit_events"})
         self.assertEqual(
             [event["summary"] for event in finished.json()["audit_events"]],
-            ["Initial page opened", "Page inspected", "Task finished"],
+            [
+                "Initial page opened",
+                "Page inspected",
+                "Agent proposed completion",
+                "User finished the run",
+            ],
         )
         self.assertEqual(
             {route.path for route in self.app.routes if route.path.startswith("/runs")},
-            {"/runs", "/runs/{run_id}", "/runs/{run_id}/responses", "/runs/{run_id}/cancel", "/runs/{run_id}/files/{file_id}"},
+            {"/runs", "/runs/{run_id}", "/runs/{run_id}/responses", "/runs/{run_id}/cancel", "/runs/{run_id}/files/{file_id}", "/runs/{run_id}/provider-traces"},
         )
 
     async def test_user_input_http_pause_and_resume(self):
@@ -278,11 +301,29 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(paused.json()["question"], "Which account?")
         self.assertTrue(paused.json()["interaction_id"])
         await self.respond(run_id, paused, {"type": "user_input", "text": "Personal"})
-        await self.poll(run_id, "finished")
+        await self.approve_completion(run_id, "resumed")
         await self.wait_for_cleanup(self.harness.records[0])
         self.assertEqual(len(self.harness.records), 1)
         interaction = self.harness.records[0].contexts[-1].user_interactions[-1]
         self.assertEqual(interaction.response, "Personal")
+
+    async def test_urlless_http_run_skips_initial_navigation_and_starts_agent(self):
+        task = "Open https://example.com and inspect the page."
+        self.harness.queue([AgentToolCall("ask_user", {"question": "Which target?"})])
+
+        created = await self.client.post("/runs", json={"task": task})
+        self.assertEqual(created.status_code, 202)
+        self.assertIsNone(created.json()["start_url"])
+        paused = await self.poll(created.json()["run_id"], "awaiting_user")
+
+        record = self.harness.records[0]
+        self.assertEqual(record.calls, [])
+        self.assertEqual(record.contexts[0].task, task)
+        visible = {tool.name for tool in record.contexts[0].tools}
+        self.assertIn("browser_navigate", visible)
+        self.assertIn("ask_user", visible)
+        self.assertEqual(paused.json()["audit_events"][0]["summary"], "Conversation started")
+        self.assertIsNone(paused.json()["start_url"])
 
     async def test_trusted_confirmation_pause_and_exact_replay(self):
         click = {"element": "Download", "ref": "button-7"}
@@ -294,7 +335,7 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         click_definition = next(tool for tool in record.contexts[0].tools if tool.name == "browser_click")
         self.assertNotIn("confirmation_granted", click_definition.input_schema.get("properties", {}))
         await self.respond(run_id, paused, {"type": "confirmation", "approved": True})
-        await self.poll(run_id, "finished")
+        await self.approve_completion(run_id, "clicked")
         await self.wait_for_cleanup(record)
         clicks = [args for name, args in record.calls if name == "browser_click"]
         self.assertEqual(clicks, [click])
@@ -309,7 +350,7 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["secret_targets"], [{"field": "password", "name": "Account password"}])
         self.assertNotIn(SECRET_REF, paused.text)
         submitted = await self.respond(run_id, paused, {"type": "secret", "values": {"password": SECRET}})
-        finished = await self.poll(run_id, "finished")
+        _, finished = await self.approve_completion(run_id, "signed in")
         record = self.harness.records[0]
         await self.wait_for_cleanup(record)
         self.assertTrue(record.secret_seen)
@@ -320,6 +361,55 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(SECRET not in value for value in retained))
         self.assertTrue(all(SECRET_REF not in value for value in [created.text, paused.text, submitted.text, finished.text, repr(await self.manager.get_run(run_id))]))
 
+    async def test_scripted_login_guards_secret_application_and_exact_confirmation(self):
+        raw_secret = "SuperSecretPassword!"
+        raw_username = "alice@example.test"
+        click = {"element": "Login", "ref": "login-button"}
+        self.harness.queue([
+            AgentToolCall("browser_fill_form", {"fields": [
+                {"name": "username", "type": "text", "ref": "user-ref", "value": raw_username},
+                {"name": "password", "type": "password", "ref": SECRET_REF, "value": raw_secret},
+            ]}),
+            AgentToolCall("request_secret", {
+                "question": "Enter username and password securely",
+                "fields": ["username", "password"],
+                "targets": [
+                    {"field": "username", "name": "Username", "ref": "user-ref"},
+                    {"field": "password", "name": "Password", "ref": SECRET_REF},
+                ],
+            }),
+            AgentToolCall("ask_user", {"question": "May I click the Login button?"}),
+            AgentToolCall("browser_click", click),
+            AgentToolCall("ask_user", {
+                "question": "Approve this exact Login click?", "confirmation_for_step": 4,
+            }),
+            AgentToolCall("finish", {"result": "Login verified"}),
+        ])
+        run_id, created = await self.create()
+        secret_pause = await self.poll(run_id, "awaiting_secret")
+        record = self.harness.records[0]
+        self.assertNotIn("browser_fill_form", [name for name, _ in record.calls])
+        retained_before_secret = repr((record.contexts, await self.manager.get_run(run_id)))
+        self.assertNotIn(raw_secret, retained_before_secret)
+        self.assertNotIn(raw_username, retained_before_secret)
+        self.assertIn("Sensitive form values must be supplied", retained_before_secret)
+
+        submitted = await self.respond(run_id, secret_pause, {
+            "type": "secret", "values": {
+                "username": raw_username, "password": raw_secret,
+            },
+        })
+        confirmation = await self.poll(run_id, "awaiting_confirmation")
+        self.assertNotEqual(submitted.json()["status"], "awaiting_user")
+        self.assertEqual([name for name, _ in record.calls].count("browser_fill_form"), 1)
+        await self.respond(run_id, confirmation, {"type": "confirmation", "approved": True})
+        proposal, finished = await self.approve_completion(run_id, "Login verified")
+        await self.wait_for_cleanup(record)
+        self.assertEqual([args for name, args in record.calls if name == "browser_click"], [click])
+        retained = repr((created.json(), secret_pause.json(), submitted.json(), proposal.json(), finished.json(), record.contexts, await self.manager.get_run(run_id)))
+        self.assertNotIn(raw_secret, retained)
+        self.assertNotIn(raw_username, retained)
+
     async def test_download_tracking_http_retrieval_and_run_isolation(self):
         click = {"element": "Report", "ref": "download-1"}
         script = [AgentToolCall("browser_click", click), AgentToolCall("ask_user", {"question": "Download?", "confirmation_for_step": 1}), AgentToolCall("finish", {"result": "downloaded"})]
@@ -328,18 +418,51 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         first, _ = await self.create()
         paused = await self.poll(first, "awaiting_confirmation")
         await self.respond(first, paused, {"type": "confirmation", "approved": True})
-        finished = await self.poll(first, "finished")
-        await self.wait_for_cleanup(self.harness.records[0])
-        second, _ = await self.create()
-        await self.poll(second, "finished")
-        await self.wait_for_cleanup(self.harness.records[1])
-        metadata = finished.json()["files"][0]
+        awaiting = await self.poll(first, "awaiting_completion")
+        self.assertEqual(awaiting.json()["status"], "awaiting_completion")
+        self.assertIsNone(awaiting.json()["final_result"])
+        self.assertEqual(awaiting.json()["completion_proposal"], "downloaded")
+        self.assertIsInstance(awaiting.json()["interaction_id"], str)
+        self.assertTrue(awaiting.json()["interaction_id"])
+        metadata = awaiting.json()["files"][0]
         self.assertEqual(set(metadata), {"file_id", "filename", "size"})
         self.assertEqual((metadata["filename"], metadata["size"]), ("report.txt", len(DOWNLOAD_BYTES)))
-        all_json = finished.text + (await self.client.get(f"/runs/{second}")).text
-        self.assertNotIn(str(self.download_base), all_json)
+        self.assertNotIn("browser_close", [name for name, _ in self.harness.records[0].calls])
+        record = self.harness.records[0]
+        evidence_context = record.contexts[-1]
+        evidence_text = evidence_context.steps[-1].observation.text
+        self.assertIn(
+            f"Application recorded download: report.txt ({len(DOWNLOAD_BYTES)} bytes)",
+            evidence_text,
+        )
+        self.assertNotIn(str(record.output_directory), evidence_text)
+        self.assertNotIn(metadata["file_id"], evidence_text)
+        self.assertEqual(
+            [name for name, _ in record.calls].count("browser_click"), 1
+        )
+
         async def run_sync(function, *args, **_kwargs):
             return function(*args)
+
+        with patch("starlette.responses.anyio.to_thread.run_sync", run_sync):
+            while_awaiting = await self.client.get(
+                f"/runs/{first}/files/{metadata['file_id']}"
+            )
+        self.assertEqual(while_awaiting.status_code, 200)
+        self.assertEqual(while_awaiting.content, DOWNLOAD_BYTES)
+
+        await self.respond(
+            first, awaiting, {"type": "completion", "approved": True}
+        )
+        finished = await self.poll(first, "finished")
+        self.assertEqual(finished.json()["final_result"], "downloaded")
+        self.assertIsNone(finished.json()["completion_proposal"])
+        await self.wait_for_cleanup(self.harness.records[0])
+        second, _ = await self.create()
+        await self.approve_completion(second, "other")
+        await self.wait_for_cleanup(self.harness.records[1])
+        all_json = awaiting.text + finished.text + (await self.client.get(f"/runs/{second}")).text
+        self.assertNotIn(str(self.download_base), all_json)
 
         with patch("starlette.responses.anyio.to_thread.run_sync", run_sync):
             downloaded = await self.client.get(f"/runs/{first}/files/{metadata['file_id']}")
@@ -352,6 +475,32 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNot(one, two)
         self.assertNotEqual(one.output_directory, two.output_directory)
         self.assertNotEqual(one.output_directory.parent, two.output_directory.parent)
+
+    async def test_declined_completion_feedback_continues_to_second_proposal(self):
+        self.harness.queue([
+            AgentToolCall("finish", {"result": "first proposal"}),
+            AgentToolCall("finish", {"result": "second proposal"}),
+        ])
+        run_id, _ = await self.create()
+        first = await self.poll(run_id, "awaiting_completion")
+        self.assertEqual(first.json()["completion_proposal"], "first proposal")
+        await self.respond(
+            run_id,
+            first,
+            {
+                "type": "completion",
+                "approved": False,
+                "feedback": "The export is still missing",
+            },
+        )
+        second, finished = await self.approve_completion(run_id, "second proposal")
+        self.assertNotEqual(
+            first.json()["interaction_id"], second.json()["interaction_id"]
+        )
+        self.assertEqual(finished.json()["final_result"], "second proposal")
+        feedback = self.harness.records[0].contexts[-1].user_interactions[-1]
+        self.assertEqual(feedback.response, "The export is still missing")
+        await self.wait_for_cleanup(self.harness.records[0])
 
     async def test_http_cancellation_and_cleanup(self):
         self.harness.queue([], blocking=True)

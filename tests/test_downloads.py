@@ -221,16 +221,26 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         self.temp.cleanup()
 
-    async def test_success_tracks_once_and_preserves_identity_and_arguments(self) -> None:
+    async def test_success_tracks_once_and_returns_canonical_evidence(self) -> None:
         (self.store.output_directory / "report.pdf").write_bytes(b"abc")
         observation = ToolObservation("browser_click", "success", '- Downloaded file report.pdf to "report.pdf"', None, None)
         executor = FakeExecutor(observation)
         wrapper = DownloadTrackingExecutor(executor, self.store)
         arguments = {"target": "ref"}
         returned = await wrapper.invoke("browser_click", arguments, confirmation_granted=True)
-        self.assertIs(returned, observation)
+        self.assertIsNot(returned, observation)
+        self.assertEqual(returned.status, observation.status)
+        self.assertEqual(returned.error, observation.error)
+        self.assertEqual(
+            returned.text,
+            '- Downloaded file report.pdf to "report.pdf"\n'
+            'Application recorded download: report.pdf (3 bytes)',
+        )
         self.assertEqual(executor.calls, [("invoke", "browser_click", arguments, True)])
-        self.assertEqual(self.store.list_metadata()[0].filename, "report.pdf")
+        metadata = self.store.list_metadata()[0]
+        self.assertEqual(metadata.filename, "report.pdf")
+        self.assertNotIn(str(self.store.output_directory), returned.text)
+        self.assertNotIn(metadata.file_id, returned.text)
 
     async def test_reported_prefix_is_not_used_for_filesystem_access(self) -> None:
         external = Path(self.temp.name) / "claimed" / "incoming" / "report.pdf"
@@ -280,6 +290,30 @@ class ExecutorTests(unittest.IsolatedAsyncioTestCase):
         wrapper = DownloadTrackingExecutor(FakeExecutor(observation), self.store)
         self.assertIs(await wrapper.invoke("browser_snapshot", {}), observation)
         self.assertEqual(self.store.list_metadata(), ())
+
+    async def test_multiple_downloads_append_ordered_canonical_markers(self) -> None:
+        (self.store.output_directory / "first.txt").write_bytes(b"one")
+        (self.store.output_directory / "second.bin").write_bytes(b"12345")
+        raw = (
+            '- Downloaded file first.txt to "first.txt"\n'
+            '- Downloaded file second.bin to "second.bin"'
+        )
+        observation = ToolObservation("browser_click", "success", raw, None, None)
+        returned = await DownloadTrackingExecutor(
+            FakeExecutor(observation), self.store
+        ).invoke("browser_click", {})
+
+        self.assertEqual(
+            returned.text.splitlines()[-2:],
+            [
+                "Application recorded download: first.txt (3 bytes)",
+                "Application recorded download: second.bin (5 bytes)",
+            ],
+        )
+        self.assertEqual(
+            [item.filename for item in self.store.list_metadata()],
+            ["first.txt", "second.bin"],
+        )
 
     async def test_error_observations_do_not_track(self) -> None:
         for status in ("mcp_error", "transport_error"):

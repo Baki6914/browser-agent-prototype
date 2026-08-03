@@ -114,6 +114,7 @@ async def _run_loop(
 ) -> None:
     from browser_agent import (
         AgentControlExecutor,
+        AgentPauseKind,
         AgentRunStatus,
         AgentStepStatus,
         AgentToolRouter,
@@ -138,9 +139,13 @@ async def _run_loop(
         "containing the page title."
     )
     result = await DeterministicAgentLoop(source, router, max_steps=5).run(task)
-    if result.status is not AgentRunStatus.FINISHED:
+    if result.status is not AgentRunStatus.AWAITING_USER:
         raise OpenAIAgentSmokeError(
-            f"loop status was {result.status.value}, expected finished"
+            f"loop status was {result.status.value}, expected awaiting_user"
+        )
+    if result.pause_kind is not AgentPauseKind.COMPLETION:
+        raise OpenAIAgentSmokeError(
+            f"pause kind was {result.pause_kind!r}, expected completion"
         )
     if len(result.steps) != 3:
         raise OpenAIAgentSmokeError(
@@ -149,7 +154,11 @@ async def _run_loop(
     expected = (
         ("browser_navigate", AgentToolSource.MCP, AgentStepStatus.SUCCESS),
         ("browser_snapshot", AgentToolSource.MCP, AgentStepStatus.SUCCESS),
-        ("finish", AgentToolSource.AGENT_CONTROL, AgentStepStatus.FINISHED),
+        (
+            "finish",
+            AgentToolSource.AGENT_CONTROL,
+            AgentStepStatus.COMPLETION_PROPOSED,
+        ),
     )
     for step, (name, source_kind, status) in zip(
         result.steps, expected, strict=True
@@ -169,9 +178,16 @@ async def _run_loop(
             "normal MCP calls were not exactly browser_navigate and "
             f"browser_snapshot: {recording_executor.calls!r}"
         )
-    if not result.final_result or "example domain" not in result.final_result.lower():
+    if result.final_result is not None:
         raise OpenAIAgentSmokeError(
-            "final_result was empty or did not contain 'Example Domain'"
+            f"final_result was set before approval: {result.final_result!r}"
+        )
+    if (
+        not result.completion_proposal
+        or "example domain" not in result.completion_proposal.lower()
+    ):
+        raise OpenAIAgentSmokeError(
+            "completion_proposal was empty or did not contain 'Example Domain'"
         )
 
 

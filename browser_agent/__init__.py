@@ -69,6 +69,12 @@ from .openai_provider import (
     OpenAIProviderTimeoutError,
     OpenAIProviderTransportError,
 )
+from .provider_trace import (
+    ProviderTraceRecord,
+    ProviderTraceRecorderProtocol,
+    ProviderTraceSnapshot,
+    ProviderTraceStore,
+)
 from .tool_policy import (
     InternalOnlyToolError,
     McpToolPolicy,
@@ -132,8 +138,11 @@ from .http_api import (
     RunHttpResponse,
     RunHttpSnapshotError,
     RunHttpAuditEvent,
+    ProviderTraceHttpRecord,
+    ProviderTraceHttpResponse,
     RunInteractionType,
     RunResponseRequest,
+    CompletionRunResponseRequest,
     SecretRunResponseRequest,
     create_http_app,
 )
@@ -167,6 +176,12 @@ __all__ = [
     "BrowserAgentApplicationConstructionError",
     "BrowserAgentApplicationError",
     "AgentApplicationEvent",
+    "ProviderTraceRecord",
+    "ProviderTraceRecorderProtocol",
+    "ProviderTraceSnapshot",
+    "ProviderTraceStore",
+    "ProviderTraceHttpRecord",
+    "ProviderTraceHttpResponse",
     "AgentApplicationEventKind",
     "AgentDecisionSourceProtocol",
     "AgentLoopContext",
@@ -247,6 +262,7 @@ __all__ = [
     "RunHttpAuditEvent",
     "RunInteractionType",
     "RunResponseRequest",
+    "CompletionRunResponseRequest",
     "SecretRunResponseRequest",
     "RunSessionFactoryProtocol",
     "RunSessionHandleProtocol",

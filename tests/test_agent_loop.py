@@ -232,7 +232,7 @@ class AgentToolRouterTests(unittest.IsolatedAsyncioTestCase):
         observation = await self.router.route(
             AgentToolCall("finish", {"result": "done"})
         )
-        self.assertEqual(observation.status, AgentStepStatus.FINISHED)
+        self.assertEqual(observation.status, AgentStepStatus.COMPLETION_PROPOSED)
         self.assertEqual(self.controls.calls, [("finish", {"result": "done"})])
         self.assertEqual(self.executor.calls, [])
 
@@ -295,6 +295,55 @@ class AgentToolRouterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "bug"):
             await router.route(AgentToolCall("browser_snapshot", {}))
 
+    async def test_sensitive_fill_form_is_rejected_before_mcp(self) -> None:
+        router = AgentToolRouter(
+            self.executor, [tool_definition("browser_fill_form")], self.controls
+        )
+        observation = await router.route(AgentToolCall("browser_fill_form", {
+            "fields": [
+                {"name": "username", "value": "alice@example.test"},
+                {"label": "Account-Password", "value": "SuperSecretPassword!"},
+            ]
+        }))
+        self.assertEqual(observation.status, AgentStepStatus.REJECTED)
+        self.assertEqual(
+            observation.text,
+            "Sensitive form values must be supplied through request_secret.",
+        )
+        self.assertEqual(self.executor.calls, [])
+
+    async def test_non_sensitive_fill_form_reaches_mcp(self) -> None:
+        router = AgentToolRouter(
+            self.executor, [tool_definition("browser_fill_form")], self.controls
+        )
+        await router.route(AgentToolCall("browser_fill_form", {
+            "fields": [{"name": "city", "value": "Ankara"}]
+        }))
+        self.assertEqual(self.executor.calls[0][0], "browser_fill_form")
+
+    async def test_ordinary_action_approval_is_rejected_without_control_pause(self) -> None:
+        observation = await self.router.route(AgentToolCall(
+            "ask_user", {"question": "May I click the Login button?"}
+        ))
+        self.assertEqual(observation.status, AgentStepStatus.REJECTED)
+        self.assertIn("Ordinary ask_user cannot request", observation.text)
+        self.assertEqual(self.controls.calls, [])
+
+    async def test_missing_information_questions_remain_ordinary(self) -> None:
+        for question in ("Which account should I use?", "Which file should I download?"):
+            with self.subTest(question=question):
+                observation = await self.router.route(
+                    AgentToolCall("ask_user", {"question": question})
+                )
+                self.assertEqual(observation.status, AgentStepStatus.AWAITING_USER)
+
+    async def test_trusted_confirmation_question_is_not_blocked(self) -> None:
+        observation = await self.router.route(AgentToolCall("ask_user", {
+            "question": "May I click the Login button?", "confirmation_for_step": 1,
+        }))
+        self.assertEqual(observation.status, AgentStepStatus.AWAITING_USER)
+        self.assertEqual(observation.confirmation_for_step, 1)
+
 
 class DeterministicAgentLoopTests(unittest.IsolatedAsyncioTestCase):
     def make_loop(
@@ -354,6 +403,49 @@ class DeterministicAgentLoopTests(unittest.IsolatedAsyncioTestCase):
             source.contexts[1].steps[0].observation.text, "page snapshot"
         )
 
+    async def test_sensitive_fill_bundle_is_redacted_before_all_retention(self) -> None:
+        secret = "SuperSecretPassword!"
+        username = "alice@example.test"
+        source = RecordingDecisionSource([
+            AgentToolCall("browser_fill_form", {"fields": [
+                {"name": "login-id", "value": username},
+                {"type": "password", "value": secret},
+            ]}),
+            AgentToolCall("finish", {"result": "safely rejected"}),
+        ])
+        executor = FakePolicyExecutor()
+        router = AgentToolRouter(
+            executor, [tool_definition("browser_fill_form")], RecordingControls()
+        )
+        result = await DeterministicAgentLoop(source, router, 3).run("Log in")
+        retained = repr((result, source.contexts, result.steps))
+        self.assertNotIn(secret, retained)
+        self.assertNotIn(username, retained)
+        self.assertEqual(executor.calls, [])
+        fields = result.steps[0].decision.arguments["fields"]
+        self.assertEqual([item["value"] for item in fields], ["[REDACTED]", "[REDACTED]"])
+        self.assertEqual(result.steps[0].observation.status, AgentStepStatus.REJECTED)
+        self.assertNotIn(secret, repr(source.contexts[1]))
+
+    async def test_rejected_ordinary_approval_continues_to_policy_confirmation(self) -> None:
+        executor = ConfirmationExecutor()
+        source = RecordingDecisionSource([
+            AgentToolCall("ask_user", {"question": "May I click the Login button?"}),
+            AgentToolCall("browser_click", {"ref": "login"}),
+            AgentToolCall("ask_user", {
+                "question": "Approve this exact click?", "confirmation_for_step": 2,
+            }),
+        ])
+        router = AgentToolRouter(
+            executor, [tool_definition("browser_click")], RecordingControls()
+        )
+        result = await DeterministicAgentLoop(source, router, 5).run("Log in")
+        self.assertEqual(result.pause_kind, AgentPauseKind.CONFIRMATION)
+        self.assertEqual([step.observation.status for step in result.steps], [
+            AgentStepStatus.REJECTED, AgentStepStatus.REJECTED,
+            AgentStepStatus.AWAITING_USER,
+        ])
+
     async def test_finish_stops_before_later_decisions(self) -> None:
         loop, source, _ = self.make_loop(
             [
@@ -362,8 +454,10 @@ class DeterministicAgentLoopTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         result = await loop.run("Inspect")
-        self.assertEqual(result.status, AgentRunStatus.FINISHED)
-        self.assertEqual(result.final_result, "done")
+        self.assertEqual(result.status, AgentRunStatus.AWAITING_USER)
+        self.assertEqual(result.pause_kind, AgentPauseKind.COMPLETION)
+        self.assertEqual(result.completion_proposal, "done")
+        self.assertIsNone(result.final_result)
         self.assertEqual(source.index, 1)
 
     async def test_ask_user_stops_before_later_decisions(self) -> None:
@@ -484,6 +578,8 @@ class ResumableAgentSessionTests(unittest.IsolatedAsyncioTestCase):
             [AgentToolCall("finish", {"result": "done"})]
         )
         result = await session.start("Inspect")
+        self.assertEqual(result.status, AgentRunStatus.AWAITING_USER)
+        result = await session.resolve_completion(True)
         self.assertEqual(result.status, AgentRunStatus.FINISHED)
         with self.assertRaises(AgentSessionStateError):
             await session.start("again")
@@ -501,6 +597,8 @@ class ResumableAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(paused.pause_kind, AgentPauseKind.USER_INPUT)
         self.assertIsNone(paused.pending_confirmation)
         result = await session.respond("2026")
+        self.assertEqual(result.pause_kind, AgentPauseKind.COMPLETION)
+        result = await session.resolve_completion(True)
         self.assertEqual(result.status, AgentRunStatus.FINISHED)
         self.assertEqual([step.step_number for step in result.steps], [1, 2])
         interaction = source.contexts[1].user_interactions[0]
@@ -549,6 +647,8 @@ class ResumableAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         returned = pending.arguments  # type: ignore[union-attr]
         returned["nested"]["values"].append(3)
         result = await session.confirm(True)
+        self.assertEqual(result.pause_kind, AgentPauseKind.COMPLETION)
+        result = await session.resolve_completion(True)
         self.assertEqual(result.status, AgentRunStatus.FINISHED)
         self.assertEqual(
             executor.calls,
@@ -577,6 +677,8 @@ class ResumableAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         )
         await session.start("Inspect")
         result = await session.confirm(False)
+        self.assertEqual(result.pause_kind, AgentPauseKind.COMPLETION)
+        result = await session.resolve_completion(True)
         self.assertEqual(result.status, AgentRunStatus.FINISHED)
         self.assertEqual(len(executor.calls), 1)
         self.assertIs(
@@ -810,6 +912,40 @@ class ResumableAgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source.index, 2)
         self.assertEqual(len(final_result.steps), 3)
 
+    async def test_completion_decline_feedback_and_multiple_proposals(self) -> None:
+        session, source, _ = self.make_session([
+            AgentToolCall("finish", {"result": "first proposal"}),
+            AgentToolCall("finish", {"result": "second proposal"}),
+        ], max_steps=2)
+        first = await session.start("Inspect")
+        self.assertEqual(first.pause_kind, AgentPauseKind.COMPLETION)
+        self.assertEqual(first.completion_proposal, "first proposal")
+        for invalid in (None, "", "   "):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(AgentUserResponseError):
+                    await session.resolve_completion(False, invalid)
+        second = await session.resolve_completion(False, "The export is missing")
+        self.assertEqual(second.completion_proposal, "second proposal")
+        self.assertEqual(source.contexts[-1].user_interactions[-1].response, "The export is missing")
+        finished = await session.resolve_completion(True)
+        self.assertEqual(finished.status, AgentRunStatus.FINISHED)
+        self.assertEqual(finished.final_result, "second proposal")
+        with self.assertRaises(AgentSessionStateError):
+            await session.resolve_completion(True)
+
+    async def test_completion_resolution_contract_and_final_step(self) -> None:
+        session, _, _ = self.make_session(
+            [AgentToolCall("finish", {"result": "done"})], max_steps=1
+        )
+        paused = await session.start("Inspect")
+        self.assertEqual(len(paused.steps), 1)
+        with self.assertRaises(AgentUserResponseError):
+            await session.resolve_completion(1)  # type: ignore[arg-type]
+        with self.assertRaises(AgentUserResponseError):
+            await session.resolve_completion(True, "extra")
+        finished = await session.resolve_completion(True)
+        self.assertEqual(finished.final_result, "done")
+
 
 class AgentLoopSmokeTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejects_navigate_mcp_error_before_later_finish(self) -> None:
@@ -918,8 +1054,10 @@ class SecretPauseTests(unittest.IsolatedAsyncioTestCase):
         session = ResumableAgentSession(source, router, 4)
         paused = await session.start("task")
         resumed = await session.resume_after_secret_application((SecretField.OTP,))
+        self.assertEqual(resumed.pause_kind, AgentPauseKind.COMPLETION)
+        resumed = await session.resolve_completion(True)
         self.assertEqual(resumed.status, AgentRunStatus.FINISHED)
-        self.assertEqual(resumed.user_interactions, ())
+        self.assertEqual(resumed.user_interactions[-1].kind, AgentPauseKind.COMPLETION)
         self.assertEqual(len(resumed.application_events), 1)
         event = resumed.application_events[0]
         self.assertEqual(event.fields, (SecretField.OTP,))
@@ -1072,11 +1210,13 @@ class SecretPauseTests(unittest.IsolatedAsyncioTestCase):
         for forbidden in ("Email", "Password", "u-ref", "p-ref", "SecretReference", "value"):
             self.assertNotIn(forbidden, event_text)
         finished = await session.resume_after_secret_application((SecretField.OTP,))
+        self.assertEqual(finished.pause_kind, AgentPauseKind.COMPLETION)
+        finished = await session.resolve_completion(True)
         self.assertEqual(finished.status, AgentRunStatus.FINISHED)
         self.assertEqual(len(finished.application_events), 2)
         self.assertIsNone(finished.secret_fields)
         self.assertIsNone(finished.secret_targets)
-        self.assertEqual(finished.user_interactions, ())
+        self.assertEqual(finished.user_interactions[-1].kind, AgentPauseKind.COMPLETION)
         self.assertEqual(first.user_interactions, ())
 
 

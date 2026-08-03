@@ -9,7 +9,7 @@ from typing import Annotated, Literal, TypeAlias
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, StrictStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, StrictStr, field_validator, model_validator
 
 from .run_manager import (
     RunConflictError,
@@ -34,8 +34,11 @@ from .operator_ui import (
     OPERATOR_CSS,
     OPERATOR_HTML,
     OPERATOR_JAVASCRIPT,
+    PROVIDER_TRACE_HTML,
+    PROVIDER_TRACE_JAVASCRIPT,
     SECURITY_HEADERS,
 )
+from .provider_trace import ProviderTraceRecord, ProviderTraceSnapshot
 
 _ERROR_MESSAGE_LIMIT = 500
 
@@ -50,11 +53,17 @@ def _non_empty_string(value: str) -> str:
     return value
 
 
+def _optional_non_empty_string(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _non_empty_string(value)
+
+
 class CreateRunRequest(_StrictHttpModel):
-    start_url: StrictStr
+    start_url: StrictStr | None = None
     task: StrictStr
 
-    _validate_start_url = field_validator("start_url")(_non_empty_string)
+    _validate_start_url = field_validator("start_url")(_optional_non_empty_string)
     _validate_task = field_validator("task")(_non_empty_string)
 
 
@@ -68,6 +77,7 @@ class RunInteractionType(str, Enum):
     USER_INPUT = "user_input"
     CONFIRMATION = "confirmation"
     SECRET = "secret"
+    COMPLETION = "completion"
 
 
 class _InteractionRequest(_StrictHttpModel):
@@ -92,6 +102,22 @@ class ConfirmationRunResponseRequest(_InteractionRequest):
     approved: StrictBool
 
 
+class CompletionRunResponseRequest(_InteractionRequest):
+    type: Literal[RunInteractionType.COMPLETION]
+    approved: StrictBool
+    feedback: StrictStr | None = None
+
+    @model_validator(mode="after")
+    def _validate_completion(self) -> "CompletionRunResponseRequest":
+        if self.approved and self.feedback is not None:
+            raise ValueError("approved completion cannot include feedback")
+        if not self.approved and (
+            self.feedback is None or not self.feedback.strip()
+        ):
+            raise ValueError("declined completion requires non-empty feedback")
+        return self
+
+
 class SecretRunResponseRequest(_InteractionRequest):
     type: Literal[RunInteractionType.SECRET]
     values: dict[StrictStr, SecretStr]
@@ -111,7 +137,7 @@ class SecretRunResponseRequest(_InteractionRequest):
 
 
 RunResponseRequest: TypeAlias = Annotated[
-    UserInputRunResponseRequest | ConfirmationRunResponseRequest | SecretRunResponseRequest,
+    UserInputRunResponseRequest | ConfirmationRunResponseRequest | CompletionRunResponseRequest | SecretRunResponseRequest,
     Field(discriminator="type"),
 ]
 
@@ -135,12 +161,13 @@ class RunHttpResponse(_StrictHttpModel):
     run_id: str
     status: RunStatus
     version: int
-    start_url: str
+    start_url: str | None
     task: str
     step_count: int
     question: str | None
     interaction_id: str | None
     final_result: str | None
+    completion_proposal: str | None
     error: RunHttpSnapshotError | None
     secret_fields: tuple[SecretField, ...] | None
     secret_targets: tuple[SecretTargetSummary, ...] | None
@@ -155,6 +182,45 @@ class HttpErrorBody(_StrictHttpModel):
 
 class HttpErrorResponse(_StrictHttpModel):
     error: HttpErrorBody
+
+
+class ProviderTraceHttpRecord(_StrictHttpModel):
+    sequence: int
+    timestamp: str
+    decision_sequence: int
+    attempt_number: int
+    model: str
+    tool_choice: str
+    offered_tool_names: tuple[str, ...]
+    previous_step_count: int
+    user_interaction_count: int
+    application_event_count: int
+    http_status: int | None
+    duration_ms: int
+    finish_reason: str | None
+    tool_call_count: int | None
+    assistant_content_present: bool
+    selected_tool_name: str | None
+    result_status: str
+    safe_error_type: str | None
+
+
+class ProviderTraceHttpResponse(_StrictHttpModel):
+    enabled: bool
+    traces: tuple[ProviderTraceHttpRecord, ...]
+
+
+def provider_traces_to_http_response(snapshot: ProviderTraceSnapshot) -> ProviderTraceHttpResponse:
+    if not isinstance(snapshot, ProviderTraceSnapshot):
+        raise TypeError("run manager must return a ProviderTraceSnapshot")
+    return ProviderTraceHttpResponse(
+        enabled=snapshot.enabled,
+        traces=tuple(
+            ProviderTraceHttpRecord(**record.__dict__)
+            for record in snapshot.traces
+            if isinstance(record, ProviderTraceRecord)
+        ),
+    )
 
 
 def snapshot_to_http_response(snapshot: RunSnapshot) -> RunHttpResponse:
@@ -194,6 +260,7 @@ def snapshot_to_http_response(snapshot: RunSnapshot) -> RunHttpResponse:
         question=snapshot.question,
         interaction_id=snapshot.interaction_id,
         final_result=snapshot.final_result,
+        completion_proposal=snapshot.completion_proposal,
         error=error,
         secret_fields=snapshot.secret_fields,
         secret_targets=snapshot.secret_targets,
@@ -215,7 +282,7 @@ def _error_response(status_code: int, code: str, message: str) -> JSONResponse:
 def create_http_app(run_manager: RunManager) -> FastAPI:
     """Create an HTTP application around one externally owned RunManager."""
     required_methods = (
-        "create_run", "get_run", "get_download", "respond", "confirm", "submit_secret", "cancel", "close"
+        "create_run", "get_run", "get_provider_traces", "get_download", "respond", "confirm", "resolve_completion", "submit_secret", "cancel", "close"
     )
     if run_manager is None or any(
         not callable(getattr(run_manager, method, None))
@@ -308,6 +375,20 @@ def create_http_app(run_manager: RunManager) -> FastAPI:
             OPERATOR_CSS, media_type="text/css", headers=dict(SECURITY_HEADERS)
         )
 
+    @app.get("/provider-trace", response_class=HTMLResponse, include_in_schema=False)
+    async def provider_trace_page() -> HTMLResponse:
+        headers = dict(SECURITY_HEADERS)
+        headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+        return HTMLResponse(PROVIDER_TRACE_HTML, headers=headers)
+
+    @app.get("/provider-trace.js", include_in_schema=False)
+    async def provider_trace_javascript() -> Response:
+        return Response(
+            PROVIDER_TRACE_JAVASCRIPT,
+            media_type="application/javascript",
+            headers=dict(SECURITY_HEADERS),
+        )
+
     @app.post(
         "/runs",
         response_model=RunHttpResponse,
@@ -327,6 +408,18 @@ def create_http_app(run_manager: RunManager) -> FastAPI:
     async def get_run(run_id: str) -> RunHttpResponse:
         snapshot = await app.state.run_manager.get_run(run_id)
         return snapshot_to_http_response(snapshot)
+
+    @app.get(
+        "/runs/{run_id}/provider-traces",
+        response_model=ProviderTraceHttpResponse,
+        status_code=status.HTTP_200_OK,
+    )
+    async def get_provider_traces(run_id: str) -> Response:
+        snapshot = await app.state.run_manager.get_provider_traces(run_id)
+        payload = provider_traces_to_http_response(snapshot)
+        return JSONResponse(
+            content=payload.model_dump(), headers={"Cache-Control": "no-store"}
+        )
 
     @app.get(
         "/runs/{run_id}/files/{file_id}",
@@ -362,6 +455,14 @@ def create_http_app(run_manager: RunManager) -> FastAPI:
                 request.interaction_id,
                 request.request_id,
                 request.approved,
+            )
+        elif isinstance(request, CompletionRunResponseRequest):
+            snapshot = await app.state.run_manager.resolve_completion(
+                run_id,
+                request.interaction_id,
+                request.request_id,
+                request.approved,
+                request.feedback,
             )
         else:
             values = {

@@ -93,7 +93,7 @@ def _finished_run(
             _step(
                 3,
                 "finish",
-                AgentStepStatus.FINISHED,
+                AgentStepStatus.COMPLETION_PROPOSED,
                 source=AgentToolSource.AGENT_CONTROL,
             ),
         )
@@ -251,7 +251,7 @@ def test_required_tools_are_an_ordered_subsequence() -> None:
         _step(
             4,
             "finish",
-            AgentStepStatus.FINISHED,
+            AgentStepStatus.COMPLETION_PROPOSED,
             source=AgentToolSource.AGENT_CONTROL,
         ),
     )
@@ -268,7 +268,7 @@ def test_missing_required_tool_fails() -> None:
             _step(
                 2,
                 "finish",
-                AgentStepStatus.FINISHED,
+                AgentStepStatus.COMPLETION_PROPOSED,
                 source=AgentToolSource.AGENT_CONTROL,
             ),
         )

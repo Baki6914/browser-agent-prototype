@@ -28,6 +28,7 @@ from browser_agent import (
     RunManagerClosedError,
     RunManagerError,
     RunFileNotFoundError,
+    ProviderTraceStore,
     RunDownloadStore,
     RunNotFoundError,
     RunStatus,
@@ -66,6 +67,7 @@ def result(
     pending_confirmation: PendingConfirmation | None = None,
     secret_fields: tuple[SecretField, ...] | None = None,
     secret_targets: tuple[SecretFieldTarget, ...] | None | object = _DEFAULT_TARGETS,
+    completion_proposal: str | None = None,
 ) -> AgentRunResult:
     if secret_targets is _DEFAULT_TARGETS and secret_fields is not None:
         secret_targets = tuple(
@@ -81,6 +83,7 @@ def result(
         pending_confirmation=pending_confirmation,
         secret_fields=secret_fields,
         secret_targets=secret_targets if secret_targets is not _DEFAULT_TARGETS else None,
+        completion_proposal=completion_proposal,
     )
 
 
@@ -109,6 +112,11 @@ class FakeSession:
 
     async def confirm(self, approved: bool) -> AgentRunResult:
         return await self._call("confirm", approved)
+
+    async def resolve_completion(
+        self, approved: bool, feedback: str | None = None
+    ) -> AgentRunResult:
+        return await self._call("completion", (approved, feedback))
 
     async def resume_after_secret_application(self, fields):
         return await self._call("secret_application", fields)
@@ -172,6 +180,7 @@ class FakeHandle:
         self.session = session
         self.secret_applier = FakeSecretApplier()
         self.download_store = FakeDownloadStore()
+        self.provider_trace_store = None
         self.close_error = close_error
         self.close_calls = 0
         self.closed = asyncio.Event()
@@ -210,12 +219,12 @@ class FakeFactory:
     ) -> None:
         self.handles = list(handles or [])
         self.error = error
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str | None, str]] = []
         self.entered = asyncio.Event()
         self.release = asyncio.Event()
         self.release.set()
 
-    async def create(self, start_url: str, task: str) -> FakeHandle:
+    async def create(self, start_url: str | None, task: str) -> FakeHandle:
         self.calls.append((start_url, task))
         self.entered.set()
         await self.release.wait()
@@ -321,6 +330,45 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
         self.managers.append(manager)
         return manager
 
+    async def test_provider_traces_are_run_isolated_retained_and_cleared_on_close(self) -> None:
+        stores = [ProviderTraceStore(enabled=True), ProviderTraceStore(enabled=True)]
+        handles = []
+        for store in stores:
+            handle = FakeHandle(FakeSession([result(
+                AgentRunStatus.AWAITING_USER,
+                question="Question?",
+                pause_kind=AgentPauseKind.USER_INPUT,
+            )]))
+            handle.provider_trace_store = store
+            handles.append(handle)
+        manager = self.manager(FakeFactory(handles))
+        first = await manager.create_run("https://example.com/a", "task a")
+        await self.settle(manager, first.run_id)
+        second = await manager.create_run("https://example.com/b", "task b")
+        await self.settle(manager, second.run_id)
+        common = dict(
+            timestamp="2026-08-03T00:00:00+00:00", decision_sequence=1,
+            attempt_number=1, tool_choice="required", offered_tool_names=("finish",),
+            previous_step_count=0, user_interaction_count=0,
+            application_event_count=0, http_status=200, duration_ms=1,
+            finish_reason="tool_calls", tool_call_count=1,
+            assistant_content_present=False, selected_tool_name="finish",
+            result_status="success", safe_error_type=None,
+        )
+        stores[0].record(model="run-a-model", **common)
+        stores[1].record(model="run-b-model", **common)
+        self.assertEqual(
+            [item.model for item in (await manager.get_provider_traces(first.run_id)).traces],
+            ["run-a-model"],
+        )
+        self.assertEqual(
+            [item.model for item in (await manager.get_provider_traces(second.run_id)).traces],
+            ["run-b-model"],
+        )
+        await manager.close()
+        self.assertEqual(stores[0].snapshot(), ())
+        self.assertEqual(stores[1].snapshot(), ())
+
     async def settle(self, manager: RunManager, run_id: str) -> None:
         record = manager._runs[run_id]
         task = record.active_task
@@ -342,6 +390,7 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
                     question="Question?",
                     pause_kind=kind,
                     pending_confirmation=pending,
+                    completion_proposal=("proposed result" if kind is AgentPauseKind.COMPLETION else None),
                 )
             ]
         )
@@ -427,6 +476,20 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
             ),
             1,
         )
+
+    async def test_urlless_run_passes_none_starts_session_and_preserves_audit(self) -> None:
+        session = FakeSession([result(AgentRunStatus.FINISHED, final_result="done")])
+        factory = FakeFactory([FakeHandle(session)])
+        manager = self.manager(factory)
+
+        created = await manager.create_run(None, "task with https://example.com")
+        await self.settle(manager, created.run_id)
+        finished = await manager.get_run(created.run_id)
+
+        self.assertEqual(factory.calls, [(None, "task with https://example.com")])
+        self.assertEqual(session.calls, [("start", "task with https://example.com")])
+        self.assertIsNone(finished.start_url)
+        self.assertEqual(finished.audit_events[0].summary, "Conversation started")
 
     async def test_hostile_unknown_tool_name_never_reaches_public_audit(self) -> None:
         hostile = (
@@ -1070,6 +1133,44 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
             manager.close(),
         )
         self.assertEqual(handle.close_calls, 1)
+
+
+    async def test_completion_approval_decline_idempotency_and_cleanup(self) -> None:
+        manager, session, handle, pause = await self.paused(AgentPauseKind.COMPLETION)
+        self.assertEqual(pause.status, RunStatus.AWAITING_COMPLETION)
+        self.assertEqual(pause.completion_proposal, "proposed result")
+        self.assertEqual((handle.close_calls, handle.download_store.finalize_calls), (0, 0))
+        session.results.append(result(
+            AgentRunStatus.AWAITING_USER,
+            question="Review again",
+            pause_kind=AgentPauseKind.COMPLETION,
+            completion_proposal="revised result",
+        ))
+        accepted = await manager.resolve_completion(
+            pause.run_id, pause.interaction_id, "decline-1", False, "More work remains"
+        )
+        self.assertEqual(accepted.status, RunStatus.RUNNING)
+        duplicate = await manager.resolve_completion(
+            pause.run_id, pause.interaction_id, "decline-1", False, "More work remains"
+        )
+        self.assertEqual(duplicate.version, accepted.version)
+        with self.assertRaises(RunIdempotencyConflictError):
+            await manager.resolve_completion(
+                pause.run_id, pause.interaction_id, "decline-1", False, "Different"
+            )
+        await self.settle(manager, pause.run_id)
+        revised = await manager.get_run(pause.run_id)
+        self.assertEqual(revised.status, RunStatus.AWAITING_COMPLETION)
+        self.assertEqual((handle.close_calls, handle.download_store.finalize_calls), (0, 0))
+        session.results.append(result(AgentRunStatus.FINISHED, final_result="revised result"))
+        await manager.resolve_completion(
+            pause.run_id, revised.interaction_id, "approve-1", True
+        )
+        await self.settle(manager, pause.run_id)
+        finished = await manager.get_run(pause.run_id)
+        self.assertEqual((finished.status, finished.final_result), (RunStatus.FINISHED, "revised result"))
+        self.assertIsNone(finished.completion_proposal)
+        self.assertEqual((handle.close_calls, handle.download_store.finalize_calls), (1, 1))
 
 
 class RunManagerSecretTests(unittest.IsolatedAsyncioTestCase):

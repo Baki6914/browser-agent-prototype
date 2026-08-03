@@ -9,7 +9,7 @@ import shutil
 import tempfile
 import threading
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from uuid import uuid4
@@ -19,6 +19,7 @@ from .mcp_gateway import ToolObservation
 _PARTIAL_SUFFIXES = (".crdownload", ".part", ".tmp")
 _COMPLETED_LINE = re.compile(r'^- Downloaded file .+ to "([^"]*)"$')
 _COMPLETED_CLAIM = "- Downloaded file "
+_APPLICATION_DOWNLOAD_MARKER = "Application recorded download:"
 
 
 class DownloadError(Exception):
@@ -299,16 +300,24 @@ class DownloadTrackingExecutor:
             raise DownloadTrackingError("tool observation is invalid")
         if observation.status != "success":
             return observation
+        recorded: list[DownloadMetadata] = []
         try:
             for path in extract_completed_download_paths(observation.text):
-                self._store.record_completed(path)
+                recorded.append(self._store.record_completed(path))
         except DownloadTrackingError:
             raise
         except DownloadError:
             raise DownloadTrackingError("completed download tracking failed safely") from None
         except Exception:
             raise DownloadTrackingError("completed download tracking failed safely") from None
-        return observation
+        if not recorded:
+            return observation
+        markers = "\n".join(
+            f"{_APPLICATION_DOWNLOAD_MARKER} {item.filename} ({item.size} bytes)"
+            for item in recorded
+        )
+        text = f"{observation.text}\n{markers}" if observation.text else markers
+        return replace(observation, text=text)
 
     async def invoke_internal(
         self, tool_name: str, arguments: Mapping[str, Any]

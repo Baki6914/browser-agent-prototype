@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -22,6 +23,65 @@ from .secret_store import SecretField
 from .secret_application import SecretFieldTarget
 
 
+_SENSITIVE_FORM_REJECTION = "Sensitive form values must be supplied through request_secret."
+_ORDINARY_APPROVAL_REJECTION = (
+    "Ordinary ask_user cannot request browser-action approval. Attempt the intended "
+    "browser tool once and use policy-backed confirmation if required."
+)
+_FORM_VALUE_REDACTION = "[REDACTED]"
+
+
+def _normalized_words(value: Any) -> str:
+    if type(value) is not str:
+        return ""
+    return " ".join(re.sub(r"[-_]+", " ", value.strip().casefold()).split())
+
+
+def _is_protected_form_field(field: Any) -> bool:
+    if type(field) is not dict:
+        return False
+    protected = {"password", "passwd", "passcode", "pin", "otp", "one time code", "verification code", "security code", "secret", "token"}
+    return any(
+        any(
+            normalized == term or f" {term} " in f" {normalized} "
+            for term in protected
+        )
+        for key in ("name", "label", "type", "input_type", "inputType")
+        if (normalized := _normalized_words(field.get(key)))
+    )
+
+
+def _redact_sensitive_fill_form(decision: "AgentToolCall") -> tuple["AgentToolCall", bool]:
+    if decision.tool_name != "browser_fill_form":
+        return decision, False
+    arguments = decision.arguments
+    fields = arguments.get("fields")
+    if type(fields) is not list or not any(_is_protected_form_field(field) for field in fields):
+        return decision, False
+    redacted_fields: list[Any] = []
+    for field in fields:
+        safe_field = deepcopy(field)
+        if type(safe_field) is dict and "value" in safe_field:
+            safe_field["value"] = _FORM_VALUE_REDACTION
+        redacted_fields.append(safe_field)
+    arguments["fields"] = redacted_fields
+    return AgentToolCall(decision.tool_name, arguments), True
+
+
+def _is_ordinary_action_approval(decision: "AgentToolCall") -> bool:
+    if decision.tool_name != "ask_user":
+        return False
+    arguments = decision.arguments
+    if arguments.get("confirmation_for_step") is not None:
+        return False
+    question = _normalized_words(arguments.get("question"))
+    if question.startswith(("which ", "what ", "where ", "when ", "who ", "hangi ", "hangi̇ ", "ne ", "nerede ", "ne zaman ", "kim ")):
+        return False
+    approval = ("approve", "approval", "may i", "can i", "should i", "do you want me to", "shall i", "proceed", "permission", "onay", "izin", "devam edeyim", "yapayım mı", "yapabilir miyim")
+    actions = ("click", "submit", "fill", "type", "login", "log in", "download", "open", "navigate", "press", "select", "upload", "tıkla", "tıkl", "gönder", "doldur", "yaz", "giriş", "indir", "aç", "git", "bas", "seç", "yükle")
+    return any(term in question for term in approval) and any(term in question for term in actions)
+
+
 class AgentToolSource(str, Enum):
     MCP = "mcp"
     AGENT_CONTROL = "agent_control"
@@ -32,7 +92,7 @@ class AgentStepStatus(str, Enum):
     MCP_ERROR = "mcp_error"
     TRANSPORT_ERROR = "transport_error"
     REJECTED = "rejected"
-    FINISHED = "finished"
+    COMPLETION_PROPOSED = "completion_proposed"
     AWAITING_USER = "awaiting_user"
     AWAITING_SECRET = "awaiting_secret"
 
@@ -88,6 +148,7 @@ class AgentPauseKind(str, Enum):
     USER_INPUT = "user_input"
     CONFIRMATION = "confirmation"
     SECRET = "secret"
+    COMPLETION = "completion"
 
 
 class AgentApplicationEventKind(str, Enum):
@@ -244,6 +305,11 @@ class AgentUserInput:
             raise AgentUserResponseError(
                 "secret pauses do not accept AgentUserInput"
             )
+        elif self.kind is AgentPauseKind.COMPLETION:
+            if not isinstance(self.response, (str, bool)) or (
+                isinstance(self.response, str) and not self.response.strip()
+            ):
+                raise AgentUserResponseError("completion response is invalid")
 
 
 @dataclass(frozen=True)
@@ -333,6 +399,7 @@ class AgentRunResult:
     secret_fields: tuple[SecretField, ...] | None = None
     secret_targets: tuple[SecretFieldTarget, ...] | None = field(default=None, repr=False)
     application_events: tuple[AgentApplicationEvent, ...] = ()
+    completion_proposal: str | None = None
 
 
 class AgentDecisionSourceProtocol(Protocol):
@@ -453,13 +520,18 @@ class AgentToolRouter:
     ) -> AgentStepObservation:
         if type(confirmation_granted) is not bool:
             raise TypeError("confirmation_granted must be a bool")
+        decision, sensitive_fill = _redact_sensitive_fill_form(decision)
+        if sensitive_fill:
+            return AgentStepObservation(decision.tool_name, AgentToolSource.MCP, AgentStepStatus.REJECTED, _SENSITIVE_FORM_REJECTION, None)
+        if _is_ordinary_action_approval(decision):
+            return AgentStepObservation(decision.tool_name, AgentToolSource.AGENT_CONTROL, AgentStepStatus.REJECTED, _ORDINARY_APPROVAL_REJECTION, None)
         try:
             if decision.tool_name in self._control_names:
                 result = self._agent_controls.execute(
                     decision.tool_name, decision.arguments
                 )
                 status = {
-                    AgentControlStatus.FINISHED: AgentStepStatus.FINISHED,
+                    AgentControlStatus.COMPLETION_PROPOSED: AgentStepStatus.COMPLETION_PROPOSED,
                     AgentControlStatus.AWAITING_USER: AgentStepStatus.AWAITING_USER,
                     AgentControlStatus.AWAITING_SECRET: AgentStepStatus.AWAITING_SECRET,
                 }[result.status]
@@ -564,6 +636,7 @@ class ResumableAgentSession:
         self._secret_fields: tuple[SecretField, ...] | None = None
         self._secret_targets: tuple[SecretFieldTarget, ...] | None = None
         self._application_events: list[AgentApplicationEvent] = []
+        self._completion_proposal: str | None = None
         self._terminal_result: AgentRunResult | None = None
         self._started = False
         self._failed = False
@@ -660,6 +733,32 @@ class ResumableAgentSession:
                 return self._terminate(AgentRunStatus.STEP_LIMIT_REACHED)
             return await self._continue()
 
+    async def resolve_completion(
+        self, approved: bool, feedback: str | None = None
+    ) -> AgentRunResult:
+        async with self._lock:
+            self._require_pause(AgentPauseKind.COMPLETION)
+            if type(approved) is not bool:
+                raise AgentUserResponseError("completion approval must be a bool")
+            if approved:
+                if feedback is not None:
+                    raise AgentUserResponseError("approved completion cannot include feedback")
+            elif type(feedback) is not str or not feedback.strip():
+                raise AgentUserResponseError("declined completion requires non-empty feedback")
+            proposal = self._completion_proposal
+            if type(proposal) is not str or not proposal.strip():
+                raise AgentSessionStateError("completion proposal is unavailable")
+            question = self._question or ""
+            self._user_interactions.append(AgentUserInput(
+                len(self._steps), AgentPauseKind.COMPLETION, question,
+                True if approved else feedback,
+            ))
+            self._completion_proposal = None
+            self._clear_pause()
+            if approved:
+                return self._terminate(AgentRunStatus.FINISHED, proposal)
+            return await self._continue()
+
     async def resume_after_secret_application(
         self, fields: tuple[SecretField, ...]
     ) -> AgentRunResult:
@@ -714,6 +813,7 @@ class ResumableAgentSession:
             self._secret_fields,
             self._secret_targets,
             tuple(self._application_events),
+            self._completion_proposal,
         )
 
     def _terminate(
@@ -724,6 +824,7 @@ class ResumableAgentSession:
         self._candidate = None
         self._pending_confirmation = None
         self._clear_pause()
+        self._completion_proposal = None
         self._terminal_result = self._result(status, final_result)
         return self._terminal_result
 
@@ -741,6 +842,7 @@ class ResumableAgentSession:
                 return self._terminate(
                     AgentRunStatus.DECISION_SOURCE_EXHAUSTED
                 )
+            decision, _ = _redact_sensitive_fill_form(decision)
             previous_candidate = self._candidate
             self._candidate = None
             observation = await self._router.route(
@@ -760,10 +862,19 @@ class ResumableAgentSession:
                     )
                 except AgentSessionConstructionError:
                     self._candidate = None
-            if observation.status is AgentStepStatus.FINISHED:
-                return self._terminate(
-                    AgentRunStatus.FINISHED, observation.text
+            if observation.status is AgentStepStatus.COMPLETION_PROPOSED:
+                if type(observation.text) is not str or not observation.text.strip():
+                    self._failed = True
+                    raise AgentSessionStateError("completion proposal must be non-empty")
+                self._candidate = None
+                self._pending_confirmation = None
+                self._pause_kind = AgentPauseKind.COMPLETION
+                self._question = (
+                    "The agent believes the task is complete. Finish the run or "
+                    "tell it what remains."
                 )
+                self._completion_proposal = observation.text
+                return self._result(AgentRunStatus.AWAITING_USER)
             if observation.status is AgentStepStatus.AWAITING_USER:
                 reference = observation.confirmation_for_step
                 if (

@@ -25,6 +25,7 @@ from .openai_provider import (
     OpenAICompatibleDecisionSource,
     OpenAICompatibleProviderConfig,
 )
+from .provider_trace import ProviderTraceStore
 from .run_manager import RunManager
 from .secret_application import SecretFormApplier
 from .secret_store import TransientSecretStore
@@ -83,6 +84,8 @@ class BrowserAgentApplicationConfig:
     mcp_cli_path: Path
     mcp_config_path: Path
     max_steps: int
+    provider_trace_enabled: bool = False
+    provider_trace_limit: int = 200
 
     def __post_init__(self) -> None:
         try:
@@ -90,6 +93,10 @@ class BrowserAgentApplicationConfig:
                 raise ValueError("provider configuration is invalid")
             if type(self.max_steps) is not int or self.max_steps <= 0:
                 raise ValueError("max_steps must be an exact positive int")
+            if type(self.provider_trace_enabled) is not bool:
+                raise ValueError("provider_trace_enabled must be a bool")
+            if type(self.provider_trace_limit) is not int or self.provider_trace_limit <= 0:
+                raise ValueError("provider_trace_limit must be an exact positive int")
             if type(self.node_command) is not str or not self.node_command.strip():
                 raise ValueError("node_command must be a non-empty string")
             for name in ("mcp_cli_path", "mcp_config_path"):
@@ -138,6 +145,8 @@ def load_application_config_from_environment() -> BrowserAgentApplicationConfig:
     node = _environment_value("BROWSER_AGENT_NODE_COMMAND")
     cli = _environment_value("BROWSER_AGENT_MCP_CLI_PATH")
     mcp_config = _environment_value("BROWSER_AGENT_MCP_CONFIG_PATH")
+    trace_enabled_text = _environment_value("BROWSER_AGENT_PROVIDER_TRACE_ENABLED")
+    trace_limit_text = _environment_value("BROWSER_AGENT_PROVIDER_TRACE_LIMIT")
 
     if node is None:
         node = shutil.which("node")
@@ -152,6 +161,29 @@ def load_application_config_from_environment() -> BrowserAgentApplicationConfig:
     except ValueError:
         raise BrowserAgentApplicationConfigurationError(
             "BROWSER_AGENT_LLM_TIMEOUT must be a finite positive number"
+        ) from None
+    try:
+        if trace_enabled_text is None:
+            trace_enabled = False
+        elif trace_enabled_text.strip().lower() == "true":
+            trace_enabled = True
+        elif trace_enabled_text.strip().lower() == "false":
+            trace_enabled = False
+        else:
+            raise ValueError
+    except ValueError:
+        raise BrowserAgentApplicationConfigurationError(
+            "BROWSER_AGENT_PROVIDER_TRACE_ENABLED must be true or false"
+        ) from None
+    try:
+        trace_limit = int(trace_limit_text) if trace_limit_text is not None else 200
+        if trace_limit_text is not None and str(trace_limit) != trace_limit_text.strip():
+            raise ValueError
+        if trace_limit <= 0:
+            raise ValueError
+    except ValueError:
+        raise BrowserAgentApplicationConfigurationError(
+            "BROWSER_AGENT_PROVIDER_TRACE_LIMIT must be a positive integer"
         ) from None
     try:
         max_steps = int(max_steps_text) if max_steps_text is not None else 10
@@ -178,6 +210,8 @@ def load_application_config_from_environment() -> BrowserAgentApplicationConfig:
             mcp_cli_path=Path(cli) if cli is not None else root / "node_modules" / "@playwright" / "mcp" / "cli.js",
             mcp_config_path=Path(mcp_config) if mcp_config is not None else root / "config" / "playwright-mcp.spike.json",
             max_steps=max_steps,
+            provider_trace_enabled=trace_enabled,
+            provider_trace_limit=trace_limit,
         )
     except BrowserAgentApplicationConfigurationError:
         raise
@@ -244,6 +278,7 @@ class _RunSessionStartup:
     secret_applier: SecretFormApplier
     download_store: RunDownloadStore
     tracking_executor: DownloadTrackingExecutor
+    provider_trace_store: ProviderTraceStore
 
 
 @dataclass(frozen=True)
@@ -262,10 +297,12 @@ class PlaywrightMcpRunSessionHandle:
         download_store: RunDownloadStore,
         tracking_executor: DownloadTrackingExecutor,
         lifecycle: _RunSessionLifecycle,
+        provider_trace_store: ProviderTraceStore | None = None,
     ) -> None:
         self.session = session
         self.secret_applier = secret_applier
         self.download_store = download_store
+        self.provider_trace_store = provider_trace_store
         self._tracking_executor = tracking_executor
         self._lifecycle = lifecycle
 
@@ -305,9 +342,10 @@ class PlaywrightMcpRunSessionFactory:
         self._client_session_factory = client_session_factory
 
     async def create(
-        self, start_url: str, task: str
+        self, start_url: str | None, task: str
     ) -> PlaywrightMcpRunSessionHandle:
-        _validate_start_url(start_url)
+        if start_url is not None:
+            _validate_start_url(start_url)
         if type(task) is not str or not task.strip():
             raise BrowserAgentApplicationConstructionError(
                 "task must be a non-empty string"
@@ -346,11 +384,12 @@ class PlaywrightMcpRunSessionFactory:
             ready.download_store,
             ready.tracking_executor,
             lifecycle,
+            ready.provider_trace_store,
         )
 
     async def _own_run_session(
         self,
-        start_url: str,
+        start_url: str | None,
         startup: asyncio.Future[_RunSessionStartup],
         close_requested: asyncio.Event,
         startup_abandoned: asyncio.Event,
@@ -359,9 +398,14 @@ class PlaywrightMcpRunSessionFactory:
         stdio_context: object | None = None
         client_context: object | None = None
         tracking: DownloadTrackingExecutor | None = None
+        provider_trace_store = ProviderTraceStore(
+            enabled=self._config.provider_trace_enabled,
+            limit=self._config.provider_trace_limit,
+        )
         startup_succeeded = False
         try:
-            _validate_start_url(start_url)
+            if start_url is not None:
+                _validate_start_url(start_url)
             store = RunDownloadStore(self._config.download_base_directory)
             parameters = StdioServerParameters(
                 command=self._config.node_command,
@@ -386,24 +430,28 @@ class PlaywrightMcpRunSessionFactory:
             policy = McpToolPolicy(definitions)
             enforced = PolicyEnforcedToolExecutor(gateway, policy)
             tracking = DownloadTrackingExecutor(enforced, store)
-            navigation = await tracking.invoke(
-                "browser_navigate",
-                {"url": start_url},
-                confirmation_granted=False,
-            )
-            if type(navigation) is not ToolObservation or navigation.status != "success":
-                raise RuntimeError("initial browser navigation failed")
+            if start_url is not None:
+                navigation = await tracking.invoke(
+                    "browser_navigate",
+                    {"url": start_url},
+                    confirmation_granted=False,
+                )
+                if type(navigation) is not ToolObservation or navigation.status != "success":
+                    raise RuntimeError("initial browser navigation failed")
             router = AgentToolRouter(
                 tracking, policy.llm_visible_tools(), AgentControlExecutor()
             )
-            decision_source = OpenAICompatibleDecisionSource(self._config.provider)
+            decision_source = OpenAICompatibleDecisionSource(
+                self._config.provider, trace_recorder=provider_trace_store
+            )
             agent_session = ResumableAgentSession(
                 decision_source, router, self._config.max_steps
             )
             secret_applier = SecretFormApplier(tracking, definitions)
             startup.set_result(
                 _RunSessionStartup(
-                    agent_session, secret_applier, store, tracking
+                    agent_session, secret_applier, store, tracking,
+                    provider_trace_store,
                 )
             )
             startup_succeeded = True

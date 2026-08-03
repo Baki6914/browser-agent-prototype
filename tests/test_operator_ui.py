@@ -3,18 +3,27 @@
 import json
 import subprocess
 
-from browser_agent.operator_ui import OPERATOR_HTML, OPERATOR_JAVASCRIPT
+from browser_agent.operator_ui import (
+    OPERATOR_CSS, OPERATOR_HTML, OPERATOR_JAVASCRIPT,
+    PROVIDER_TRACE_HTML, PROVIDER_TRACE_JAVASCRIPT,
+)
 
 
 def test_page_contains_required_controls() -> None:
     for identifier in (
-        "start-url", "task", "start", "run-id", "status", "question",
+        "task", "start", "run-id", "status", "question",
         "user-response", "approve", "reject", "secret-fields", "cancel",
         "result", "downloads", "activity", "error", "timeline", "timeline-empty",
         "conversation", "diagnostics",
         "diagnostics-panel", "toggle-diagnostics", "diagnostics-follow",
+        "completion-panel", "completion-proposal", "completion-feedback",
+        "finish-run", "continue-working",
+        "composer", "start-composer", "composer-state",
+        "provider-trace-link",
     ):
         assert f'id="{identifier}"' in OPERATOR_HTML
+    assert 'id="start-url"' not in OPERATOR_HTML
+    assert "Start URL" not in OPERATOR_HTML
 
 
 def test_javascript_uses_existing_api_and_safe_dom_rendering() -> None:
@@ -26,6 +35,53 @@ def test_javascript_uses_existing_api_and_safe_dom_rendering() -> None:
     assert "snapshot.audit_events" in OPERATOR_JAVASCRIPT
     assert "innerHTML" not in OPERATOR_JAVASCRIPT
     assert "credentials:'same-origin'" in OPERATOR_JAVASCRIPT
+    assert "type:'completion'" in OPERATOR_JAVASCRIPT
+    assert "approved:true" in OPERATOR_JAVASCRIPT
+    assert "approved:false,feedback" in OPERATOR_JAVASCRIPT
+    assert "event.key==='Enter'&&!event.shiftKey" in OPERATOR_JAVASCRIPT
+    assert "body:JSON.stringify({task})" in OPERATOR_JAVASCRIPT
+    assert "start_url" not in OPERATOR_JAVASCRIPT
+    assert "message('user',task)" in OPERATOR_JAVASCRIPT
+
+
+def test_chat_shell_and_responsive_diagnostics_layout() -> None:
+    assert 'class="conversation-scroll"' in OPERATOR_HTML
+    assert 'class="start-card"' not in OPERATOR_HTML
+    assert "position:sticky;bottom:0" in OPERATOR_CSS
+    assert "grid-template-columns:minmax(0,1fr) minmax(340px,var(--drawer))" in OPERATOR_CSS
+    assert ".columns.diagnostics-closed{grid-template-columns:minmax(0,1fr)}" in OPERATOR_CSS
+    assert "@media(max-width:700px)" in OPERATOR_CSS
+    assert "position:fixed;inset:0" in OPERATOR_CSS
+    assert "padding-left:2.4rem" in OPERATOR_CSS
+    assert "overflow:auto" in OPERATOR_CSS
+    assert "setDiagnosticsOpen(byId('diagnostics-panel').hidden)" in OPERATOR_JAVASCRIPT
+
+
+def test_provider_trace_is_a_separate_safe_screen() -> None:
+    assert 'src="/provider-trace.js"' in PROVIDER_TRACE_HTML
+    assert 'href="/"' in PROVIDER_TRACE_HTML
+    assert "/provider-traces" in PROVIDER_TRACE_JAVASCRIPT
+    assert "setInterval(poll,1000)" in PROVIDER_TRACE_JAVASCRIPT
+    assert "textContent" in PROVIDER_TRACE_JAVASCRIPT
+    assert "innerHTML" not in PROVIDER_TRACE_JAVASCRIPT
+    assert "raw prompt" not in PROVIDER_TRACE_HTML.lower()
+    assert 'id="diagnostics-panel"' in OPERATOR_HTML
+
+
+def test_interactions_downloads_and_no_free_form_message_endpoint() -> None:
+    assert 'class="interaction-card downloads-card"' in OPERATOR_HTML
+    assert 'id="confirmation-panel"' in OPERATOR_HTML
+    assert 'id="completion-panel"' in OPERATOR_HTML
+    assert 'id="secret-panel"' in OPERATOR_HTML
+    assert "state.seenFiles.has(file.file_id)" in OPERATOR_JAVASCRIPT
+    assert "state.finalShown" in OPERATOR_JAVASCRIPT
+    assert "dataset.renderedId" in OPERATOR_JAVASCRIPT
+    assert "link.href=`runs/${encodeURIComponent(snapshot.run_id)}/files/" in OPERATOR_JAVASCRIPT
+    assert "/messages" not in OPERATOR_JAVASCRIPT
+    assert "state.completionKeys.has(key)" in OPERATOR_JAVASCRIPT
+    assert "state.completionTexts.has(snapshot.final_result)" in OPERATOR_JAVASCRIPT
+    assert "state.completionKeys.clear()" in OPERATOR_JAVASCRIPT
+    assert "message('agent',snapshot.completion_proposal||'')" not in OPERATOR_JAVASCRIPT
 
 
 def test_browser_storage_external_assets_and_payload_logging_are_absent() -> None:
@@ -99,6 +155,9 @@ const renderedText = (node) => node.textContent + node.children.map(renderedText
         "start-url", "task", "send-response", "approve", "reject", "send-secret",
         "timeline", "timeline-empty", "timeline-wrap", "conversation", "diagnostics",
         "diagnostics-panel", "toggle-diagnostics", "diagnostics-follow", "columns",
+        "completion-panel", "completion-proposal", "completion-feedback",
+        "finish-run", "continue-working",
+        "start-composer", "composer-state", "composer",
     ]))
     scenarios = r"""
 (async () => {
@@ -138,6 +197,7 @@ const renderedText = (node) => node.textContent + node.children.map(renderedText
   assert(renderedText(elements.diagnostics).includes('timeline B'),'newer timeline B was not rendered');
   intervals.at(-1)(); await flush(); calls[5].finish(200,snap('run-b',1,'failed',null,[],[event(1,'timeline A')])); await flush(); await flush();
   assert(renderedText(elements.diagnostics).includes('timeline B') && !renderedText(elements.diagnostics).includes('timeline A'),'equal-version timeline replaced B');
+  assert(!renderedText(elements.diagnostics).includes('method: GET'),'routine successful GET polling produced diagnostics noise');
   assert(elements.status.textContent==='awaiting_user','equal-version response changed status');
   intervals.at(-1)(); await flush(); calls[6].finish(200,snap('run-b',0,'failed',null,[],[event(1,'lower timeline')])); await flush(); await flush();
   assert(!renderedText(elements.diagnostics).includes('lower timeline'),'lower-version timeline rendered');

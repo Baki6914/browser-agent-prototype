@@ -194,6 +194,8 @@ class ApplicationTestCase(unittest.TestCase):
         with self.assertRaises((AttributeError, TypeError)):
             config.max_steps = 5
         self.assertNotIn(API_KEY, repr(config))
+        self.assertFalse(config.provider_trace_enabled)
+        self.assertEqual(config.provider_trace_limit, 200)
 
     def test_config_rejects_invalid_max_steps_and_node(self):
         for value in (0, -1, True, "1", 1.5):
@@ -238,6 +240,8 @@ class ApplicationTestCase(unittest.TestCase):
             "BROWSER_AGENT_NODE_COMMAND": "node-custom",
             "BROWSER_AGENT_MCP_CLI_PATH": str(self.cli),
             "BROWSER_AGENT_MCP_CONFIG_PATH": str(self.mcp_config),
+            "BROWSER_AGENT_PROVIDER_TRACE_ENABLED": "true",
+            "BROWSER_AGENT_PROVIDER_TRACE_LIMIT": "17",
         }
         with patch.dict(os.environ, env, clear=True):
             config = load_application_config_from_environment()
@@ -245,6 +249,8 @@ class ApplicationTestCase(unittest.TestCase):
         self.assertEqual(config.provider.timeout_seconds, 12.5)
         self.assertEqual(config.max_steps, 6)
         self.assertEqual(config.node_command, "node-custom")
+        self.assertTrue(config.provider_trace_enabled)
+        self.assertEqual(config.provider_trace_limit, 17)
         self.assertFalse(self.downloads.exists())
         self.assertNotIn(API_KEY, repr(config))
 
@@ -301,6 +307,9 @@ class ApplicationTestCase(unittest.TestCase):
             ("BROWSER_AGENT_MAX_STEPS", "0"),
             ("BROWSER_AGENT_LLM_API_KEY", ""),
             ("BROWSER_AGENT_NODE_COMMAND", " "),
+            ("BROWSER_AGENT_PROVIDER_TRACE_ENABLED", "yes"),
+            ("BROWSER_AGENT_PROVIDER_TRACE_LIMIT", "0"),
+            ("BROWSER_AGENT_PROVIDER_TRACE_LIMIT", "1.5"),
         ):
             env = dict(required, **{name: value})
             with self.subTest(name=name, value=value), patch.dict(
@@ -318,6 +327,7 @@ class ApplicationTestCase(unittest.TestCase):
         self.assertEqual(paths, {
             "/runs", "/runs/{run_id}", "/runs/{run_id}/responses",
             "/runs/{run_id}/cancel", "/runs/{run_id}/files/{file_id}",
+            "/runs/{run_id}/provider-traces",
         })
         self.assertFalse(self.downloads.exists())
         stdio.assert_not_called()
@@ -430,6 +440,29 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         with patch.object(DownloadTrackingExecutor, "invoke", new=recording):
             handle = await factory.create(start_url, "inspect")
         self.assertEqual(observed[0], ("browser_navigate", {"url": start_url}, False))
+        await handle.close()
+
+    async def test_urlless_factory_skips_navigation_but_keeps_browser_tools(self):
+        observed = []
+        original = DownloadTrackingExecutor.invoke
+
+        async def recording(executor, name, arguments, *, confirmation_granted=False):
+            observed.append((name, arguments, confirmation_granted))
+            return await original(executor, name, arguments, confirmation_granted=confirmation_granted)
+
+        harness = Harness()
+        factory = PlaywrightMcpRunSessionFactory(
+            self.config(), stdio_factory=harness.stdio,
+            client_session_factory=harness.client,
+        )
+        with patch.object(DownloadTrackingExecutor, "invoke", new=recording):
+            handle = await factory.create(None, "inspect")
+
+        self.assertEqual(observed, [])
+        visible = {tool.name for tool in handle.session._router.definitions()}
+        self.assertIn("browser_navigate", visible)
+        self.assertIn("ask_user", visible)
+        self.assertTrue(handle.download_store.output_directory.exists())
         await handle.close()
 
     async def test_invalid_urls_fail_before_stdio(self):

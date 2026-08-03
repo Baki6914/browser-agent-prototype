@@ -42,6 +42,7 @@ from .secret_application import (
     SecretTargetSummary,
 )
 from .tool_policy import TOOL_POLICY_REGISTRY
+from .provider_trace import ProviderTraceSnapshot, ProviderTraceStore
 
 _ERROR_MESSAGE_LIMIT = 500
 _AUDIT_SUMMARY_LIMIT = 200
@@ -60,6 +61,7 @@ class RunStatus(str, Enum):
     RUNNING = "running"
     AWAITING_USER = "awaiting_user"
     AWAITING_CONFIRMATION = "awaiting_confirmation"
+    AWAITING_COMPLETION = "awaiting_completion"
     AWAITING_SECRET = "awaiting_secret"
     AWAITING_SECRET_APPLICATION = "awaiting_secret_application"
     FINISHED = "finished"
@@ -75,6 +77,7 @@ class RunAuditKind(str, Enum):
     USER_INPUT = "user_input"
     CONFIRMATION = "confirmation"
     SECRET = "secret"
+    COMPLETION = "completion"
 
 
 class RunAuditStatus(str, Enum):
@@ -141,7 +144,7 @@ class RunSnapshot:
     run_id: str
     status: RunStatus
     version: int
-    start_url: str
+    start_url: str | None
     task: str
     step_count: int
     question: str | None
@@ -153,6 +156,7 @@ class RunSnapshot:
     secret_targets: tuple[SecretTargetSummary, ...] | None = None
     files: tuple[DownloadMetadata, ...] = ()
     audit_events: tuple[RunAuditEvent, ...] = ()
+    completion_proposal: str | None = None
 
 
 class RunManagerError(Exception):
@@ -190,6 +194,10 @@ class RunSessionProtocol(Protocol):
 
     async def confirm(self, approved: bool) -> AgentRunResult: ...
 
+    async def resolve_completion(
+        self, approved: bool, feedback: str | None = None
+    ) -> AgentRunResult: ...
+
     async def resume_after_secret_application(
         self, fields: tuple[SecretField, ...]
     ) -> AgentRunResult: ...
@@ -199,13 +207,14 @@ class RunSessionHandleProtocol(Protocol):
     session: RunSessionProtocol
     secret_applier: SecretFormApplierProtocol
     download_store: RunDownloadStore
+    provider_trace_store: ProviderTraceStore
 
     async def close(self) -> None: ...
 
 
 class RunSessionFactoryProtocol(Protocol):
     async def create(
-        self, start_url: str, task: str
+        self, start_url: str | None, task: str
     ) -> RunSessionHandleProtocol: ...
 
 
@@ -215,12 +224,13 @@ class _RequestFingerprint:
     interaction_id: str | None = None
     payload: str | bool | None = field(default=None, repr=False)
     secret_digest: bytes | None = field(default=None, repr=False)
+    feedback: str | None = field(default=None, repr=False)
 
 
 @dataclass
 class _RunRecord:
     run_id: str
-    start_url: str
+    start_url: str | None
     task: str
     status: RunStatus = RunStatus.QUEUED
     version: int = 1
@@ -228,6 +238,7 @@ class _RunRecord:
     question: str | None = None
     interaction_id: str | None = None
     final_result: str | None = None
+    completion_proposal: str | None = None
     error_type: str | None = None
     error_message: str | None = None
     handle: RunSessionHandleProtocol | None = None
@@ -242,6 +253,7 @@ class _RunRecord:
     secret_targets: tuple[SecretFieldTarget, ...] | None = field(default=None, repr=False)
     secret_applier: SecretFormApplierProtocol | None = field(default=None, repr=False)
     download_store: RunDownloadStore | None = field(default=None, repr=False)
+    provider_trace_store: ProviderTraceStore | None = field(default=None, repr=False)
     audit_events: tuple[RunAuditEvent, ...] = ()
 
 
@@ -283,10 +295,11 @@ class RunManager:
         self._closed = False
         self._close_task: asyncio.Task[bool] | None = None
 
-    async def create_run(self, start_url: str, task: str) -> RunSnapshot:
-        start_url = _required_string(
-            start_url, "start_url", RunConstructionError
-        )
+    async def create_run(self, start_url: str | None, task: str) -> RunSnapshot:
+        if start_url is not None:
+            start_url = _required_string(
+                start_url, "start_url", RunConstructionError
+            )
         task = _required_string(task, "task", RunConstructionError)
         async with self._lock:
             self._ensure_open()
@@ -304,6 +317,16 @@ class RunManager:
         record = await self._find(run_id)
         async with record.lock:
             return self._snapshot(record)
+
+    async def get_provider_traces(self, run_id: str) -> ProviderTraceSnapshot:
+        run_id = _required_string(run_id, "run_id", RunManagerError)
+        record = await self._find(run_id)
+        async with record.lock:
+            store = record.provider_trace_store
+            return ProviderTraceSnapshot(
+                enabled=store.enabled if store is not None else False,
+                traces=store.snapshot() if store is not None else (),
+            )
 
     async def get_download(self, run_id: str, file_id: str) -> DownloadFile:
         run_id = _required_string(run_id, "run_id", RunManagerError)
@@ -362,6 +385,31 @@ class RunManager:
             request_id,
             _RequestFingerprint("confirm", interaction_id, approved),
             RunStatus.AWAITING_CONFIRMATION,
+        )
+
+    async def resolve_completion(
+        self,
+        run_id: str,
+        interaction_id: str,
+        request_id: str,
+        approved: bool,
+        feedback: str | None = None,
+    ) -> RunSnapshot:
+        run_id = _required_string(run_id, "run_id", RunManagerError)
+        interaction_id = _required_string(interaction_id, "interaction_id", RunManagerError)
+        request_id = _required_string(request_id, "request_id", RunManagerError)
+        if type(approved) is not bool:
+            raise RunManagerError("approved must be a bool")
+        if approved:
+            if feedback is not None:
+                raise RunManagerError("approved completion cannot include feedback")
+        else:
+            feedback = _required_string(feedback, "feedback", RunManagerError)
+        return await self._resume(
+            run_id,
+            request_id,
+            _RequestFingerprint("completion", interaction_id, approved, feedback=feedback),
+            RunStatus.AWAITING_COMPLETION,
         )
 
     async def cancel(self, run_id: str, request_id: str) -> RunSnapshot:
@@ -429,6 +477,9 @@ class RunManager:
                 failed = True
         finally:
             self._hmac_key[:] = b"\x00" * len(self._hmac_key)
+            for record in records:
+                if record.provider_trace_store is not None:
+                    record.provider_trace_store.clear()
         return not failed
 
     async def submit_secret(
@@ -560,6 +611,7 @@ class RunManager:
                 record.requests[request_id] = fingerprint
                 record.question = None
                 record.interaction_id = None
+                record.completion_proposal = None
                 record.status = RunStatus.RUNNING
                 record.version += 1
                 operation = asyncio.create_task(
@@ -580,6 +632,9 @@ class RunManager:
                 record.start_url, record.task
             )
             session, applier, download_store = self._validate_handle(local_handle)
+            provider_trace_store = getattr(local_handle, "provider_trace_store", None)
+            if provider_trace_store is not None and not isinstance(provider_trace_store, ProviderTraceStore):
+                raise TypeError("factory returned an invalid provider trace store")
             async with record.lock:
                 if record.status is RunStatus.CANCELLED:
                     return
@@ -587,12 +642,13 @@ class RunManager:
                 record.session = session
                 record.secret_applier = applier
                 record.download_store = download_store
+                record.provider_trace_store = provider_trace_store
                 record.audit_events = (
                     RunAuditEvent(
                         1,
                         RunAuditKind.SYSTEM,
                         RunAuditStatus.SUCCESS,
-                        "Initial page opened",
+                        "Initial page opened" if record.start_url is not None else "Conversation started",
                     ),
                 )
                 record.version += 1
@@ -621,6 +677,10 @@ class RunManager:
                 result = await session.respond(str(fingerprint.payload))
             elif fingerprint.operation == "confirm":
                 result = await session.confirm(fingerprint.payload)  # type: ignore[arg-type]
+            elif fingerprint.operation == "completion":
+                result = await session.resolve_completion(
+                    fingerprint.payload, fingerprint.feedback  # type: ignore[arg-type]
+                )
             else:
                 raise RuntimeError("unsupported resume operation")
             await self._publish_result(record, result)
@@ -674,7 +734,7 @@ class RunManager:
         self, record: _RunRecord, result: AgentRunResult
     ) -> None:
         try:
-            status, question, final_result, step_count, secret_fields, secret_targets = self._translate(result)
+            status, question, final_result, step_count, secret_fields, secret_targets, completion_proposal = self._translate(result)
         except Exception as exc:
             await self._publish_failure(record, exc)
             return
@@ -692,20 +752,20 @@ class RunManager:
                     RunStatus.AWAITING_USER,
                     RunStatus.AWAITING_CONFIRMATION,
                     RunStatus.AWAITING_SECRET,
+                    RunStatus.AWAITING_COMPLETION,
                 )
                 else None
             )
             record.final_result = final_result
+            record.completion_proposal = completion_proposal
             record.secret_fields = secret_fields
             record.secret_targets = secret_targets
             record.error_type = None
             record.error_message = None
             record.audit_events = self._audit_from_result(
                 result,
-                preserve_initial=bool(
-                    record.audit_events
-                    and record.audit_events[0].summary == "Initial page opened"
-                ),
+                preserve_initial=bool(record.audit_events),
+                initial_summary=(record.audit_events[0].summary if record.audit_events else "Initial page opened"),
             )
         if status in _TERMINAL_STATUSES:
             if status is RunStatus.FINISHED:
@@ -735,6 +795,7 @@ class RunManager:
             record.question = None
             record.interaction_id = None
             record.final_result = None
+            record.completion_proposal = None
             record.secret_fields = None
             record.secret_targets = None
             record.secret_reference = None
@@ -929,7 +990,7 @@ class RunManager:
         session = getattr(handle, "session", None)
         if session is None or any(
             not callable(getattr(session, name, None))
-            for name in ("start", "respond", "confirm", "resume_after_secret_application")
+            for name in ("start", "respond", "confirm", "resolve_completion", "resume_after_secret_application")
         ):
             raise TypeError("factory handle has an invalid session")
         applier = getattr(handle, "secret_applier", None)
@@ -956,7 +1017,7 @@ class RunManager:
     @staticmethod
     def _translate(
         result: AgentRunResult,
-    ) -> tuple[RunStatus, str | None, str | None, int, tuple[SecretField, ...] | None, tuple[SecretFieldTarget, ...] | None]:
+    ) -> tuple[RunStatus, str | None, str | None, int, tuple[SecretField, ...] | None, tuple[SecretFieldTarget, ...] | None, str | None]:
         if not isinstance(result, AgentRunResult) or type(result.steps) is not tuple:
             raise TypeError("session returned an invalid AgentRunResult")
         step_count = len(result.steps)
@@ -996,15 +1057,28 @@ class RunManager:
                 ):
                     raise ValueError("session returned an inconsistent secret pause result")
                 status = RunStatus.AWAITING_SECRET
+            elif result.pause_kind is AgentPauseKind.COMPLETION:
+                if (
+                    result.pending_confirmation is not None
+                    or result.secret_fields is not None
+                    or result.secret_targets is not None
+                    or type(result.completion_proposal) is not str
+                    or not result.completion_proposal.strip()
+                ):
+                    raise ValueError("session returned an inconsistent completion pause")
+                status = RunStatus.AWAITING_COMPLETION
             else:
                 raise ValueError("session returned an inconsistent pause result")
-            return status, result.question, None, step_count, result.secret_fields, result.secret_targets
+            if status is not RunStatus.AWAITING_COMPLETION and result.completion_proposal is not None:
+                raise ValueError("non-completion pause contains completion proposal")
+            return status, result.question, None, step_count, result.secret_fields, result.secret_targets, result.completion_proposal
         if (
             result.question is not None
             or result.pause_kind is not None
             or result.pending_confirmation is not None
             or result.secret_fields is not None
             or result.secret_targets is not None
+            or result.completion_proposal is not None
         ):
             raise ValueError("session returned inconsistent terminal fields")
         if result.status is AgentRunStatus.FINISHED:
@@ -1013,7 +1087,7 @@ class RunManager:
                 or not result.final_result.strip()
             ):
                 raise ValueError("finished result must contain final_result")
-            return RunStatus.FINISHED, None, result.final_result, step_count, None, None
+            return RunStatus.FINISHED, None, result.final_result, step_count, None, None, None
         if result.final_result is not None:
             raise ValueError("non-finished result cannot contain final_result")
         mapping = {
@@ -1022,7 +1096,7 @@ class RunManager:
                 RunStatus.DECISION_SOURCE_EXHAUSTED,
         }
         try:
-            return mapping[result.status], None, None, step_count, None, None
+            return mapping[result.status], None, None, step_count, None, None, None
         except (KeyError, TypeError) as exc:
             raise ValueError("session returned an unsupported status") from exc
 
@@ -1033,6 +1107,7 @@ class RunManager:
         record.question = None
         record.interaction_id = None
         record.final_result = None
+        record.completion_proposal = None
         record.secret_fields = None
         record.secret_targets = None
         record.secret_reference = None
@@ -1056,7 +1131,8 @@ class RunManager:
 
     @staticmethod
     def _audit_from_result(
-        result: AgentRunResult, *, preserve_initial: bool
+        result: AgentRunResult, *, preserve_initial: bool,
+        initial_summary: str = "Initial page opened",
     ) -> tuple[RunAuditEvent, ...]:
         events: list[RunAuditEvent] = []
 
@@ -1082,7 +1158,7 @@ class RunManager:
             )
 
         if preserve_initial:
-            add(RunAuditKind.SYSTEM, RunAuditStatus.SUCCESS, "Initial page opened")
+            add(RunAuditKind.SYSTEM, RunAuditStatus.SUCCESS, initial_summary)
 
         interactions = {}
         for interaction in result.user_interactions:
@@ -1095,6 +1171,7 @@ class RunManager:
 
         for step in sorted(result.steps, key=lambda item: item.step_number):
             observation = step.observation
+            event_kind = RunAuditKind.TOOL
             candidate_tool_name = step.decision.tool_name
             tool_name = candidate_tool_name if candidate_tool_name in _TRUSTED_AUDIT_TOOL_NAMES else None
             if tool_name is None:
@@ -1112,9 +1189,10 @@ class RunManager:
             }:
                 status = RunAuditStatus.FAILED
                 summary = f"Action failed: {tool_name}"
-            elif observation.status is AgentStepStatus.FINISHED:
-                status = RunAuditStatus.SUCCESS
-                summary = "Task finished"
+            elif observation.status is AgentStepStatus.COMPLETION_PROPOSED:
+                event_kind = RunAuditKind.COMPLETION
+                status = RunAuditStatus.PENDING
+                summary = "Agent proposed completion"
             elif observation.status is AgentStepStatus.AWAITING_SECRET:
                 fields = observation.secret_fields or ()
                 names = ", ".join(field.value for field in fields)
@@ -1134,7 +1212,7 @@ class RunManager:
                 else:
                     summary = f"Action completed: {tool_name}"
             add(
-                RunAuditKind.TOOL,
+                event_kind,
                 status,
                 summary,
                 step_number=step.step_number,
@@ -1148,6 +1226,14 @@ class RunManager:
                         RunAuditKind.CONFIRMATION,
                         RunAuditStatus.APPROVED if approved else RunAuditStatus.REJECTED,
                         "Operator approved the action" if approved else "Operator rejected the action",
+                        step_number=step.step_number,
+                    )
+                elif interaction.kind is AgentPauseKind.COMPLETION:
+                    approved = interaction.response is True
+                    add(
+                        RunAuditKind.COMPLETION,
+                        RunAuditStatus.APPROVED if approved else RunAuditStatus.REJECTED,
+                        "User finished the run" if approved else "User declined completion and continued",
                         step_number=step.step_number,
                     )
                 else:
@@ -1194,6 +1280,7 @@ class RunManager:
             ),
             files=files,
             audit_events=record.audit_events,
+            completion_proposal=record.completion_proposal,
         )
 
     @staticmethod
