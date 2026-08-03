@@ -6,9 +6,11 @@ import asyncio
 import math
 import os
 import shutil
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI
 from mcp import ClientSession, StdioServerParameters
@@ -30,8 +32,6 @@ from .tool_policy import McpToolPolicy, PolicyEnforcedToolExecutor
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parent.parent
-
-
 class BrowserAgentApplicationError(Exception):
     """Base class for safe application-composition errors."""
 
@@ -46,6 +46,31 @@ class BrowserAgentApplicationConstructionError(BrowserAgentApplicationError):
 
 class BrowserAgentApplicationCleanupError(BrowserAgentApplicationError):
     """Owned browser resources could not be completely cleaned up."""
+
+
+def _validate_start_url(value: str) -> None:
+    """Validate basic URL syntax without making a site-authorization decision."""
+    if type(value) is not str or not value.strip():
+        raise BrowserAgentApplicationConstructionError("start_url is invalid")
+    if (
+        value != value.strip()
+        or any(unicodedata.category(char).startswith("C") for char in value)
+    ):
+        raise BrowserAgentApplicationConstructionError("start_url is invalid")
+    try:
+        parsed = urlsplit(value)
+        parsed.port
+        hostname = parsed.hostname
+    except (TypeError, UnicodeError, ValueError):
+        raise BrowserAgentApplicationConstructionError("start_url is invalid") from None
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or any(char.isspace() for char in parsed.netloc)
+    ):
+        raise BrowserAgentApplicationConstructionError("start_url is invalid")
 
 
 @dataclass(frozen=True)
@@ -282,10 +307,7 @@ class PlaywrightMcpRunSessionFactory:
     async def create(
         self, start_url: str, task: str
     ) -> PlaywrightMcpRunSessionHandle:
-        if type(start_url) is not str or not start_url.strip():
-            raise BrowserAgentApplicationConstructionError(
-                "start_url must be a non-empty string"
-            )
+        _validate_start_url(start_url)
         if type(task) is not str or not task.strip():
             raise BrowserAgentApplicationConstructionError(
                 "task must be a non-empty string"
@@ -339,6 +361,7 @@ class PlaywrightMcpRunSessionFactory:
         tracking: DownloadTrackingExecutor | None = None
         startup_succeeded = False
         try:
+            _validate_start_url(start_url)
             store = RunDownloadStore(self._config.download_base_directory)
             parameters = StdioServerParameters(
                 command=self._config.node_command,

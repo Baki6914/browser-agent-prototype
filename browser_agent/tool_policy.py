@@ -77,7 +77,7 @@ TOOL_POLICY_REGISTRY: Mapping[str, ToolPolicyDecision] = MappingProxyType({
         _rule("browser_find", ToolCategory.READ_ONLY, PolicyAction.ALLOW, "Searches the page snapshot without changing page state."),
         _rule("browser_handle_dialog", ToolCategory.PAGE_INTERACTION, PolicyAction.REQUIRE_CONFIRMATION, "Handling a dialog may accept or reject a page action."),
         _rule("browser_hover", ToolCategory.PAGE_INTERACTION, PolicyAction.ALLOW, "Hover is an approved low-impact page interaction."),
-        _rule("browser_navigate", ToolCategory.NAVIGATION, PolicyAction.ALLOW, "Navigation is an approved browser operation."),
+        _rule("browser_navigate", ToolCategory.NAVIGATION, PolicyAction.ALLOW, "Navigation is observable; destination access is enforced by the deployment and network environment."),
         _rule("browser_navigate_back", ToolCategory.NAVIGATION, PolicyAction.ALLOW, "Back navigation is an approved browser operation."),
         _rule("browser_network_request", ToolCategory.READ_ONLY, PolicyAction.ALLOW, "Observes a previously recorded network request."),
         _rule("browser_network_requests", ToolCategory.READ_ONLY, PolicyAction.ALLOW, "Observes recorded network requests."),

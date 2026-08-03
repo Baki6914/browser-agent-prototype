@@ -28,6 +28,9 @@ from browser_agent import (
     RunNotFoundError,
     RunSnapshot,
     RunStatus,
+    RunAuditEvent,
+    RunAuditKind,
+    RunAuditStatus,
     SecretField,
     SecretTargetSummary,
     create_http_app,
@@ -104,6 +107,7 @@ def snapshot(
     secret_fields: tuple[SecretField, ...] | None = None,
     secret_targets: tuple[SecretTargetSummary, ...] | None = None,
     files: tuple[DownloadMetadata, ...] = (),
+    audit_events: tuple[RunAuditEvent, ...] = (),
 ) -> RunSnapshot:
     return RunSnapshot(
         run_id="run-1",
@@ -120,6 +124,7 @@ def snapshot(
         secret_fields=secret_fields,
         secret_targets=secret_targets,
         files=files,
+        audit_events=audit_events,
     )
 
 
@@ -570,6 +575,23 @@ class ErrorMappingTests(unittest.TestCase):
 
 
 class SnapshotTests(unittest.TestCase):
+    def test_audit_events_serialize_in_order_without_sensitive_markers(self) -> None:
+        events = (
+            RunAuditEvent(1, RunAuditKind.SYSTEM, RunAuditStatus.SUCCESS, "Initial page opened"),
+            RunAuditEvent(
+                2, RunAuditKind.TOOL, RunAuditStatus.PENDING,
+                "Approval required: browser_click", 1, "browser_click", None,
+            ),
+        )
+        payload = snapshot_to_http_response(snapshot(audit_events=events)).model_dump(mode="json")
+        self.assertEqual([item["sequence"] for item in payload["audit_events"]], [1, 2])
+        self.assertEqual(payload["audit_events"][0]["kind"], "system")
+        self.assertEqual(payload["audit_events"][0]["status"], "success")
+        self.assertIsNone(payload["audit_events"][0]["tool_name"])
+        rendered = repr(payload)
+        for marker in ("SECRET_MARKER", "ARGUMENT_MARKER", "OBSERVATION_MARKER"):
+            self.assertNotIn(marker, rendered)
+
     def test_files_serialize_safe_metadata_without_path(self) -> None:
         response = snapshot_to_http_response(snapshot(
             files=(DownloadMetadata("file-1", "report.pdf", 7),)
@@ -639,6 +661,7 @@ class SnapshotTests(unittest.TestCase):
                 "secret_fields",
                 "secret_targets",
                 "files",
+                "audit_events",
             },
         )
         self.assertTrue(

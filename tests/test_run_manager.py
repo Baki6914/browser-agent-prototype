@@ -31,6 +31,9 @@ from browser_agent import (
     RunDownloadStore,
     RunNotFoundError,
     RunStatus,
+    RunAuditEvent,
+    RunAuditKind,
+    RunAuditStatus,
     SecretField,
     SecretFieldTarget,
     SecretApplicationResult,
@@ -38,6 +41,18 @@ from browser_agent import (
     SecretNotFoundError,
     TransientSecretStore,
 )
+from browser_agent.agent_loop import (
+    AgentApplicationEvent,
+    AgentApplicationEventKind,
+    AgentStepObservation,
+    AgentStepRecord,
+    AgentStepStatus,
+    AgentToolCall,
+    AgentToolSource,
+    AgentUserInput,
+)
+from browser_agent.run_manager import _TRUSTED_AUDIT_TOOL_NAMES
+from browser_agent.tool_policy import TOOL_POLICY_REGISTRY
 
 _DEFAULT_TARGETS = object()
 
@@ -379,6 +394,96 @@ class RunManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handle.download_store.close_calls, 0)
         self.assertLess(created.version, running.version)
         self.assertLess(running.version, finished.version)
+
+    async def test_initial_audit_publication_is_atomic_and_preserved(self) -> None:
+        session = FakeSession([result(AgentRunStatus.FINISHED, final_result="done")])
+        session.release.clear()
+        factory = FakeFactory([FakeHandle(session)])
+        factory.release.clear()
+        manager = self.manager(factory)
+
+        created = await manager.create_run("https://example.com", "task")
+        await factory.entered.wait()
+        before_navigation = await manager.get_run(created.run_id)
+        self.assertEqual(before_navigation.status, RunStatus.RUNNING)
+        self.assertEqual(before_navigation.audit_events, ())
+
+        factory.release.set()
+        await session.entered.wait()
+        after_navigation = await manager.get_run(created.run_id)
+        self.assertEqual(after_navigation.status, RunStatus.RUNNING)
+        self.assertGreater(after_navigation.version, before_navigation.version)
+        self.assertEqual(
+            [event.summary for event in after_navigation.audit_events],
+            ["Initial page opened"],
+        )
+
+        session.release.set()
+        await self.settle(manager, created.run_id)
+        finished = await manager.get_run(created.run_id)
+        self.assertEqual(
+            [event.summary for event in finished.audit_events].count(
+                "Initial page opened"
+            ),
+            1,
+        )
+
+    async def test_hostile_unknown_tool_name_never_reaches_public_audit(self) -> None:
+        hostile = (
+            "https://URL_MARKER USER_RESPONSE_MARKER SECRET_MARKER\n\x00\u2066"
+            + "x" * 1000
+        )
+        step = AgentStepRecord(
+            1,
+            AgentToolCall(hostile, {"value": "ARGUMENT_MARKER"}),
+            AgentStepObservation(
+                hostile,
+                AgentToolSource.MCP,
+                AgentStepStatus.REJECTED,
+                "OBSERVATION_MARKER",
+                "internal error",
+            ),
+        )
+        run_result = AgentRunResult(AgentRunStatus.FINISHED, (step,), "done", None)
+        manager = self.manager(FakeFactory([FakeHandle(FakeSession([run_result]))]))
+        created = await manager.create_run("https://example.com", "task")
+        await self.settle(manager, created.run_id)
+        snapshot = await manager.get_run(created.run_id)
+
+        self.assertEqual(snapshot.audit_events[1].summary, "Unknown action rejected safely")
+        self.assertIsNone(snapshot.audit_events[1].tool_name)
+        public = repr(snapshot)
+        for marker in (
+            "URL_MARKER", "USER_RESPONSE_MARKER", "SECRET_MARKER",
+            "ARGUMENT_MARKER", "OBSERVATION_MARKER", hostile,
+        ):
+            self.assertNotIn(marker, public)
+
+    async def test_startup_failure_and_idempotent_cancel_are_versioned_audit_changes(self) -> None:
+        failed_manager = self.manager(
+            FakeFactory(error=RuntimeError("PRIVATE /internal/path failure"))
+        )
+        failed_created = await failed_manager.create_run("https://example.com", "task")
+        await self.settle(failed_manager, failed_created.run_id)
+        failed = await failed_manager.get_run(failed_created.run_id)
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertGreater(failed.version, failed_created.version)
+        self.assertEqual([event.summary for event in failed.audit_events], ["Run failed safely"])
+        self.assertNotIn("/internal/path", repr(failed.audit_events))
+
+        session = FakeSession([result(AgentRunStatus.FINISHED, final_result="done")])
+        session.release.clear()
+        manager = self.manager(FakeFactory([FakeHandle(session)]))
+        created = await manager.create_run("https://example.com", "task")
+        await session.entered.wait()
+        before = await manager.get_run(created.run_id)
+        cancelled = await manager.cancel(created.run_id, "cancel-once")
+        repeated = await manager.cancel(created.run_id, "cancel-once")
+        self.assertGreater(cancelled.version, before.version)
+        self.assertEqual(cancelled.audit_events[:-1], before.audit_events)
+        self.assertEqual(cancelled.audit_events[-1].summary, "Run cancelled")
+        self.assertEqual(cancelled.audit_events, repeated.audit_events)
+        self.assertEqual(cancelled.version, repeated.version)
 
     async def test_user_and_confirmation_pauses_have_interactions(self) -> None:
         for kind, expected in (
@@ -1626,6 +1731,261 @@ class RunManagerSecretTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(record.secret_targets)
         self.assertEqual(len(handle.secret_applier.calls), 1)
         self.assertLessEqual(len([c for c in session.calls if c[0] == "secret_application"]), 1)
+
+
+class RunAuditTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.managers: list[RunManager] = []
+
+    async def asyncTearDown(self) -> None:
+        for manager in self.managers:
+            try:
+                await manager.close()
+            except RunManagerError:
+                pass
+
+    def manager(self, factory: FakeFactory) -> RunManager:
+        manager = RunManager(factory, secret_store=TransientSecretStore())
+        self.managers.append(manager)
+        return manager
+
+    async def settle(self, manager: RunManager, run_id: str) -> None:
+        task = manager._runs[run_id].active_task
+        if task is not None:
+            await task
+
+    def test_public_models_are_frozen_and_strictly_validated(self) -> None:
+        event = RunAuditEvent(1, RunAuditKind.SYSTEM, RunAuditStatus.INFO, "Safe")
+        with self.assertRaises(FrozenInstanceError):
+            event.summary = "changed"  # type: ignore[misc]
+        for arguments in (
+            (0, RunAuditKind.SYSTEM, RunAuditStatus.INFO, "Safe"),
+            (1, "system", RunAuditStatus.INFO, "Safe"),
+            (1, RunAuditKind.SYSTEM, "info", "Safe"),
+            (1, RunAuditKind.SYSTEM, RunAuditStatus.INFO, " "),
+            (1, RunAuditKind.SYSTEM, RunAuditStatus.INFO, "line\nfeed"),
+            (1, RunAuditKind.SYSTEM, RunAuditStatus.INFO, "x" * 201),
+        ):
+            with self.assertRaises((TypeError, ValueError)):
+                RunAuditEvent(*arguments)  # type: ignore[arg-type]
+        for tool_name in ("unknown_tool", "browser_click\n", "x" * 101):
+            with self.assertRaises(ValueError):
+                RunAuditEvent(
+                    1, RunAuditKind.TOOL, RunAuditStatus.INFO, "Safe",
+                    tool_name=tool_name,
+                )
+
+    def test_complete_history_is_deterministic_and_contains_only_safe_data(self) -> None:
+        argument_marker = "TOOL_ARGUMENT_MARKER"
+        observation_marker = "OBSERVATION_MARKER"
+        response_marker = "USER_RESPONSE_MARKER"
+        pending = AgentStepRecord(
+            1,
+            AgentToolCall("browser_click", {"ref": argument_marker}),
+            AgentStepObservation(
+                "browser_click", AgentToolSource.MCP, AgentStepStatus.REJECTED,
+                observation_marker, observation_marker, True, 1,
+            ),
+        )
+        replay = AgentStepRecord(
+            2,
+            AgentToolCall("browser_click", {"ref": argument_marker}),
+            AgentStepObservation(
+                "browser_click", AgentToolSource.MCP, AgentStepStatus.SUCCESS,
+                observation_marker, None,
+            ),
+            replay_of_step_number=1,
+        )
+        run_result = AgentRunResult(
+            AgentRunStatus.FINISHED,
+            (pending, replay),
+            "done",
+            None,
+            user_interactions=(
+                AgentUserInput(1, AgentPauseKind.CONFIRMATION, "Approve?", True),
+                AgentUserInput(2, AgentPauseKind.USER_INPUT, "Input?", response_marker),
+            ),
+        )
+        first = RunManager._audit_from_result(run_result, preserve_initial=True)
+        second = RunManager._audit_from_result(run_result, preserve_initial=True)
+        self.assertEqual(first, second)
+        self.assertEqual([event.sequence for event in first], list(range(1, len(first) + 1)))
+        self.assertEqual(first[1].status, RunAuditStatus.PENDING)
+        self.assertEqual(first[2].status, RunAuditStatus.APPROVED)
+        self.assertEqual(first[3].replay_of_step_number, 1)
+        rendered = repr(first)
+        for marker in (argument_marker, observation_marker, response_marker):
+            self.assertNotIn(marker, rendered)
+
+    async def test_later_session_failure_appends_one_safe_audit_event(self) -> None:
+        private = "SESSION_PRIVATE /synthetic/session/path"
+        session = FakeSession([RuntimeError(private)])
+        session.release.clear()
+        manager = self.manager(FakeFactory([FakeHandle(session)]))
+        created = await manager.create_run("url", "task")
+        await session.entered.wait()
+        after_navigation = await manager.get_run(created.run_id)
+        self.assertEqual(
+            [event.summary for event in after_navigation.audit_events],
+            ["Initial page opened"],
+        )
+        session.release.set()
+        await self.settle(manager, created.run_id)
+        failed = await manager.get_run(created.run_id)
+
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertGreater(failed.version, after_navigation.version)
+        self.assertEqual(
+            [event.summary for event in failed.audit_events],
+            ["Initial page opened", "Run failed safely"],
+        )
+        self.assertNotIn(private, repr(failed.audit_events))
+
+    async def test_cleanup_failure_preserves_history_and_has_one_terminal_failure(self) -> None:
+        private = "CLEANUP_PRIVATE /synthetic/cleanup/path"
+        handle = FakeHandle(
+            FakeSession([result(AgentRunStatus.FINISHED, final_result="done")]),
+            RuntimeError(private),
+        )
+        manager = self.manager(FakeFactory([handle]))
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        failed = await manager.get_run(created.run_id)
+
+        self.assertEqual(failed.status, RunStatus.FAILED)
+        self.assertGreater(failed.version, created.version)
+        self.assertEqual(failed.audit_events[0].summary, "Initial page opened")
+        terminal = [event for event in failed.audit_events if event.summary == "Run failed safely"]
+        self.assertEqual(len(terminal), 1)
+        self.assertEqual(terminal[0].sequence, len(failed.audit_events))
+        self.assertNotIn(private, repr(failed.audit_events))
+
+    async def test_confirmation_rejection_is_audited_without_replay_or_arguments(self) -> None:
+        argument_marker = "CONFIRM_ARGUMENT_MARKER"
+        pending_step = AgentStepRecord(
+            1,
+            AgentToolCall("browser_click", {"ref": argument_marker}),
+            AgentStepObservation(
+                "browser_click", AgentToolSource.MCP, AgentStepStatus.REJECTED,
+                "safe", None, True, 1,
+            ),
+        )
+        pending = PendingConfirmation(1, "browser_click", '{"ref":"hidden"}')
+        paused_result = AgentRunResult(
+            AgentRunStatus.AWAITING_USER, (pending_step,), None, "Approve?",
+            AgentPauseKind.CONFIRMATION, pending,
+        )
+        rejected_result = AgentRunResult(
+            AgentRunStatus.FINISHED, (pending_step,), "rejected", None,
+            user_interactions=(
+                AgentUserInput(1, AgentPauseKind.CONFIRMATION, "Approve?", False),
+            ),
+        )
+        session = FakeSession([paused_result, rejected_result])
+        manager = self.manager(FakeFactory([FakeHandle(session)]))
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        pause = await manager.get_run(created.run_id)
+        self.assertEqual(pause.audit_events[1].status, RunAuditStatus.PENDING)
+
+        await manager.confirm(pause.run_id, pause.interaction_id, "reject", False)
+        await self.settle(manager, pause.run_id)
+        rejected = await manager.get_run(pause.run_id)
+        self.assertEqual(
+            len([event for event in rejected.audit_events if event.status is RunAuditStatus.REJECTED]),
+            1,
+        )
+        self.assertFalse(any(event.replay_of_step_number for event in rejected.audit_events))
+        self.assertEqual([event.sequence for event in rejected.audit_events], list(range(1, len(rejected.audit_events) + 1)))
+        self.assertNotIn(argument_marker, repr(rejected))
+
+    async def test_secret_request_and_application_audit_is_ordered_and_private(self) -> None:
+        value_marker = "SECRET_VALUE_MARKER"
+        target_marker = "SECRET_TARGET_MARKER"
+        fields = (SecretField.PASSWORD,)
+        targets = (SecretFieldTarget(SecretField.PASSWORD, "Password", target_marker),)
+        secret_step = AgentStepRecord(
+            1,
+            AgentToolCall("request_secret", {"target": target_marker}),
+            AgentStepObservation(
+                "request_secret", AgentToolSource.AGENT_CONTROL, AgentStepStatus.AWAITING_SECRET,
+                "safe", None, secret_fields=fields, secret_targets=targets,
+            ),
+        )
+        paused_result = AgentRunResult(
+            AgentRunStatus.AWAITING_USER, (secret_step,), None, "Credentials",
+            AgentPauseKind.SECRET, secret_fields=fields, secret_targets=targets,
+        )
+        finished_result = AgentRunResult(
+            AgentRunStatus.FINISHED, (secret_step,), "done", None,
+            application_events=(
+                AgentApplicationEvent(1, AgentApplicationEventKind.SECRET_APPLIED, fields),
+            ),
+        )
+        session = FakeSession([paused_result, finished_result])
+        handle = FakeHandle(session)
+        manager = self.manager(FakeFactory([handle]))
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        pause = await manager.get_run(created.run_id)
+        accepted = await manager.submit_secret(
+            pause.run_id, pause.interaction_id, "secret", {SecretField.PASSWORD: value_marker}
+        )
+        await handle.secret_applier.entered.wait()
+        handle.secret_applier.release.set()
+        await self.settle(manager, pause.run_id)
+        finished = await manager.get_run(pause.run_id)
+
+        self.assertLess(created.version, pause.version)
+        self.assertLess(pause.version, accepted.version)
+        self.assertLess(accepted.version, finished.version)
+        summaries = [event.summary for event in finished.audit_events]
+        self.assertLess(
+            next(i for i, value in enumerate(summaries) if "requested secure fields" in value),
+            next(i for i, value in enumerate(summaries) if "applied to the page" in value),
+        )
+        self.assertIn("password", " ".join(summaries))
+        self.assertEqual([event.sequence for event in finished.audit_events], list(range(1, len(finished.audit_events) + 1)))
+        for marker in (value_marker, target_marker):
+            self.assertNotIn(marker, repr(finished))
+            self.assertNotIn(marker, repr(finished.audit_events))
+            for event in finished.audit_events:
+                self.assertNotIn(marker, event.summary)
+                self.assertNotIn(marker, event.tool_name or "")
+
+    async def test_repeated_manager_publication_rebuilds_identical_history(self) -> None:
+        step = AgentStepRecord(
+            1,
+            AgentToolCall("browser_snapshot", {}),
+            AgentStepObservation(
+                "browser_snapshot", AgentToolSource.MCP, AgentStepStatus.SUCCESS,
+                "private observation", None,
+            ),
+        )
+        accumulated = AgentRunResult(
+            AgentRunStatus.FINISHED, (step,), "done", None,
+            user_interactions=(AgentUserInput(1, AgentPauseKind.USER_INPUT, "Q", "A"),),
+        )
+        session = FakeSession([accumulated])
+        manager = self.manager(FakeFactory([FakeHandle(session)]))
+        created = await manager.create_run("url", "task")
+        await self.settle(manager, created.run_id)
+        first = await manager.get_run(created.run_id)
+        await manager._publish_result(manager._runs[created.run_id], accumulated)
+        second = await manager.get_run(created.run_id)
+
+        self.assertGreater(second.version, first.version)
+        self.assertEqual(second.audit_events, first.audit_events)
+        self.assertEqual([event.sequence for event in second.audit_events], list(range(1, len(second.audit_events) + 1)))
+        self.assertEqual([event.summary for event in second.audit_events].count("Initial page opened"), 1)
+
+    def test_trusted_audit_catalog_exactly_matches_fixed_policy_and_controls(self) -> None:
+        expected = frozenset(TOOL_POLICY_REGISTRY) | {
+            "ask_user", "finish", "request_secret"
+        }
+        self.assertEqual(_TRUSTED_AUDIT_TOOL_NAMES - expected, frozenset())
+        self.assertEqual(expected - _TRUSTED_AUDIT_TOOL_NAMES, frozenset())
+        self.assertEqual(_TRUSTED_AUDIT_TOOL_NAMES, expected)
 
 
 if __name__ == "__main__":

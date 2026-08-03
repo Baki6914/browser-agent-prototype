@@ -8,7 +8,7 @@ from typing import Annotated, Literal, TypeAlias
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, StrictBool, StrictStr, field_validator
 
 from .run_manager import (
@@ -22,10 +22,20 @@ from .run_manager import (
     RunNotFoundError,
     RunSnapshot,
     RunStatus,
+    RunAuditEvent,
+    RunAuditKind,
+    RunAuditStatus,
 )
 from .downloads import DownloadMetadata
 from .secret_store import SecretField
 from .secret_application import SecretTargetSummary
+from .operator_ui import (
+    CONTENT_SECURITY_POLICY,
+    OPERATOR_CSS,
+    OPERATOR_HTML,
+    OPERATOR_JAVASCRIPT,
+    SECURITY_HEADERS,
+)
 
 _ERROR_MESSAGE_LIMIT = 500
 
@@ -111,6 +121,16 @@ class RunHttpSnapshotError(_StrictHttpModel):
     message: str
 
 
+class RunHttpAuditEvent(_StrictHttpModel):
+    sequence: int
+    kind: RunAuditKind
+    status: RunAuditStatus
+    summary: str
+    step_number: int | None
+    tool_name: str | None
+    replay_of_step_number: int | None
+
+
 class RunHttpResponse(_StrictHttpModel):
     run_id: str
     status: RunStatus
@@ -125,6 +145,7 @@ class RunHttpResponse(_StrictHttpModel):
     secret_fields: tuple[SecretField, ...] | None
     secret_targets: tuple[SecretTargetSummary, ...] | None
     files: tuple[DownloadMetadata, ...]
+    audit_events: tuple[RunHttpAuditEvent, ...]
 
 
 class HttpErrorBody(_StrictHttpModel):
@@ -148,6 +169,21 @@ def snapshot_to_http_response(snapshot: RunSnapshot) -> RunHttpResponse:
             type=snapshot.error_type,
             message=snapshot.error_message,
         )
+    audit_events = tuple(
+        RunHttpAuditEvent(
+            sequence=event.sequence,
+            kind=event.kind,
+            status=event.status,
+            summary=event.summary,
+            step_number=event.step_number,
+            tool_name=event.tool_name,
+            replay_of_step_number=event.replay_of_step_number,
+        )
+        for event in snapshot.audit_events
+        if isinstance(event, RunAuditEvent)
+    )
+    if len(audit_events) != len(snapshot.audit_events):
+        raise TypeError("snapshot audit events must contain RunAuditEvent values")
     return RunHttpResponse(
         run_id=snapshot.run_id,
         status=snapshot.status,
@@ -162,6 +198,7 @@ def snapshot_to_http_response(snapshot: RunSnapshot) -> RunHttpResponse:
         secret_fields=snapshot.secret_fields,
         secret_targets=snapshot.secret_targets,
         files=snapshot.files,
+        audit_events=audit_events,
     )
 
 
@@ -250,6 +287,26 @@ def create_http_app(run_manager: RunManager) -> FastAPI:
         )
 
     app.add_exception_handler(Exception, handle_unexpected_error)
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    async def operator_page() -> HTMLResponse:
+        headers = dict(SECURITY_HEADERS)
+        headers["Content-Security-Policy"] = CONTENT_SECURITY_POLICY
+        return HTMLResponse(OPERATOR_HTML, headers=headers)
+
+    @app.get("/operator.js", include_in_schema=False)
+    async def operator_javascript() -> Response:
+        return Response(
+            OPERATOR_JAVASCRIPT,
+            media_type="application/javascript",
+            headers=dict(SECURITY_HEADERS),
+        )
+
+    @app.get("/operator.css", include_in_schema=False)
+    async def operator_stylesheet() -> Response:
+        return Response(
+            OPERATOR_CSS, media_type="text/css", headers=dict(SECURITY_HEADERS)
+        )
 
     @app.post(
         "/runs",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import unittest
@@ -163,7 +164,10 @@ class ApplicationTestCase(unittest.TestCase):
         self.cli = self.root / "cli.js"
         self.mcp_config = self.root / "mcp.json"
         self.cli.write_text("cli")
-        self.mcp_config.write_text("{}")
+        self.base_config = {
+            "browser": {"browserName": "chromium"},
+        }
+        self.mcp_config.write_text(json.dumps(self.base_config))
         self.downloads = self.root / "downloads"
         self.provider = OpenAICompatibleProviderConfig(
             "https://example.test/v1", "model", API_KEY, 7
@@ -360,10 +364,15 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         )
         parameters = harness1.parameters[0]
         self.assertEqual(parameters.command, "synthetic-node")
-        self.assertEqual(parameters.args, [
-            str(self.cli), "--config", str(self.mcp_config), "--output-dir",
-            str(handle1.download_store.output_directory),
+        self.assertEqual(parameters.args[:2], [str(self.cli), "--config"])
+        runtime_config = Path(parameters.args[2])
+        second_runtime_config = Path(harness2.parameters[0].args[2])
+        self.assertEqual(runtime_config, self.mcp_config)
+        self.assertEqual(second_runtime_config, self.mcp_config)
+        self.assertEqual(parameters.args[3:], [
+            "--output-dir", str(handle1.download_store.output_directory),
         ])
+        self.assertEqual(json.loads(self.mcp_config.read_text()), self.base_config)
         self.assertEqual(
             parameters.cwd, Path(application_module.__file__).resolve().parent.parent
         )
@@ -378,8 +387,79 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertFalse(handle1.session._started)
         await handle1.close()
         await handle2.close()
+        self.assertTrue(runtime_config.exists())
         handle1.download_store.close()
         handle2.download_store.close()
+
+    async def test_config_is_passed_unchanged_and_urls_are_not_authorized(self):
+        self.mcp_config.write_text(json.dumps({"browser": {"browserName": "chromium"}}))
+        before = self.mcp_config.read_bytes()
+        for url in (
+            "http://Example.TEST:8080/path?q=1#part",
+            "https://b\u00fccher.example/login?redirect=https://sso.example/",
+            "https://example.test./login",
+        ):
+            with self.subTest(url=url):
+                harness = Harness()
+                factory = PlaywrightMcpRunSessionFactory(
+                    self.config(), stdio_factory=harness.stdio,
+                    client_session_factory=harness.client,
+                )
+                handle = await factory.create(url, "inspect")
+                self.assertEqual(harness.parameters[0].args[2], str(self.mcp_config))
+                await handle.close()
+        self.assertEqual(self.mcp_config.read_bytes(), before)
+
+    async def test_initial_navigation_preserves_url_without_trusted_confirmation(self):
+        start_url = "https://b\u00fccher.example./login?redirect=https://sso.example/"
+        observed = []
+        original = DownloadTrackingExecutor.invoke
+
+        async def recording(executor, name, arguments, *, confirmation_granted=False):
+            observed.append((name, arguments, confirmation_granted))
+            return await original(
+                executor, name, arguments,
+                confirmation_granted=confirmation_granted,
+            )
+
+        harness = Harness()
+        factory = PlaywrightMcpRunSessionFactory(
+            self.config(), stdio_factory=harness.stdio,
+            client_session_factory=harness.client,
+        )
+        with patch.object(DownloadTrackingExecutor, "invoke", new=recording):
+            handle = await factory.create(start_url, "inspect")
+        self.assertEqual(observed[0], ("browser_navigate", {"url": start_url}, False))
+        await handle.close()
+
+    async def test_invalid_urls_fail_before_stdio(self):
+        invalid = (
+            "relative/path", "ftp://example.test", "https://user:pass@example.test",
+            "https://example.test:bad", "https://example.test\n/path",
+            "https:///missing-host", "https://bad host.test/path",
+            "https://example.test/\u0085path", " https://example.test",
+        )
+        for value in invalid:
+            harness = Harness()
+            factory = PlaywrightMcpRunSessionFactory(
+                self.config(), stdio_factory=harness.stdio,
+                client_session_factory=harness.client,
+            )
+            with self.subTest(value=value), self.assertRaises(
+                BrowserAgentApplicationConstructionError
+            ):
+                await factory.create(value, "inspect")
+            self.assertEqual(harness.parameters, [])
+    async def test_config_remains_after_stdio_startup_failure(self):
+        harness = Harness(stdio_enter_error=RuntimeError("synthetic"))
+        factory = PlaywrightMcpRunSessionFactory(
+            self.config(), stdio_factory=harness.stdio,
+            client_session_factory=harness.client,
+        )
+        with self.assertRaises(BrowserAgentApplicationConstructionError):
+            await factory.create("https://example.test", "inspect")
+        self.assertEqual(harness.parameters[0].args[2], str(self.mcp_config))
+        self.assertTrue(self.mcp_config.exists())
 
     async def test_navigation_failure_cleans_everything_and_returns_safe_error(self):
         harness = Harness(navigation_status="mcp_error")
@@ -392,23 +472,28 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.events[-3:], [
             "call:browser_close", "client_exit", "stdio_exit"
         ])
+        self.assertTrue(self.mcp_config.exists())
         self.assertNotIn(API_KEY, str(cm.exception))
         self.assertNotIn(PRIVATE_MARKER, str(cm.exception))
+        self.assertTrue(self.mcp_config.exists())
         self.assertEqual(list(self.downloads.iterdir()), [])
 
     async def test_handle_close_is_ordered_idempotent_and_does_not_close_store(self):
         handle, harness = await self.make_handle()
+        runtime_path = Path(harness.parameters[0].args[2])
         await handle.close()
         await handle.close()
         self.assertEqual(harness.events[-3:], [
             "call:browser_close", "client_exit", "stdio_exit"
         ])
         self.assertEqual(harness.events.count("call:browser_close"), 1)
+        self.assertTrue(runtime_path.exists())
         self.assertTrue(handle.download_store.output_directory.exists())
         handle.download_store.close()
 
     async def test_task_affine_contexts_are_owned_and_closed_by_one_task(self):
         handle, harness = await self.make_handle(Harness(task_affine=True))
+        runtime_path = Path(harness.parameters[0].args[2])
         caller_task = asyncio.current_task()
         close_task = asyncio.create_task(handle.close())
         await close_task
@@ -421,18 +506,43 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.events[-3:], [
             "call:browser_close", "client_exit", "stdio_exit"
         ])
+        self.assertTrue(runtime_path.exists())
         handle.download_store.close()
 
     async def test_concurrent_close_callers_share_one_lifecycle(self):
         handle, harness = await self.make_handle(Harness(task_affine=True))
+        runtime_path = Path(harness.parameters[0].args[2])
         owner_task = handle._lifecycle.owner_task
         await asyncio.gather(handle.close(), handle.close(), handle.close())
         self.assertIs(handle._lifecycle.owner_task, owner_task)
         self.assertEqual(harness.events.count("call:browser_close"), 1)
         self.assertEqual(harness.client_context.exit_count, 1)
         self.assertEqual(harness.stdio_context.exit_count, 1)
+        self.assertTrue(runtime_path.exists())
         await handle.close()
         self.assertEqual(harness.events.count("call:browser_close"), 1)
+        handle.download_store.close()
+
+    async def test_cancelled_close_caller_after_startup_still_removes_runtime_config(self):
+        handle, harness = await self.make_handle(Harness(task_affine=True))
+        runtime_path = Path(harness.parameters[0].args[2])
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        async def blocked_close(name, arguments):
+            close_started.set()
+            await allow_close.wait()
+            return ToolObservation(name, "success", "closed", None, None)
+
+        handle._tracking_executor.invoke_internal = blocked_close
+        close_task = asyncio.create_task(handle.close())
+        await asyncio.wait_for(close_started.wait(), 1)
+        close_task.cancel()
+        allow_close.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(close_task, 1)
+        self.assertTrue(runtime_path.exists())
+        self.assertIs(harness.stdio_context.enter_task, harness.stdio_context.exit_task)
         handle.download_store.close()
 
     async def test_partial_context_entry_failures_only_exit_entered_resources(self):
@@ -458,6 +568,7 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
                     if harness.client_context is not None else 0
                 )
                 self.assertEqual(actual_client_exits, client_exits)
+                self.assertTrue(Path(harness.parameters[0].args[2]).exists())
                 self.assertNotIn(PRIVATE_MARKER, str(cm.exception))
                 self.assertEqual(list(self.downloads.iterdir()), [])
 
@@ -480,6 +591,7 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.events[-3:], [
             "initialize_failed", "client_exit", "stdio_exit"
         ])
+        self.assertTrue(Path(harness.parameters[0].args[2]).exists())
         self.assertNotIn(PRIVATE_MARKER, str(cm.exception))
         self.assertEqual(list(self.downloads.iterdir()), [])
 
@@ -500,19 +612,21 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         create_task = asyncio.create_task(
             factory.create("https://example.test", "inspect")
         )
-        await initialize_started.wait()
+        await asyncio.wait_for(initialize_started.wait(), 1)
         create_task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await create_task
         self.assertIs(harness.client_context.enter_task, harness.client_context.exit_task)
         self.assertIs(harness.stdio_context.enter_task, harness.stdio_context.exit_task)
         self.assertEqual(harness.events[-2:], ["client_exit", "stdio_exit"])
+        self.assertTrue(Path(harness.parameters[0].args[2]).exists())
         self.assertEqual(list(self.downloads.iterdir()), [])
 
     async def test_cleanup_is_exhaustive_when_browser_or_client_exit_fails(self):
         handle, harness = await self.make_handle(
             Harness(client_exit_error=RuntimeError(PRIVATE_MARKER))
         )
+        runtime_path = Path(harness.parameters[0].args[2])
         handle._tracking_executor.invoke_internal = self._failing_close(harness.events)
         with self.assertRaises(BrowserAgentApplicationCleanupError) as cm:
             await handle.close()
@@ -520,10 +634,12 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
             "browser_close_failed", "client_exit", "stdio_exit"
         ])
         self.assertNotIn(PRIVATE_MARKER, str(cm.exception))
+        self.assertTrue(runtime_path.exists())
         handle.download_store.close()
 
     async def test_mcp_error_close_result_fails_safely_and_exits_contexts(self):
         handle, harness = await self.make_handle()
+        runtime_path = Path(harness.parameters[0].args[2])
 
         async def mcp_error(name, arguments):
             harness.events.append("browser_close_mcp_error")
@@ -540,6 +656,7 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.events.count("browser_close_mcp_error"), 1)
         self.assertNotIn(PRIVATE_MARKER, str(cm.exception))
         self.assertNotIn(API_KEY, str(cm.exception))
+        self.assertTrue(runtime_path.exists())
         with self.assertRaises(BrowserAgentApplicationCleanupError):
             await handle.close()
         self.assertEqual(harness.events.count("browser_close_mcp_error"), 1)
@@ -556,6 +673,7 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         for result in results:
             with self.subTest(result=type(result).__name__):
                 handle, harness = await self.make_handle()
+                runtime_path = Path(harness.parameters[0].args[2])
 
                 async def close_result(name, arguments, value=result):
                     harness.events.append("close_result")
@@ -569,6 +687,7 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
                 ])
                 self.assertNotIn(PRIVATE_MARKER, str(cm.exception))
                 self.assertNotIn(API_KEY, str(cm.exception))
+                self.assertTrue(runtime_path.exists())
                 handle.download_store.close()
 
     @staticmethod
@@ -607,6 +726,7 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.events[-3:], [
             "call:browser_close", "client_exit", "stdio_exit"
         ])
+        self.assertTrue(Path(harness.parameters[0].args[2]).exists())
         self.assertEqual(list(self.downloads.iterdir()), [])
 
     async def test_failure_before_policy_closes_entered_contexts_and_store(self):
@@ -626,6 +746,7 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.events[-3:], [
             "discover_failed", "client_exit", "stdio_exit"
         ])
+        self.assertTrue(Path(harness.parameters[0].args[2]).exists())
         self.assertNotIn(PRIVATE_MARKER, str(cm.exception))
         self.assertEqual(list(self.downloads.iterdir()), [])
 
@@ -646,6 +767,7 @@ class FactoryTests(ApplicationTestCase, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(harness.events[-3:], [
             "discover_cancelled", "client_exit", "stdio_exit"
         ])
+        self.assertTrue(Path(harness.parameters[0].args[2]).exists())
         self.assertEqual(list(self.downloads.iterdir()), [])
 
     async def test_factory_control_signals_are_cleaned_and_not_converted(self):

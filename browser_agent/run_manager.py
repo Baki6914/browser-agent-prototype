@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import secrets
 import struct
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -14,7 +15,13 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
-from .agent_loop import AgentPauseKind, AgentRunResult, AgentRunStatus
+from .agent_loop import (
+    AgentApplicationEventKind,
+    AgentPauseKind,
+    AgentRunResult,
+    AgentRunStatus,
+    AgentStepStatus,
+)
 from .downloads import (
     DownloadError,
     DownloadFile,
@@ -34,8 +41,18 @@ from .secret_application import (
     SecretFormApplierProtocol,
     SecretTargetSummary,
 )
+from .tool_policy import TOOL_POLICY_REGISTRY
 
 _ERROR_MESSAGE_LIMIT = 500
+_AUDIT_SUMMARY_LIMIT = 200
+_AUDIT_TOOL_NAME_LIMIT = 100
+_TRUSTED_AUDIT_TOOL_NAMES = frozenset(TOOL_POLICY_REGISTRY) | frozenset(
+    {"ask_user", "finish", "request_secret"}
+)
+
+
+def _contains_control_or_format(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
 
 
 class RunStatus(str, Enum):
@@ -50,6 +67,62 @@ class RunStatus(str, Enum):
     CANCELLED = "cancelled"
     STEP_LIMIT_REACHED = "step_limit_reached"
     DECISION_SOURCE_EXHAUSTED = "decision_source_exhausted"
+
+
+class RunAuditKind(str, Enum):
+    SYSTEM = "system"
+    TOOL = "tool"
+    USER_INPUT = "user_input"
+    CONFIRMATION = "confirmation"
+    SECRET = "secret"
+
+
+class RunAuditStatus(str, Enum):
+    INFO = "info"
+    SUCCESS = "success"
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True)
+class RunAuditEvent:
+    sequence: int
+    kind: RunAuditKind
+    status: RunAuditStatus
+    summary: str
+    step_number: int | None = None
+    tool_name: str | None = None
+    replay_of_step_number: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.sequence) is not int or self.sequence <= 0:
+            raise ValueError("audit sequence must be a positive integer")
+        if type(self.kind) is not RunAuditKind:
+            raise TypeError("audit kind must be a RunAuditKind")
+        if type(self.status) is not RunAuditStatus:
+            raise TypeError("audit status must be a RunAuditStatus")
+        if type(self.summary) is not str or not self.summary.strip():
+            raise ValueError("audit summary must be a non-empty string")
+        if len(self.summary) > _AUDIT_SUMMARY_LIMIT:
+            raise ValueError("audit summary is too long")
+        if _contains_control_or_format(self.summary):
+            raise ValueError("audit summary contains control or format characters")
+        for name in ("step_number", "replay_of_step_number"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"audit {name} must be a positive integer or None")
+        if self.tool_name is not None:
+            if type(self.tool_name) is not str or not self.tool_name.strip():
+                raise ValueError("audit tool_name must be a non-empty string or None")
+            if len(self.tool_name) > _AUDIT_TOOL_NAME_LIMIT:
+                raise ValueError("audit tool_name is too long")
+            if _contains_control_or_format(self.tool_name):
+                raise ValueError("audit tool_name contains control or format characters")
+            if self.tool_name not in _TRUSTED_AUDIT_TOOL_NAMES:
+                raise ValueError("audit tool_name is not a trusted identifier")
 
 
 _TERMINAL_STATUSES = frozenset(
@@ -79,6 +152,7 @@ class RunSnapshot:
     secret_fields: tuple[SecretField, ...] | None = None
     secret_targets: tuple[SecretTargetSummary, ...] | None = None
     files: tuple[DownloadMetadata, ...] = ()
+    audit_events: tuple[RunAuditEvent, ...] = ()
 
 
 class RunManagerError(Exception):
@@ -168,6 +242,7 @@ class _RunRecord:
     secret_targets: tuple[SecretFieldTarget, ...] | None = field(default=None, repr=False)
     secret_applier: SecretFormApplierProtocol | None = field(default=None, repr=False)
     download_store: RunDownloadStore | None = field(default=None, repr=False)
+    audit_events: tuple[RunAuditEvent, ...] = ()
 
 
 def _required_string(value: object, name: str, error: type[RunManagerError]) -> str:
@@ -309,6 +384,11 @@ class RunManager:
                 task = record.active_task
                 record.active_task = None
                 self._transition(record, RunStatus.CANCELLED)
+                record.audit_events = self._append_terminal_audit(
+                    record.audit_events,
+                    RunAuditStatus.CANCELLED,
+                    "Run cancelled",
+                )
         if task is not None:
             task.cancel()
             try:
@@ -507,6 +587,15 @@ class RunManager:
                 record.session = session
                 record.secret_applier = applier
                 record.download_store = download_store
+                record.audit_events = (
+                    RunAuditEvent(
+                        1,
+                        RunAuditKind.SYSTEM,
+                        RunAuditStatus.SUCCESS,
+                        "Initial page opened",
+                    ),
+                )
+                record.version += 1
                 local_handle = None
             result = await session.start(record.task)
             await self._publish_result(record, result)
@@ -611,6 +700,13 @@ class RunManager:
             record.secret_targets = secret_targets
             record.error_type = None
             record.error_message = None
+            record.audit_events = self._audit_from_result(
+                result,
+                preserve_initial=bool(
+                    record.audit_events
+                    and record.audit_events[0].summary == "Initial page opened"
+                ),
+            )
         if status in _TERMINAL_STATUSES:
             if status is RunStatus.FINISHED:
                 try:
@@ -644,6 +740,11 @@ class RunManager:
             record.secret_reference = None
             record.error_type = error_type
             record.error_message = error_message
+            record.audit_events = self._append_terminal_audit(
+                record.audit_events,
+                RunAuditStatus.FAILED,
+                "Run failed safely",
+            )
         await self._close_handle(record)
         try:
             await self._cleanup_secrets(record)
@@ -743,6 +844,11 @@ class RunManager:
             )
             if after != before:
                 record.version += 1
+                record.audit_events = self._append_terminal_audit(
+                    record.audit_events,
+                    RunAuditStatus.FAILED,
+                    "Run failed safely",
+                )
 
     async def _shutdown_record(self, record: _RunRecord) -> None:
         async with record.lock:
@@ -751,6 +857,11 @@ class RunManager:
             if not terminal:
                 record.active_task = None
                 self._transition(record, RunStatus.CANCELLED)
+                record.audit_events = self._append_terminal_audit(
+                    record.audit_events,
+                    RunAuditStatus.CANCELLED,
+                    "Run cancelled",
+                )
         current = asyncio.current_task()
         if task is not None and task is not current:
             if not terminal:
@@ -927,6 +1038,137 @@ class RunManager:
         record.secret_reference = None
 
     @staticmethod
+    def _append_terminal_audit(
+        events: tuple[RunAuditEvent, ...],
+        status: RunAuditStatus,
+        summary: str,
+    ) -> tuple[RunAuditEvent, ...]:
+        if events and events[-1].status is status and events[-1].summary == summary:
+            return events
+        return events + (
+            RunAuditEvent(
+                len(events) + 1,
+                RunAuditKind.SYSTEM,
+                status,
+                summary,
+            ),
+        )
+
+    @staticmethod
+    def _audit_from_result(
+        result: AgentRunResult, *, preserve_initial: bool
+    ) -> tuple[RunAuditEvent, ...]:
+        events: list[RunAuditEvent] = []
+
+        def add(
+            kind: RunAuditKind,
+            status: RunAuditStatus,
+            summary: str,
+            *,
+            step_number: int | None = None,
+            tool_name: str | None = None,
+            replay_of_step_number: int | None = None,
+        ) -> None:
+            events.append(
+                RunAuditEvent(
+                    len(events) + 1,
+                    kind,
+                    status,
+                    summary,
+                    step_number,
+                    tool_name,
+                    replay_of_step_number,
+                )
+            )
+
+        if preserve_initial:
+            add(RunAuditKind.SYSTEM, RunAuditStatus.SUCCESS, "Initial page opened")
+
+        interactions = {}
+        for interaction in result.user_interactions:
+            interactions.setdefault(interaction.after_step_number, []).append(interaction)
+        application_events = {}
+        for application_event in result.application_events:
+            application_events.setdefault(application_event.after_step_number, []).append(
+                application_event
+            )
+
+        for step in sorted(result.steps, key=lambda item: item.step_number):
+            observation = step.observation
+            candidate_tool_name = step.decision.tool_name
+            tool_name = candidate_tool_name if candidate_tool_name in _TRUSTED_AUDIT_TOOL_NAMES else None
+            if tool_name is None:
+                status = RunAuditStatus.REJECTED
+                summary = "Unknown action rejected safely"
+            elif observation.confirmation_required:
+                status = RunAuditStatus.PENDING
+                summary = f"Approval required: {tool_name}"
+            elif observation.status is AgentStepStatus.REJECTED:
+                status = RunAuditStatus.REJECTED
+                summary = f"Action rejected by policy: {tool_name}"
+            elif observation.status in {
+                AgentStepStatus.MCP_ERROR,
+                AgentStepStatus.TRANSPORT_ERROR,
+            }:
+                status = RunAuditStatus.FAILED
+                summary = f"Action failed: {tool_name}"
+            elif observation.status is AgentStepStatus.FINISHED:
+                status = RunAuditStatus.SUCCESS
+                summary = "Task finished"
+            elif observation.status is AgentStepStatus.AWAITING_SECRET:
+                fields = observation.secret_fields or ()
+                names = ", ".join(field.value for field in fields)
+                status = RunAuditStatus.PENDING
+                summary = f"Agent requested secure fields: {names}"
+            elif observation.status is AgentStepStatus.AWAITING_USER:
+                status = RunAuditStatus.PENDING
+                summary = "Agent requested user input"
+            else:
+                status = RunAuditStatus.SUCCESS
+                if step.replay_of_step_number is not None:
+                    summary = f"Approved action completed: {tool_name}"
+                elif tool_name == "browser_navigate":
+                    summary = "Page navigation completed"
+                elif tool_name in {"browser_snapshot", "browser_find"}:
+                    summary = "Page inspected"
+                else:
+                    summary = f"Action completed: {tool_name}"
+            add(
+                RunAuditKind.TOOL,
+                status,
+                summary,
+                step_number=step.step_number,
+                tool_name=tool_name,
+                replay_of_step_number=step.replay_of_step_number,
+            )
+            for interaction in interactions.get(step.step_number, ()):
+                if interaction.kind is AgentPauseKind.CONFIRMATION:
+                    approved = interaction.response is True
+                    add(
+                        RunAuditKind.CONFIRMATION,
+                        RunAuditStatus.APPROVED if approved else RunAuditStatus.REJECTED,
+                        "Operator approved the action" if approved else "Operator rejected the action",
+                        step_number=step.step_number,
+                    )
+                else:
+                    add(
+                        RunAuditKind.USER_INPUT,
+                        RunAuditStatus.SUCCESS,
+                        "User supplied requested information",
+                        step_number=step.step_number,
+                    )
+            for application_event in application_events.get(step.step_number, ()):
+                if application_event.kind is AgentApplicationEventKind.SECRET_APPLIED:
+                    names = ", ".join(field.value for field in application_event.fields)
+                    add(
+                        RunAuditKind.SECRET,
+                        RunAuditStatus.SUCCESS,
+                        f"Secure fields applied to the page: {names}",
+                        step_number=step.step_number,
+                    )
+        return tuple(events)
+
+    @staticmethod
     def _snapshot(record: _RunRecord) -> RunSnapshot:
         files = (
             record.download_store.list_metadata()
@@ -951,6 +1193,7 @@ class RunManager:
                 if record.secret_targets is not None else None
             ),
             files=files,
+            audit_events=record.audit_events,
         )
 
     @staticmethod

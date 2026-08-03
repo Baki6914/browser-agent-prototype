@@ -41,6 +41,23 @@ class FakeGateway:
 
 
 class ToolPolicyTests(unittest.TestCase):
+    def test_base_policy_distribution(self) -> None:
+        counts = {action: 0 for action in PolicyAction}
+        for rule in TOOL_POLICY_REGISTRY.values():
+            counts[rule.action] += 1
+        self.assertEqual(counts[PolicyAction.ALLOW], 11)
+        self.assertEqual(counts[PolicyAction.REQUIRE_CONFIRMATION], 8)
+        self.assertEqual(counts[PolicyAction.INTERNAL_ONLY], 1)
+        self.assertEqual(counts[PolicyAction.DENY], 4)
+
+    def test_browser_navigate_is_automatic_and_remains_visible(self) -> None:
+        policy = McpToolPolicy([definition("browser_navigate")])
+        decision = policy.decide("browser_navigate", {})
+        self.assertEqual(decision.action, PolicyAction.ALLOW)
+        self.assertEqual(
+            [tool.name for tool in policy.llm_visible_tools()],
+            ["browser_navigate"],
+        )
     def test_inventory_has_an_explicit_registry_entry_for_every_tool(self) -> None:
         inventory_path = (
             Path(__file__).resolve().parents[1]
@@ -168,9 +185,18 @@ class PolicyExecutorTests(unittest.IsolatedAsyncioTestCase):
                 definition("browser_type"),
                 definition("browser_close"),
                 definition("browser_evaluate"),
+                definition("browser_navigate"),
             ]
         )
         self.executor = PolicyEnforcedToolExecutor(self.gateway, self.policy)
+
+    async def test_navigation_invokes_without_confirmation(self) -> None:
+        await self.executor.invoke(
+            "browser_navigate", {"url": "https://example.test"}
+        )
+        self.assertEqual(self.gateway.calls, [
+            ("browser_navigate", {"url": "https://example.test"})
+        ])
 
     async def test_allow_invokes_gateway(self) -> None:
         result = await self.executor.invoke("browser_find", {"text": "ready"})

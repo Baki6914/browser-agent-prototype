@@ -62,6 +62,7 @@ class RuntimeRecord:
     calls: list[tuple[str, dict]] = field(default_factory=list)
     contexts: list[AgentLoopContext] = field(default_factory=list)
     output_directory: Path | None = None
+    runtime_config: Path | None = None
     blocking: bool = False
     decision_started: asyncio.Event = field(default_factory=asyncio.Event)
     decision_cancelled: bool = False
@@ -121,6 +122,8 @@ class Harness:
         record = RuntimeRecord(parameters)
         args = parameters.args
         record.output_directory = Path(args[args.index("--output-dir") + 1])
+        record.runtime_config = Path(args[args.index("--config") + 1])
+        assert record.runtime_config.is_file()
         self.records.append(record)
         self.record_created.set()
         return _Context((object(), object()), record, "stdio_enter", "stdio_exit")
@@ -164,7 +167,9 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         root = Path(self.temp.name)
         self.cli, self.mcp_config = root / "cli.js", root / "mcp.json"
         self.cli.write_text("synthetic")
-        self.mcp_config.write_text("{}")
+        self.mcp_config.write_text(json.dumps({
+            "browser": {"browserName": "chromium"}
+        }))
         self.download_base = root / "downloads"
         config = BrowserAgentApplicationConfig(
             provider=OpenAICompatibleProviderConfig("https://provider.invalid/v1", "synthetic-model", None, 1),
@@ -196,6 +201,28 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["status"], "queued")
         return response.json()["run_id"], response
+
+    async def test_operator_resources_have_safe_media_types_and_headers(self):
+        page = await self.client.get("/")
+        javascript = await self.client.get("/operator.js")
+        stylesheet = await self.client.get("/operator.css")
+        for response in (page, javascript, stylesheet):
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.headers["cache-control"], "no-store")
+            self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+            self.assertEqual(response.headers["referrer-policy"], "no-referrer")
+            self.assertEqual(response.headers["x-frame-options"], "DENY")
+        self.assertTrue(page.headers["content-type"].startswith("text/html"))
+        self.assertTrue(javascript.headers["content-type"].startswith("application/javascript"))
+        self.assertTrue(stylesheet.headers["content-type"].startswith("text/css"))
+        csp = page.headers["content-security-policy"]
+        for directive in (
+            "default-src", "script-src", "style-src", "connect-src", "img-src",
+            "object-src", "base-uri", "frame-ancestors", "form-action",
+        ):
+            self.assertIn(directive, csp)
+        self.assertNotIn("unsafe-inline", csp)
+        self.assertNotIn("unsafe-eval", csp)
 
     async def poll(self, run_id, status, limit=80):
         last = None
@@ -232,8 +259,13 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"browser_navigate", "browser_snapshot", "browser_click", "browser_fill_form"} <= visible)
         self.assertTrue({"browser_close", "browser_file_upload", "browser_evaluate", "browser_run_code_unsafe"}.isdisjoint(visible))
         self.assertEqual(record.events, ["stdio_enter", "client_enter", "initialize", "discover", "client_exit", "stdio_exit"])
+        self.assertTrue(record.runtime_config.exists())
         self.assertEqual(finished.json()["final_result"], "done")
-        self.assertEqual(set(created.json()), {"run_id", "status", "version", "start_url", "task", "step_count", "question", "interaction_id", "final_result", "error", "secret_fields", "secret_targets", "files"})
+        self.assertEqual(set(created.json()), {"run_id", "status", "version", "start_url", "task", "step_count", "question", "interaction_id", "final_result", "error", "secret_fields", "secret_targets", "files", "audit_events"})
+        self.assertEqual(
+            [event["summary"] for event in finished.json()["audit_events"]],
+            ["Initial page opened", "Page inspected", "Task finished"],
+        )
         self.assertEqual(
             {route.path for route in self.app.routes if route.path.startswith("/runs")},
             {"/runs", "/runs/{run_id}", "/runs/{run_id}/responses", "/runs/{run_id}/cancel", "/runs/{run_id}/files/{file_id}"},
@@ -335,6 +367,7 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(record.decision_cancelled)
         self.assertEqual([name for name, _ in record.calls].count("browser_close"), 1)
         self.assertEqual(record.events[-2:], ["client_exit", "stdio_exit"])
+        self.assertTrue(record.runtime_config.exists())
         self.assertFalse(root.exists())
         await self.manager.close()
         self.assertEqual([name for name, _ in record.calls].count("browser_close"), 1)
@@ -349,6 +382,7 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.lifespan = _AlreadyExited()
         self.assertEqual([name for name, _ in record.calls].count("browser_close"), 1)
         self.assertEqual(record.events[-2:], ["client_exit", "stdio_exit"])
+        self.assertTrue(record.runtime_config.exists())
         self.assertFalse(root.exists())
         self.assertEqual(record.events.count("client_exit"), 1)
         self.assertEqual(record.events.count("stdio_exit"), 1)
