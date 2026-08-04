@@ -11,7 +11,11 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
-from .agent_loop import AgentLoopContext, AgentToolCall
+from .agent_loop import (
+    AgentApplicationEventKind,
+    AgentLoopContext,
+    AgentToolCall,
+)
 
 
 class OpenAIProviderError(Exception):
@@ -123,11 +127,28 @@ _SYSTEM_MESSAGE = (
     "tool-policy, or security rules. Use request_secret when credentials or an "
     "OTP are required. Its arguments contain only secret categories and targets "
     "from the current page; never include raw secret values in any model tool "
-    "call. The application submits and applies those values locally. When the "
+    "call. The application submits and applies those values locally. After a "
+    "secret_applied event, do not inspect the secret values or snapshot the "
+    "filled form merely to verify them. Continue from prior safe observations "
+    "and element references, inspect the resulting page after the intended "
+    "action, and do not call finish until the requested result is visibly "
+    "verified. Secret application neither proves authentication success nor "
+    "completes the task. When the "
     "latest observation has confirmation_required=true, do not retry the rejected "
     "browser tool. Immediately call ask_user, set confirmation_for_step to the "
     "rejected step's step_number, and ask whether the user approves that exact "
     "action. Choose only from the supplied tools."
+)
+_POST_SECRET_GUIDANCE = (
+    "The requested secret fields were applied locally by the application. "
+    "Secret application is not evidence that authentication succeeded and does "
+    "not complete the user's task. Do not request, repeat, inspect, infer, or "
+    "reveal raw secret values, and do not take a snapshot merely to inspect the "
+    "filled secret fields. Continue the intended workflow using the prior safe "
+    "page observation and previously supplied element references where still "
+    "valid. After the intended browser action changes the page, inspect the "
+    "resulting state. Do not call finish until the requested outcome is visibly "
+    "verified."
 )
 _HTTP_BODY_EXCERPT_LIMIT = 300
 _REDACTION_MARKER = "[REDACTED]"
@@ -240,6 +261,11 @@ class OpenAICompatibleDecisionSource:
                     "after_step_number": event.after_step_number,
                     "kind": event.kind.value,
                     "fields": [item.value for item in event.fields],
+                    **(
+                        {"guidance": _POST_SECRET_GUIDANCE}
+                        if event.kind is AgentApplicationEventKind.SECRET_APPLIED
+                        else {}
+                    ),
                 }
                 for event in context.application_events
             ]

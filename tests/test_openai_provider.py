@@ -308,6 +308,75 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_secret_applied_event_adds_fixed_safe_guidance(self) -> None:
+        context = _context()
+        context = AgentLoopContext(
+            context.task,
+            context.tools,
+            context.steps,
+            application_events=(
+                AgentApplicationEvent(
+                    1,
+                    AgentApplicationEventKind.SECRET_APPLIED,
+                    (SecretField.PASSWORD, SecretField.USERNAME),
+                ),
+            ),
+        )
+
+        _, request = await self._request(
+            httpx.Response(200, json=_payload()), context=context
+        )
+
+        body = json.loads(request.content)
+        user = json.loads(body["messages"][1]["content"])
+        event = user["application_events"][0]
+        self.assertEqual(
+            set(event), {"after_step_number", "kind", "fields", "guidance"}
+        )
+        self.assertEqual(event["after_step_number"], 1)
+        self.assertEqual(event["kind"], "secret_applied")
+        self.assertEqual(event["fields"], ["password", "username"])
+        guidance = event["guidance"]
+        for phrase in (
+            "not evidence that authentication succeeded",
+            "does not complete the user's task",
+            "inspect, infer, or reveal raw secret values",
+            "do not take a snapshot merely to inspect the filled secret fields",
+            "prior safe page observation and previously supplied element references",
+            "inspect the resulting state",
+            "Do not call finish until the requested outcome is visibly verified",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, guidance)
+        system_message = body["messages"][0]["content"]
+        for phrase in (
+            "do not inspect the secret values",
+            "snapshot the filled form merely to verify them",
+            "Continue from prior safe observations and element references",
+            "inspect the resulting page after the intended action",
+            "do not call finish until the requested result is visibly verified",
+            "neither proves authentication success nor completes the task",
+        ):
+            with self.subTest(system_phrase=phrase):
+                self.assertIn(phrase, system_message)
+
+    async def test_context_without_application_events_preserves_shape(self) -> None:
+        context = _context()
+
+        _, request = await self._request(
+            httpx.Response(200, json=_payload()), context=context
+        )
+
+        body = json.loads(request.content)
+        user = json.loads(body["messages"][1]["content"])
+        self.assertNotIn("application_events", user)
+        self.assertEqual(user["task"], context.task)
+        self.assertEqual(user["previous_steps"][0]["step_number"], 1)
+        self.assertEqual(
+            [item["function"]["name"] for item in body["tools"]],
+            [definition.name for definition in context.tools],
+        )
+
     async def test_confirmation_required_step_is_explicit_in_context(self) -> None:
         context = _context()
         context = AgentLoopContext(
@@ -586,7 +655,11 @@ class SecretApplicationContextTests(unittest.TestCase):
             (AgentApplicationEvent(1, AgentApplicationEventKind.SECRET_APPLIED, (SecretField.OTP,)),),
         )
         rendered = OpenAICompatibleDecisionSource._context_request_body(safe)["messages"][1]["content"]
-        self.assertIn('"application_events":[{"after_step_number":1,"fields":["otp"],"kind":"secret_applied"}]', rendered)
+        event = json.loads(rendered)["application_events"][0]
+        self.assertEqual(event["after_step_number"], 1)
+        self.assertEqual(event["fields"], ["otp"])
+        self.assertEqual(event["kind"], "secret_applied")
+        self.assertIn("not evidence that authentication succeeded", event["guidance"])
         for forbidden in ("synthetic-user", "synthetic-pass", "synthetic-otp", "target-ref", "secret_id"):
             self.assertNotIn(forbidden, rendered)
 
@@ -607,8 +680,17 @@ class SecretApplicationContextTests(unittest.TestCase):
         user = json.loads(body["messages"][1]["content"])
         self.assertEqual(
             [tuple(item) for item in user["application_events"]],
-            [("after_step_number", "fields", "kind")] * 2,
+            [("after_step_number", "fields", "guidance", "kind")] * 2,
         )
+        first_event, second_event = user["application_events"]
+        self.assertEqual(first_event["guidance"], second_event["guidance"])
+        self.assertEqual(first_event["fields"], ["password", "username"])
+        self.assertEqual(second_event["fields"], ["otp"])
+        for event in (first_event, second_event):
+            self.assertNotIn("target_ref", event)
+            self.assertNotIn("target_label", event)
+            self.assertNotIn("handle", event)
+            self.assertNotIn("raw_value", event)
         self.assertEqual(user["user_interactions"][0]["response"], "Answer")
         rendered = json.dumps(body, sort_keys=True)
         for forbidden in ("synthetic-user", "synthetic-pass", "synthetic-otp",
