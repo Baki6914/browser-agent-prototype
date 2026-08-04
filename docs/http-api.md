@@ -17,15 +17,19 @@ Validation keeps the generic envelope and never echoes the body.
 sorted `secret_fields`. `awaiting_secret_application` clears question and
 interaction while retaining those field categories. Responses never contain
 values, references, secret IDs, expiry, fingerprints, keys, or store details.
-There is no new endpoint and no browser login yet.
+There is no new endpoint. Milestone 11 later composed this response path into
+the real browser-login runtime without changing its HTTP contract.
 
 ## Purpose and boundary
 
-Milestone 8C adds a FastAPI HTTP boundary over the existing in-memory
-`RunManager` public API. `create_http_app(run_manager)` receives the exact
-manager instance from a future composition layer. Importing this module or
-constructing the application does not create a run, session, provider, MCP
-process, browser, subprocess, or network connection.
+Milestone 8C added a FastAPI HTTP boundary over the existing in-memory
+`RunManager` public API. The real application factory now supplies the manager
+and a run-session factory. Creating a run constructs a separate MCP runtime,
+browser session, `RunDownloadStore`, `SecretFormApplier`, and
+`DownloadTrackingExecutor`; `RunManager` owns those per-run resources and their
+lifecycle. Each store's output directory is passed to Playwright MCP through
+`--output-dir`. Importing the HTTP module alone still creates no run, provider,
+MCP process, browser, subprocess, or network connection.
 
 The HTTP layer validates and serializes requests, delegates one operation to
 `RunManager`, converts the returned immutable `RunSnapshot`, and translates
@@ -173,20 +177,24 @@ HTTP tests enter the real `app.router.lifespan_context(app)` and use HTTPX
 `ASGITransport` on the same event loop for entry, requests, and exit. They do
 not substitute a direct manager close for lifespan cleanup.
 
-This milestone is an in-process, in-memory boundary. It has no persistence or
-resume after service restart, no multi-worker coordination, and no real
-provider, NVIDIA, MCP, Playwright, or browser composition. Future composition
-work must inject a fully constructed manager.
+This remains an in-process, in-memory boundary. It has no persistence or resume
+after service restart and no multi-worker coordination. The application
+factory provides the real NVIDIA, MCP, Playwright, browser, and per-run resource
+composition. The Operator UI is a client of these same HTTP endpoints; it does
+not introduce a separate run-control API.
 
 The secret response variant is the transient credential and OTP submission
-path. Other response variants must not carry secrets. This milestone provides
-no authentication, authorization,
-CORS, rate limiting, uploads, login, UI, WebSocket, SSE,
-Docker, or multi-worker support.
+path. Other response variants must not carry secrets. The prototype provides
+no HTTP authentication, authorization, CORS, rate limiting, uploads,
+WebSocket, SSE, Docker, or multi-worker support. The Operator UI and browser
+login flow added later use the same HTTP and secret-safety boundaries.
 
 Download access is process-local and unauthenticated in this prototype. It has
-no persistence, restart recovery, custom range handling, or real M10B factory
-composition; wiring the per-run output directory to MCP is deferred to M11.
+no persistence, restart recovery, custom range handling, authentication, or
+authorization. The application factory binds each run's download output
+directory to MCP and serves registered files through the existing retrieval
+endpoint.
+
 ## Milestone 9C secret summaries
 
 The existing responses endpoint is unchanged. Secret pauses and the immediate `awaiting_secret_application` response include summaries containing only `field` and `name`; element refs never cross HTTP. Clients poll the existing run GET endpoint for later completion. The application fills fields locally but does not click, press Enter, or submit the form.

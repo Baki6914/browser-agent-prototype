@@ -4,13 +4,13 @@
 
 - **Active branch:** `mvp/playwright-mcp-agent`
 - **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current completed milestone:** Milestone 10, Minimal Controlled Downloads
+- **Current completed milestone:** Milestone 11, End-to-End NVIDIA Browser-Agent MVP
   - This is the latest milestone whose implementation, review, tests, Learning
     Handoff, human commit, human push, and remote verification are complete.
-- **Latest completed documentation checkpoint:**
-  `11fcf02a2e06cd5a4f78fa94bb226a17ca9cce87`. This is the latest completed
-  and remotely verified documentation checkpoint before the current
-  uncommitted Milestone 10 closure edit; no SHA is assigned to this edit.
+- **Latest completed code checkpoint:**
+  `a15eb0dacb8538008cd814a9335d233d05d105a2` (`fix: continue agent workflow
+  after secret application`). This document records the Milestone 11
+  closure; its own documentation commit SHA is intentionally not embedded.
 - **Current implementation:** synchronous learning prototype, verified local
   Playwright MCP connectivity, dynamic MCP tool gateway, typed classification
   and policy enforcement, typed `finish` and `ask_user` controls,
@@ -27,11 +27,50 @@
   app-owned secure secret requests, transient one-time secret storage, and
   handle-bound secret form application outside model-visible and serializable
   state; a run-specific `RunDownloadStore`, `DownloadTrackingExecutor`,
-  path-free download metadata, lifecycle cleanup, and HTTP file delivery
-- **Current phase:** PLAN — Milestone 11, End-to-End NVIDIA Browser-Agent MVP.
-  Milestone 11 implementation has not started.
+  path-free download metadata, lifecycle cleanup, and HTTP file delivery; plus
+  a real application and per-run session factory that compose the configured
+  NVIDIA/OpenAI-compatible provider, MCP stdio and Playwright browser,
+  policy-enforced and download-tracking executors, `SecretFormApplier`,
+  run-specific download store, resumable session, `RunManager`, FastAPI, and
+  the Operator UI with audited run controls
+- **Current phase:** PLAN — Milestone 12, Installation, HTTP API, Usage, and
+  Adaptation Documentation. The technical runtime MVP is complete; Milestone
+  12 documentation is not.
 
 ## Completed
+
+- Milestone 11 completed the end-to-end NVIDIA browser-agent runtime through
+  these verified implementation checkpoints:
+  - `cd20df8d8efff71fb1d6ba5f0ac691ca805e0155` — real application composition.
+  - `23a8013f84f7911165a8ab9212711992318d5d62` — full HTTP application wiring tests.
+  - `6e2f7db2fdea41eb8346cb49917e5e9b426704c2` — live HTTP verification harness.
+  - `d58c4d4ba78076b8d138bf4f633e350a0cb7b04b` — MCP-aligned confirmation and secret handoff.
+  - `ee63920a633b099865266f56a42db66ab55537f8` — run-scoped download delivery and lifecycle ownership.
+  - `0a22af0d58dacd642e68c14e87ea13d1686e2a25` — Operator UI and audited run controls.
+  - `5d8648a210921b1d1f841df8cd6d2b2ea8685166` — polished dark Operator UI.
+  - `a15eb0dacb8538008cd814a9335d233d05d105a2` — continued workflow after secret application.
+- Final automated validation recorded 531 passed, with passing `py_compile`
+  and `git diff --check`.
+- The M11C live HTTP verifier created a run through real FastAPI HTTP and
+  verified `ask_user` pause/resume, application-controlled secret filling,
+  trusted confirmation replay, controlled download and HTTP retrieval,
+  cancellation through `POST /runs/{run_id}/cancel`, browser/MCP and lifespan
+  cleanup, run isolation, download-store cleanup, and absence of secret or API
+  key disclosure. No additional manual external-site shutdown test was run;
+  cancellation and cleanup acceptance is supported by M11C and automated tests.
+- Real NVIDIA-model acceptance used public data and temporary UI-entered test
+  secrets. It verified secure login on the public the-internet demo with
+  secrets outside model visibility and confirmed click replay; Turkish
+  Wikipedia user choice and same-session resume for Ada Lovelace, including
+  recovery from a transient snapshot failure; confirmed
+  `browser_select_option` selection of `Four` on Selenium's public form page;
+  and a W3C ZIP download delivered over HTTP.
+- The W3C file `PDF-testfiles-20081027.zip` appeared in `RunSnapshot.files` and
+  the UI at 1,256,889 bytes. Retrieval returned HTTP 200,
+  `application/octet-stream`, the safe filename in `Content-Disposition`, a
+  matching byte count, ZIP signature `PK\x03\x04`, and test-computed SHA-256
+  `904b5a30977d7af1b248f026e287d305432a7689b7b28c38b9c75ee3e12a7cb4`.
+  This is one acceptance case, not broad compatibility or checksum infrastructure.
 
 - A synchronous Playwright learning prototype exists in the repository.
 - `agent_demo.py` contains a fake, deterministic LLM decision example.
@@ -446,13 +485,12 @@ passed; the full suite recorded 418 passed. `py_compile` and
 pushed by the human; local and remote SHAs were verified equal and the tree was
 clean.
 
-M10 supplies a typed and tested download application boundary. M11 owns the
-real factory and composition root, which does not yet wire NVIDIA, MCP,
-Playwright, browser, `SecretFormApplier`, `RunDownloadStore`, session,
-`RunManager`, and FastAPI; pass `RunDownloadStore.output_directory` through
-MCP `--output-dir`; or wrap the real per-run `PolicyEnforcedToolExecutor` with
-`DownloadTrackingExecutor`. No HTTP-submitted NVIDIA/browser/download/file-
-retrieval end-to-end run has been demonstrated.
+M10 supplies a typed and tested download application boundary. M11 completed
+the real factory and composition root: it wires NVIDIA, MCP, Playwright,
+browser, `SecretFormApplier`, `RunDownloadStore`, resumable session,
+`RunManager`, FastAPI, and the Operator UI; passes
+`RunDownloadStore.output_directory` through MCP `--output-dir`; and wraps the
+real per-run `PolicyEnforcedToolExecutor` with `DownloadTrackingExecutor`.
 
 Explicit limitations remain: no persistence, restart recovery, database-backed
 sessions or persistent file catalog, production authentication or
@@ -462,13 +500,13 @@ proof. Path validation alone is not production security.
 
 ## In progress
 
-- Planning Milestone 11, End-to-End NVIDIA Browser-Agent MVP. Implementation
-  has not started.
+- Planning Milestone 12, Installation, HTTP API, Usage, and Adaptation
+  Documentation. Documentation implementation awaits an approved plan.
 
 ## Not started
 
 - A timeout system.
-- Milestone 12 installation, HTTP API, usage, and adaptation documentation.
+- Milestone 12 documentation implementation.
 
 ## Known constraints
 
@@ -532,14 +570,15 @@ proof. Path validation alone is not production security.
   confidential-data suitability, or production readiness.
 - Allowed origins are a defensive configuration, not a complete security
   boundary. Local MCP transport does not make target web content trusted.
-- The `--output-dir` mechanism and typed download boundary are proven, but
-  broad external-site compatibility and real product composition are not.
+- The `--output-dir` mechanism, typed download boundary, and real product
+  composition are proven for the accepted M11 scenarios, but broad
+  external-site compatibility is not.
 - Downloads have no antivirus scanning, checksums, quotas, or file-type
   inspection. Path validation alone is not production security.
 - File upload remains optional future work, disabled and denied by default.
-- FastAPI is the implemented HTTP boundary, but the concrete production
-  composition that wires real NVIDIA, MCP, Playwright, browser, and session
-  resources into HTTP runs is not implemented.
+- FastAPI is the implemented HTTP boundary, and the MVP application factory
+  wires real NVIDIA, MCP, Playwright, browser, and per-run session resources
+  into HTTP runs. This is not a production-readiness claim.
 - Run state is in memory only. Persistent sessions, database-backed
   sessions, and service-restart resume are out of scope for the MVP.
 - Docker, Docker Compose, PostgreSQL, SQLAlchemy, Alembic, local vLLM,
@@ -555,10 +594,11 @@ proof. Path validation alone is not production security.
 
 ## Immediate next step
 
-Plan Milestone 11, End-to-End NVIDIA Browser-Agent MVP, without beginning
-implementation. Define the real factory and composition wiring needed for an
-HTTP-submitted NVIDIA/browser/download/file-retrieval run while preserving
-policy enforcement, secret isolation, and lifecycle cleanup.
+Plan Milestone 12, Installation, HTTP API, Usage, and Adaptation Documentation.
+Document installation, NVIDIA configuration, endpoint usage, interaction and
+secret-safety flows, downloads, policy categories, troubleshooting, and
+adaptation to another approved OpenAI-compatible provider without presenting
+Milestone 12 as complete.
 
 ## Last verified checkpoint
 
@@ -787,9 +827,8 @@ Milestone 7, MVP Evaluation, is completed.
 
 The documentation-only roadmap correction checkpoint is complete and remotely
 verified. After that checkpoint, Milestone 8 was implemented and completed.
-Milestone 10 is now complete, and the repository is planning Milestone 11,
-End-to-End NVIDIA Browser-Agent MVP. Milestone 11 implementation has not
-started.
+Milestones 10 and 11 are now complete, and the repository is planning
+Milestone 12, Installation, HTTP API, Usage, and Adaptation Documentation.
 The authoritative Milestones 8–12 sequence is in
 [`ROADMAP.md`](../ROADMAP.md):
 
@@ -801,8 +840,8 @@ The authoritative Milestones 8–12 sequence is in
   exposing raw secrets to provider/model context or serializable run history.
 - Milestone 10: completed minimal controlled downloads with proven
   `--output-dir` capability and a typed, tested application boundary.
-- Milestone 11: end-to-end NVIDIA browser-agent MVP, currently in PLAN with
-  implementation not started.
+- Milestone 11: completed end-to-end NVIDIA browser-agent runtime and live
+  acceptance.
 - Milestone 12: installation, HTTP API, usage, and provider-adaptation
   documentation.
 

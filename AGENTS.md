@@ -62,13 +62,16 @@ process on the same computer:
 - File upload is optional future work. `browser_file_upload` remains denied by
   default unless a separately approved milestone changes it.
 
-Milestones 1 through 10 are completed. Milestone 10 was completed through M10A
+Milestones 1 through 11 are completed. Milestone 10 was completed through M10A
 `22153a419b4d865073bc056e227405eeb3379212` (`test: prove controlled
 download capability`) and M10B
 `a5781ee81c088e9e212eddeaee16c4e2d2a25ec7` (`feat: add minimal controlled
-downloads`); M10B's full suite recorded 418 passed. The current phase is
-PLAN — Milestone 11, End-to-End NVIDIA Browser-Agent MVP. Milestone 11
-implementation has not started.
+downloads`); M10B's full suite recorded 418 passed. Milestone 11's latest
+completed code checkpoint is
+`a15eb0dacb8538008cd814a9335d233d05d105a2`; its final automated suite recorded
+531 passed. The current phase is PLAN — Milestone 12, Installation, HTTP API,
+Usage, and Adaptation Documentation. The product runtime MVP is technically
+complete, while the Milestone 12 documentation deliverable remains open.
 
 Provider visibility is not execution authority. `AgentToolRouter`,
 `McpToolPolicy`, `PolicyEnforcedToolExecutor`, `McpToolGateway`, and the local
@@ -78,14 +81,13 @@ discovery remains distinct from authorization.
 Do not recreate the lost asynchronous `BrowserService` draft unless a
 separately approved plan explicitly requires it.
 
-The complete real composition boundary is still missing: no real composition
-root or run-session factory yet constructs and wires NVIDIA, MCP, Playwright,
-the browser, `SecretFormApplier`, `RunDownloadStore`, the session,
-`RunManager`, and FastAPI. `RunDownloadStore.output_directory` is not yet
-passed to the real MCP process through `--output-dir`, and the real per-run
-`PolicyEnforcedToolExecutor` is not yet wrapped with
-`DownloadTrackingExecutor`. No HTTP-submitted NVIDIA/browser/download/file-
-retrieval end-to-end run has been demonstrated.
+The real application composition root now constructs and wires the configured
+NVIDIA/OpenAI-compatible provider, a per-run MCP stdio session and Playwright
+browser, policy executor, `SecretFormApplier`, run-specific
+`RunDownloadStore`, `DownloadTrackingExecutor`, resumable session,
+`RunManager`, FastAPI application, and Operator UI. Each store's
+`output_directory` is passed to MCP through `--output-dir`, and the per-run
+`PolicyEnforcedToolExecutor` is wrapped by `DownloadTrackingExecutor`.
 
 There is no persistence, restart recovery, database-backed session or
 persistent file catalog, production authentication or authorization,

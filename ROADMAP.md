@@ -49,13 +49,13 @@ The implemented learning prototype:
 - performs lifespan shutdown through `RunManager.close()`;
 - does not expose arbitrary server-side code execution to the LLM.
 
-The complete product MVP is not finished. Controlled-download metadata and
-HTTP file retrieval are implemented, but the real HTTP composition root that
-constructs and wires NVIDIA, MCP, Playwright, browser, secret application,
-download storage and tracking, session, and run-manager resources is not
-implemented. Persistence, service-restart resume, HTTP-service
-authentication and authorization, production deployment, and multi-worker
-coordination are also not implemented.
+The technical runtime MVP was completed in Milestone 11. The real HTTP
+composition root constructs and wires NVIDIA, MCP, Playwright, browser, secret
+application, per-run download storage and tracking, resumable sessions,
+run-manager resources, FastAPI, and the Operator UI. Project delivery continues
+through Milestone 12 documentation. Persistence, service-restart resume,
+HTTP-service authentication and authorization, production deployment, and
+multi-worker coordination are also not implemented.
 
 ## Milestones
 
@@ -327,12 +327,10 @@ unsuccessful-run cleanup, and `RunManager.close` cleanup complete the lifecycle.
 `run_file_not_found` when appropriate, and never exposes private paths.
 
 Milestone 10 provides the typed and tested download application boundary.
-Milestone 11 owns the real factory and composition wiring. Its implementation
-has not started; the current phase is PLAN. In particular, the real factory
-does not yet pass `RunDownloadStore.output_directory` to MCP via `--output-dir`
-or wrap each real `PolicyEnforcedToolExecutor` with
-`DownloadTrackingExecutor`, and no HTTP-submitted NVIDIA/browser/download/file-
-retrieval end-to-end run has been demonstrated.
+Milestone 11 completed the real factory and composition wiring, including
+passing `RunDownloadStore.output_directory` to MCP via `--output-dir` and
+wrapping each real `PolicyEnforcedToolExecutor` with
+`DownloadTrackingExecutor`.
 
 Explicit limitations remain: no persistence, restart recovery, database-backed
 sessions or persistent file catalog, production authentication or
@@ -351,6 +349,50 @@ Path validation alone is not production security.
   secure login, form filling, selection, clicking, and automatic download.
 - Cancellation and browser/MCP resource cleanup are verified.
 - End-to-end evaluation uses only public or synthetic data.
+
+**Completion note:** Milestone 11 is technically complete through these
+human-created and verified implementation checkpoints:
+
+- `cd20df8d8efff71fb1d6ba5f0ac691ca805e0155` — `feat: compose real browser agent application`
+- `23a8013f84f7911165a8ab9212711992318d5d62` — `test: prove full HTTP application wiring`
+- `6e2f7db2fdea41eb8346cb49917e5e9b426704c2` — `test: add live HTTP verification harness`
+- `d58c4d4ba78076b8d138bf4f633e350a0cb7b04b` — `fix: align confirmation and secret handoff with MCP`
+- `ee63920a633b099865266f56a42db66ab55537f8` — `feat: add run-scoped download delivery and lifecycle ownership`
+- `0a22af0d58dacd642e68c14e87ea13d1686e2a25` — `feat: add operator UI and audited run controls`
+- `5d8648a210921b1d1f841df8cd6d2b2ea8685166` — `feat: add polished dark operator UI`
+- `a15eb0dacb8538008cd814a9335d233d05d105a2` — `fix: continue agent workflow after secret application`
+
+Final automated validation recorded 531 passed; `py_compile` and
+`git diff --check` also passed. The M11C live HTTP verifier created runs through
+the real FastAPI boundary and proved `ask_user` pause/resume, `request_secret`
+with application-controlled secret filling, trusted confirmation replay,
+controlled download and HTTP file retrieval, cancellation through
+`POST /runs/{run_id}/cancel`, browser/MCP and lifespan cleanup, run isolation,
+download-store cleanup, and absence of secret or API-key disclosure. No
+additional manual external-site shutdown test was performed; cancellation and
+cleanup acceptance rests on M11C and the automated tests.
+
+Real NVIDIA-model acceptance used only public data and temporary test secrets
+entered through the Operator UI. It covered: secure login on the public
+the-internet demo with model-requested secrets kept outside model visibility,
+confirmed click replay, and visible `/secure` success verification; a Turkish
+Wikipedia choice-and-resume run for Ada Lovelace, including confirmed search
+and recovery from a transient snapshot error; a W3C ZIP download saved as
+`PDF-testfiles-20081027.zip`, exposed as 1,256,889 bytes in `RunSnapshot.files`
+and the UI, retrieved with HTTP 200, `application/octet-stream`, safe
+`Content-Disposition`, matching byte count, ZIP signature `PK\x03\x04`, and
+SHA-256 `904b5a30977d7af1b248f026e287d305432a7689b7b28c38b9c75ee3e12a7cb4`;
+and a Selenium form interaction where `browser_select_option` selected visible
+option `Four` only after confirmation and trusted replay, followed by snapshot
+verification without form submission. The single W3C case does not establish
+broad or universal external-site download compatibility.
+
+These results meet the Milestone 11 criteria for HTTP task submission, a real
+NVIDIA model, navigation, page inspection, user interaction and resume, secure
+login, form filling, selection, clicking, automatic download, cancellation,
+browser/MCP cleanup, and use of public or synthetic data. The current phase is
+PLAN — Milestone 12, Installation, HTTP API, Usage, and Adaptation
+Documentation; Milestone 12 is not yet complete.
 
 ### 12. Installation, HTTP API, Usage, and Adaptation Documentation
 
