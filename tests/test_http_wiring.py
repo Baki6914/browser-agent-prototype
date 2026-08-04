@@ -361,54 +361,49 @@ class HttpWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(SECRET not in value for value in retained))
         self.assertTrue(all(SECRET_REF not in value for value in [created.text, paused.text, submitted.text, finished.text, repr(await self.manager.get_run(run_id))]))
 
-    async def test_scripted_login_guards_secret_application_and_exact_confirmation(self):
-        raw_secret = "SuperSecretPassword!"
-        raw_username = "alice@example.test"
+    async def test_public_demo_login_uses_policy_confirmation_and_exact_replay(self):
+        fields = [
+            {"name": "username", "type": "text", "ref": "user-ref", "value": "demo-user"},
+            {"name": "password", "type": "password", "ref": SECRET_REF, "value": "public-demo-password"},
+        ]
         click = {"element": "Login", "ref": "login-button"}
         self.harness.queue([
-            AgentToolCall("browser_fill_form", {"fields": [
-                {"name": "username", "type": "text", "ref": "user-ref", "value": raw_username},
-                {"name": "password", "type": "password", "ref": SECRET_REF, "value": raw_secret},
-            ]}),
-            AgentToolCall("request_secret", {
-                "question": "Enter username and password securely",
-                "fields": ["username", "password"],
-                "targets": [
-                    {"field": "username", "name": "Username", "ref": "user-ref"},
-                    {"field": "password", "name": "Password", "ref": SECRET_REF},
-                ],
+            AgentToolCall("browser_fill_form", {"fields": fields}),
+            AgentToolCall("ask_user", {
+                "question": "Approve this exact demo credential fill?",
+                "confirmation_for_step": 1,
             }),
-            AgentToolCall("ask_user", {"question": "May I click the Login button?"}),
             AgentToolCall("browser_click", click),
             AgentToolCall("ask_user", {
                 "question": "Approve this exact Login click?", "confirmation_for_step": 4,
             }),
+            AgentToolCall("browser_snapshot", {}),
             AgentToolCall("finish", {"result": "Login verified"}),
         ])
-        run_id, created = await self.create()
-        secret_pause = await self.poll(run_id, "awaiting_secret")
+        run_id, _ = await self.create()
+        fill_confirmation = await self.poll(run_id, "awaiting_confirmation")
         record = self.harness.records[0]
         self.assertNotIn("browser_fill_form", [name for name, _ in record.calls])
-        retained_before_secret = repr((record.contexts, await self.manager.get_run(run_id)))
-        self.assertNotIn(raw_secret, retained_before_secret)
-        self.assertNotIn(raw_username, retained_before_secret)
-        self.assertIn("Sensitive form values must be supplied", retained_before_secret)
-
-        submitted = await self.respond(run_id, secret_pause, {
-            "type": "secret", "values": {
-                "username": raw_username, "password": raw_secret,
-            },
+        await self.respond(run_id, fill_confirmation, {
+            "type": "confirmation", "approved": True,
         })
-        confirmation = await self.poll(run_id, "awaiting_confirmation")
-        self.assertNotEqual(submitted.json()["status"], "awaiting_user")
+        click_confirmation = await self.poll(run_id, "awaiting_confirmation")
         self.assertEqual([name for name, _ in record.calls].count("browser_fill_form"), 1)
-        await self.respond(run_id, confirmation, {"type": "confirmation", "approved": True})
-        proposal, finished = await self.approve_completion(run_id, "Login verified")
+        self.assertNotIn("browser_click", [name for name, _ in record.calls])
+        await self.respond(run_id, click_confirmation, {
+            "type": "confirmation", "approved": True,
+        })
+        await self.approve_completion(run_id, "Login verified")
         await self.wait_for_cleanup(record)
+        self.assertEqual(
+            [args for name, args in record.calls if name == "browser_fill_form"],
+            [{"fields": [
+                {"name": "username", "type": "text"},
+                {"name": "password", "type": "password"},
+            ]}],
+        )
         self.assertEqual([args for name, args in record.calls if name == "browser_click"], [click])
-        retained = repr((created.json(), secret_pause.json(), submitted.json(), proposal.json(), finished.json(), record.contexts, await self.manager.get_run(run_id)))
-        self.assertNotIn(raw_secret, retained)
-        self.assertNotIn(raw_username, retained)
+        self.assertEqual([name for name, _ in record.calls].count("browser_snapshot"), 1)
 
     async def test_download_tracking_http_retrieval_and_run_isolation(self):
         click = {"element": "Report", "ref": "download-1"}

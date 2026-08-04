@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import math
-import re
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -21,65 +20,6 @@ from .mcp_gateway import McpGatewayError, ToolDefinition, ToolObservation
 from .tool_policy import ToolConfirmationRequiredError, ToolPolicyError
 from .secret_store import SecretField
 from .secret_application import SecretFieldTarget
-
-
-_SENSITIVE_FORM_REJECTION = "Sensitive form values must be supplied through request_secret."
-_ORDINARY_APPROVAL_REJECTION = (
-    "Ordinary ask_user cannot request browser-action approval. Attempt the intended "
-    "browser tool once and use policy-backed confirmation if required."
-)
-_FORM_VALUE_REDACTION = "[REDACTED]"
-
-
-def _normalized_words(value: Any) -> str:
-    if type(value) is not str:
-        return ""
-    return " ".join(re.sub(r"[-_]+", " ", value.strip().casefold()).split())
-
-
-def _is_protected_form_field(field: Any) -> bool:
-    if type(field) is not dict:
-        return False
-    protected = {"password", "passwd", "passcode", "pin", "otp", "one time code", "verification code", "security code", "secret", "token"}
-    return any(
-        any(
-            normalized == term or f" {term} " in f" {normalized} "
-            for term in protected
-        )
-        for key in ("name", "label", "type", "input_type", "inputType")
-        if (normalized := _normalized_words(field.get(key)))
-    )
-
-
-def _redact_sensitive_fill_form(decision: "AgentToolCall") -> tuple["AgentToolCall", bool]:
-    if decision.tool_name != "browser_fill_form":
-        return decision, False
-    arguments = decision.arguments
-    fields = arguments.get("fields")
-    if type(fields) is not list or not any(_is_protected_form_field(field) for field in fields):
-        return decision, False
-    redacted_fields: list[Any] = []
-    for field in fields:
-        safe_field = deepcopy(field)
-        if type(safe_field) is dict and "value" in safe_field:
-            safe_field["value"] = _FORM_VALUE_REDACTION
-        redacted_fields.append(safe_field)
-    arguments["fields"] = redacted_fields
-    return AgentToolCall(decision.tool_name, arguments), True
-
-
-def _is_ordinary_action_approval(decision: "AgentToolCall") -> bool:
-    if decision.tool_name != "ask_user":
-        return False
-    arguments = decision.arguments
-    if arguments.get("confirmation_for_step") is not None:
-        return False
-    question = _normalized_words(arguments.get("question"))
-    if question.startswith(("which ", "what ", "where ", "when ", "who ", "hangi ", "hangi̇ ", "ne ", "nerede ", "ne zaman ", "kim ")):
-        return False
-    approval = ("approve", "approval", "may i", "can i", "should i", "do you want me to", "shall i", "proceed", "permission", "onay", "izin", "devam edeyim", "yapayım mı", "yapabilir miyim")
-    actions = ("click", "submit", "fill", "type", "login", "log in", "download", "open", "navigate", "press", "select", "upload", "tıkla", "tıkl", "gönder", "doldur", "yaz", "giriş", "indir", "aç", "git", "bas", "seç", "yükle")
-    return any(term in question for term in approval) and any(term in question for term in actions)
 
 
 class AgentToolSource(str, Enum):
@@ -520,11 +460,6 @@ class AgentToolRouter:
     ) -> AgentStepObservation:
         if type(confirmation_granted) is not bool:
             raise TypeError("confirmation_granted must be a bool")
-        decision, sensitive_fill = _redact_sensitive_fill_form(decision)
-        if sensitive_fill:
-            return AgentStepObservation(decision.tool_name, AgentToolSource.MCP, AgentStepStatus.REJECTED, _SENSITIVE_FORM_REJECTION, None)
-        if _is_ordinary_action_approval(decision):
-            return AgentStepObservation(decision.tool_name, AgentToolSource.AGENT_CONTROL, AgentStepStatus.REJECTED, _ORDINARY_APPROVAL_REJECTION, None)
         try:
             if decision.tool_name in self._control_names:
                 result = self._agent_controls.execute(
@@ -842,7 +777,6 @@ class ResumableAgentSession:
                 return self._terminate(
                     AgentRunStatus.DECISION_SOURCE_EXHAUSTED
                 )
-            decision, _ = _redact_sensitive_fill_form(decision)
             previous_candidate = self._candidate
             self._candidate = None
             observation = await self._router.route(

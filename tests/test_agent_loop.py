@@ -295,22 +295,39 @@ class AgentToolRouterTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "bug"):
             await router.route(AgentToolCall("browser_snapshot", {}))
 
-    async def test_sensitive_fill_form_is_rejected_before_mcp(self) -> None:
+    async def test_public_demo_fill_form_reaches_policy_executor(self) -> None:
         router = AgentToolRouter(
             self.executor, [tool_definition("browser_fill_form")], self.controls
         )
+        fields = [
+            {"name": "username", "value": "demo-user"},
+            {"label": "Password", "value": "public-demo-password"},
+        ]
+        await router.route(AgentToolCall("browser_fill_form", {
+            "fields": fields,
+        }))
+        self.assertEqual(
+            self.executor.calls,
+            [("browser_fill_form", {"fields": fields}, False)],
+        )
+
+    async def test_confirmation_required_fill_form_returns_policy_rejection(self) -> None:
+        executor = FakePolicyExecutor(
+            error=ToolConfirmationRequiredError("approval required")
+        )
+        router = AgentToolRouter(
+            executor, [tool_definition("browser_fill_form")], self.controls
+        )
         observation = await router.route(AgentToolCall("browser_fill_form", {
             "fields": [
-                {"name": "username", "value": "alice@example.test"},
-                {"label": "Account-Password", "value": "SuperSecretPassword!"},
+                {"name": "username", "value": "demo-user"},
+                {"name": "password", "value": "public-demo-password"},
             ]
         }))
         self.assertEqual(observation.status, AgentStepStatus.REJECTED)
-        self.assertEqual(
-            observation.text,
-            "Sensitive form values must be supplied through request_secret.",
-        )
-        self.assertEqual(self.executor.calls, [])
+        self.assertTrue(observation.confirmation_required)
+        self.assertIn("ToolConfirmationRequiredError", observation.error or "")
+        self.assertEqual(len(executor.calls), 1)
 
     async def test_non_sensitive_fill_form_reaches_mcp(self) -> None:
         router = AgentToolRouter(
@@ -321,13 +338,12 @@ class AgentToolRouterTests(unittest.IsolatedAsyncioTestCase):
         }))
         self.assertEqual(self.executor.calls[0][0], "browser_fill_form")
 
-    async def test_ordinary_action_approval_is_rejected_without_control_pause(self) -> None:
+    async def test_ordinary_ask_user_question_reaches_control(self) -> None:
         observation = await self.router.route(AgentToolCall(
             "ask_user", {"question": "May I click the Login button?"}
         ))
-        self.assertEqual(observation.status, AgentStepStatus.REJECTED)
-        self.assertIn("Ordinary ask_user cannot request", observation.text)
-        self.assertEqual(self.controls.calls, [])
+        self.assertEqual(observation.status, AgentStepStatus.AWAITING_USER)
+        self.assertEqual(len(self.controls.calls), 1)
 
     async def test_missing_information_questions_remain_ordinary(self) -> None:
         for question in ("Which account should I use?", "Which file should I download?"):
@@ -403,47 +419,29 @@ class DeterministicAgentLoopTests(unittest.IsolatedAsyncioTestCase):
             source.contexts[1].steps[0].observation.text, "page snapshot"
         )
 
-    async def test_sensitive_fill_bundle_is_redacted_before_all_retention(self) -> None:
-        secret = "SuperSecretPassword!"
-        username = "alice@example.test"
+    async def test_fill_form_policy_confirmation_then_exact_replay_once(self) -> None:
+        fields = [
+            {"name": "username", "value": "demo-user"},
+            {"type": "password", "value": "public-demo-password"},
+        ]
         source = RecordingDecisionSource([
-            AgentToolCall("browser_fill_form", {"fields": [
-                {"name": "login-id", "value": username},
-                {"type": "password", "value": secret},
-            ]}),
-            AgentToolCall("finish", {"result": "safely rejected"}),
+            AgentToolCall("browser_fill_form", {"fields": fields}),
+            AgentToolCall("ask_user", {
+                "question": "Approve this exact fill?", "confirmation_for_step": 1,
+            }),
         ])
-        executor = FakePolicyExecutor()
+        executor = ConfirmationExecutor()
         router = AgentToolRouter(
             executor, [tool_definition("browser_fill_form")], RecordingControls()
         )
-        result = await DeterministicAgentLoop(source, router, 3).run("Log in")
-        retained = repr((result, source.contexts, result.steps))
-        self.assertNotIn(secret, retained)
-        self.assertNotIn(username, retained)
-        self.assertEqual(executor.calls, [])
-        fields = result.steps[0].decision.arguments["fields"]
-        self.assertEqual([item["value"] for item in fields], ["[REDACTED]", "[REDACTED]"])
-        self.assertEqual(result.steps[0].observation.status, AgentStepStatus.REJECTED)
-        self.assertNotIn(secret, repr(source.contexts[1]))
-
-    async def test_rejected_ordinary_approval_continues_to_policy_confirmation(self) -> None:
-        executor = ConfirmationExecutor()
-        source = RecordingDecisionSource([
-            AgentToolCall("ask_user", {"question": "May I click the Login button?"}),
-            AgentToolCall("browser_click", {"ref": "login"}),
-            AgentToolCall("ask_user", {
-                "question": "Approve this exact click?", "confirmation_for_step": 2,
-            }),
-        ])
-        router = AgentToolRouter(
-            executor, [tool_definition("browser_click")], RecordingControls()
-        )
-        result = await DeterministicAgentLoop(source, router, 5).run("Log in")
+        session = ResumableAgentSession(source, router, 5)
+        result = await session.start("Log in to the public demo")
         self.assertEqual(result.pause_kind, AgentPauseKind.CONFIRMATION)
-        self.assertEqual([step.observation.status for step in result.steps], [
-            AgentStepStatus.REJECTED, AgentStepStatus.REJECTED,
-            AgentStepStatus.AWAITING_USER,
+        resumed = await session.confirm(True)
+        self.assertEqual(resumed.steps[-1].observation.status, AgentStepStatus.SUCCESS)
+        self.assertEqual(executor.calls, [
+            ("browser_fill_form", {"fields": fields}, False),
+            ("browser_fill_form", {"fields": fields}, True),
         ])
 
     async def test_finish_stops_before_later_decisions(self) -> None:

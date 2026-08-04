@@ -2,34 +2,30 @@
 
 ## Status summary
 
-- **Active branch:** `mvp/playwright-mcp-agent`
-- **Remote tracking:** configured for `origin/mvp/playwright-mcp-agent`
-- **Current completed milestone:** Milestone 10, Minimal Controlled Downloads
-  - This is the latest milestone whose implementation, review, tests, Learning
-    Handoff, human commit, human push, and remote verification are complete.
-- **Latest completed documentation checkpoint:**
-  `11fcf02a2e06cd5a4f78fa94bb226a17ca9cce87`. This is the latest completed
-  and remotely verified documentation checkpoint before the current
-  uncommitted Milestone 10 closure edit; no SHA is assigned to this edit.
-- **Current implementation:** synchronous learning prototype, verified local
-  Playwright MCP connectivity, dynamic MCP tool gateway, typed classification
-  and policy enforcement, typed `finish` and `ask_user` controls,
-  `AgentToolRouter`, a deterministic observation-driven agent loop, a
-  provider-neutral real decision source and MVP evaluation framework, a
-  resumable agent session with typed pause kind and trusted confirmation
-  replay, an in-memory `RunManager` with immutable `RunSnapshot`, typed run
-  states, `request_id` idempotency, single-use `interaction_id` validation,
-  per-run concurrency, cancellation, terminal and shutdown cleanup, and a
-  FastAPI HTTP boundary with strict request validation, a stable HTTP error
-  envelope, and five endpoints: `POST /runs`, `GET /runs/{run_id}`,
-  `POST /runs/{run_id}/responses`, `POST /runs/{run_id}/cancel`, and
-  `GET /runs/{run_id}/files/{file_id}`; plus
-  app-owned secure secret requests, transient one-time secret storage, and
-  handle-bound secret form application outside model-visible and serializable
-  state; a run-specific `RunDownloadStore`, `DownloadTrackingExecutor`,
-  path-free download metadata, lifecycle cleanup, and HTTP file delivery
-- **Current phase:** PLAN — Milestone 11, End-to-End NVIDIA Browser-Agent MVP.
-  Milestone 11 implementation has not started.
+- **Active branch:** `mvp/m11-core-clean`
+- **Remote tracking:** not configured yet for the candidate branch.
+- **Current completed milestone:** Milestone 10, Minimal Controlled Downloads.
+  - Milestone 10 remains the latest milestone whose implementation, review,
+    tests, Learning Handoff, human commit, human push, and remote verification
+    are complete.
+- **Current phase:** TEST — Milestone 11 Core MVP candidate manual acceptance.
+- **Candidate status:** implementation and automated tests are complete, but
+  manual login acceptance, manual download retrieval acceptance, final
+  documentation closure, human commit, push, and remote SHA verification are
+  still pending.
+- **Milestone 11 Core candidate capabilities:**
+  - URL-less run creation;
+  - chat-shell operator UI with a sticky task composer;
+  - controlled completion with `Finish run` and `Continue working`;
+  - bounded structural Provider Trace;
+  - required single-tool provider decisions with one bounded cardinality retry;
+  - canonical completed-download evidence;
+  - a Downloads card and HTTP file retrieval.
+- Existing `request_secret`, transient secret storage, local secret form
+  application, policy-backed confirmation, and exact confirmed-action replay
+  remain available.
+- Generic automatic login orchestration and semantic credential detection
+  across arbitrary websites are explicitly outside the Core MVP scope.
 
 ## Completed
 
@@ -808,3 +804,28 @@ The authoritative Milestones 8–12 sequence is in
 
 Controlled file upload is an optional future milestone. It remains disabled
 and `browser_file_upload` remains denied unless separately approved.
+## Milestone 11 Core MVP candidate
+
+- **Candidate branch:** `mvp/m11-core-clean`
+- **Candidate base/checkpoint:** WIP commit `4aaa980`
+- Brittle keyword-based credential detection and ordinary-approval rejection
+  heuristics were removed.
+- Existing policy-backed confirmation and exact confirmed-action replay were
+  preserved.
+- `request_secret`, transient secret storage, and model-external local secret
+  application were preserved.
+- URL-less runs, the chat operator UI, controlled completion, structural
+  Provider Trace, canonical download evidence, and HTTP download retrieval are
+  included in the candidate.
+- Public demo login and controlled-download manual acceptance are pending.
+- Generic login orchestration across arbitrary websites is outside scope.
+- A successful public demo credential test does not prove the safety of private
+  credentials or broad login compatibility.
+
+Final completion requires:
+
+1. Manual public demo login acceptance.
+2. Manual controlled-download acceptance and successful local retrieval.
+3. Documentation closure.
+4. Human commit and push.
+5. Remote SHA verification.

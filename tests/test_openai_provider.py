@@ -463,14 +463,15 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
 
         for guidance in (
             "ordinary ask_user only for genuinely missing non-secret information",
-            "request_secret for credentials or OTP values",
-            "remains protected even when visible on the page",
-            "Never repeat credential values",
-            "never put a credential bundle directly in browser_fill_form arguments",
-            "Request both username and password through request_secret",
-            "applies them locally without putting their values in model context",
+            "belonging to the user's private account",
+            "use request_secret",
+            "not a mandatory mechanism for every login",
+            "Synthetic demo credentials",
+            "explicitly displayed by a public demo or test page",
+            "Do not unnecessarily repeat demo credentials",
+            "applies it locally without putting its value in model context",
             "Use finish to propose completion",
-            "Browser-action authorization is controlled by application policy",
+            "Browser-action approval is managed by application policy",
             "Never use ordinary ask_user for advance approval",
             "first call the intended browser tool exactly once",
             "without claiming user approval",
@@ -478,6 +479,7 @@ class DecisionSourceTests(unittest.IsolatedAsyncioTestCase):
             "only the application-recorded confirmation interaction authorizes",
             "Do not request a second confirmation after trusted confirmation was accepted",
             "never include raw secret values",
+            "Provider traces must never contain prompts, page content, tool arguments, or secret values",
         ):
             with self.subTest(guidance=guidance):
                 self.assertIn(guidance, system_message)
